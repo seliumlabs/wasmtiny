@@ -10,8 +10,7 @@
 //! Exit codes: 0 = burst completed with no findings; 1 = finding
 //! (failing input written next to the report on stdout); 2 = usage.
 
-use std::path::PathBuf;
-use std::process::exit;
+use std::{path::PathBuf, process::exit};
 
 use wasmtiny::security_test::{Prng, fuzz_execute, fuzz_load, fuzz_shared_region, mutate};
 
@@ -24,6 +23,87 @@ struct Args {
     seed: u64,
     crash_dir: PathBuf,
     inject_panic_at: Option<usize>,
+}
+
+fn load_seeds(paths: &[PathBuf]) -> Vec<Vec<u8>> {
+    let mut seeds = Vec::new();
+    for path in paths {
+        if path.is_dir() {
+            let mut entries: Vec<PathBuf> = std::fs::read_dir(path)
+                .unwrap_or_else(|e| {
+                    eprintln!("cannot read seed dir {}: {e}", path.display());
+                    exit(2);
+                })
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.is_file())
+                .collect();
+            entries.sort();
+            for entry in entries {
+                match std::fs::read(&entry) {
+                    Ok(bytes) => seeds.push(bytes),
+                    Err(e) => {
+                        eprintln!("cannot read seed {}: {e}", entry.display());
+                        exit(2);
+                    }
+                }
+            }
+        } else {
+            match std::fs::read(path) {
+                Ok(bytes) => seeds.push(bytes),
+                Err(e) => {
+                    eprintln!("cannot read seed {}: {e}", path.display());
+                    exit(2);
+                }
+            }
+        }
+    }
+    seeds
+}
+
+fn main() {
+    let args = parse_args();
+    let seeds = load_seeds(&args.seeds);
+    if seeds.is_empty() {
+        eprintln!("no seeds provided\n{USAGE}");
+        exit(2);
+    }
+
+    // Panics print normally but must not take the process down before
+    // the artifact is written; run_input converts them into a report.
+    let mut prng = Prng::new(args.seed);
+    let mut current = seeds[prng.below(seeds.len())].clone();
+    let mut injection = args.inject_panic_at;
+
+    for iteration in 0..args.iterations {
+        if prng.coin() || current.is_empty() {
+            current = seeds[prng.below(seeds.len())].clone();
+        }
+        current = mutate(&mut prng, &current, &seeds);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_input(&current, &mut injection, iteration);
+        }));
+        if result.is_err() {
+            let path = args
+                .crash_dir
+                .join(format!("fuzz-crash-iter-{iteration}.bin"));
+            if let Err(e) = std::fs::write(&path, &current) {
+                eprintln!("FINDING at iteration {iteration} (artifact write failed: {e})");
+            } else {
+                println!("FINDING at iteration {iteration}: {e}", e = path.display());
+            }
+            exit(1);
+        }
+    }
+
+    println!(
+        "fuzz burst clean: {} iterations, {} seeds, seed #{:#x}",
+        args.iterations,
+        seeds.len(),
+        args.seed
+    );
+    exit(0);
 }
 
 fn parse_args() -> Args {
@@ -78,42 +158,6 @@ fn parse_args() -> Args {
     args
 }
 
-fn load_seeds(paths: &[PathBuf]) -> Vec<Vec<u8>> {
-    let mut seeds = Vec::new();
-    for path in paths {
-        if path.is_dir() {
-            let mut entries: Vec<PathBuf> = std::fs::read_dir(path)
-                .unwrap_or_else(|e| {
-                    eprintln!("cannot read seed dir {}: {e}", path.display());
-                    exit(2);
-                })
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .filter(|p| p.is_file())
-                .collect();
-            entries.sort();
-            for entry in entries {
-                match std::fs::read(&entry) {
-                    Ok(bytes) => seeds.push(bytes),
-                    Err(e) => {
-                        eprintln!("cannot read seed {}: {e}", entry.display());
-                        exit(2);
-                    }
-                }
-            }
-        } else {
-            match std::fs::read(path) {
-                Ok(bytes) => seeds.push(bytes),
-                Err(e) => {
-                    eprintln!("cannot read seed {}: {e}", path.display());
-                    exit(2);
-                }
-            }
-        }
-    }
-    seeds
-}
-
 /// Runs one input through every fuzz entry point, catching panics so
 /// the failing input can be reported instead of silently unwinding.
 fn run_input(input: &[u8], injection: &mut Option<usize>, iteration: usize) {
@@ -133,49 +177,4 @@ fn run_input(input: &[u8], injection: &mut Option<usize>, iteration: usize) {
             std::panic::resume_unwind(Box::new("fuzz target panicked"));
         }
     }
-}
-
-fn main() {
-    let args = parse_args();
-    let seeds = load_seeds(&args.seeds);
-    if seeds.is_empty() {
-        eprintln!("no seeds provided\n{USAGE}");
-        exit(2);
-    }
-
-    // Panics print normally but must not take the process down before
-    // the artifact is written; run_input converts them into a report.
-    let mut prng = Prng::new(args.seed);
-    let mut current = seeds[prng.below(seeds.len())].clone();
-    let mut injection = args.inject_panic_at;
-
-    for iteration in 0..args.iterations {
-        if prng.coin() || current.is_empty() {
-            current = seeds[prng.below(seeds.len())].clone();
-        }
-        current = mutate(&mut prng, &current, &seeds);
-
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_input(&current, &mut injection, iteration);
-        }));
-        if result.is_err() {
-            let path = args
-                .crash_dir
-                .join(format!("fuzz-crash-iter-{iteration}.bin"));
-            if let Err(e) = std::fs::write(&path, &current) {
-                eprintln!("FINDING at iteration {iteration} (artifact write failed: {e})");
-            } else {
-                println!("FINDING at iteration {iteration}: {e}", e = path.display());
-            }
-            exit(1);
-        }
-    }
-
-    println!(
-        "fuzz burst clean: {} iterations, {} seeds, seed #{:#x}",
-        args.iterations,
-        seeds.len(),
-        args.seed
-    );
-    exit(0);
 }

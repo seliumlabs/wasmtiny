@@ -8,36 +8,18 @@
 //! CI gate required by the `sandbox-escape-testing` spec: a new
 //! threat-model entry fails CI until a test exists.
 
-use std::collections::BTreeMap;
-use std::fmt::Write as _;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    fmt::Write as _,
+    fs,
+    path::{Path, PathBuf},
+};
 
 /// A coverage source: a corpus fixture or a fuzz target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Coverage {
     Fixture(String),
     FuzzTarget(String),
-}
-
-fn manifest_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
-
-/// Extract `TM-xx` entries (with titles) from the threat model doc.
-fn threat_entries(doc: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for line in doc.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("### TM-") {
-            let id = format!("TM-{}", rest.split(':').next().unwrap_or(rest).trim());
-            let title = rest.split_once(':').map(|(_, t)| t.trim().to_string());
-            if let Some(title) = title {
-                out.push((id, title));
-            }
-        }
-    }
-    out
 }
 
 /// Parse the `key: value` lines of a fixture manifest.
@@ -146,4 +128,24 @@ fn every_threat_model_entry_has_coverage() {
         uncovered.join(", "),
         out_path.display()
     );
+}
+
+fn manifest_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// Extract `TM-xx` entries (with titles) from the threat model doc.
+fn threat_entries(doc: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in doc.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("### TM-") {
+            let id = format!("TM-{}", rest.split(':').next().unwrap_or(rest).trim());
+            let title = rest.split_once(':').map(|(_, t)| t.trim().to_string());
+            if let Some(title) = title {
+                out.push((id, title));
+            }
+        }
+    }
+    out
 }

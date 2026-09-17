@@ -19,30 +19,27 @@
 
 #![cfg(feature = "security-test")]
 
-use std::collections::BTreeMap;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::{
+    collections::BTreeMap,
+    fs,
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 use wasmtiny::security_test::open_fd_count;
 
+/// Harness deadline is always the guest budget plus this grace, so a
+/// fixture that ignores its budget is classified `hung` by the
+/// harness rather than silently overrunning.
+const DEADLINE_GRACE_MS: u64 = 3000;
 const PAGE_BYTES: u32 = 64 * 1024;
-
 /// Serializes the fd-sensitive tests in this file: cargo runs test
 /// functions on parallel threads in one process, and concurrently
 /// spawning watchdog children (pipe fds) would race the corpus fd
 /// canary windows.
 static TEST_SERIALIZE: Mutex<()> = Mutex::new(());
-/// Harness deadline is always the guest budget plus this grace, so a
-/// fixture that ignores its budget is classified `hung` by the
-/// harness rather than silently overrunning.
-const DEADLINE_GRACE_MS: u64 = 3000;
-
-// ---------------------------------------------------------------------------
-// Manifests
-// ---------------------------------------------------------------------------
 
 /// Parsed fixture manifest (`key: value` lines, `#` comments).
 #[derive(Debug, Clone)]
@@ -77,77 +74,33 @@ struct Manifest {
     selftest: Option<String>,
 }
 
-fn parse_manifest(text: &str) -> BTreeMap<String, String> {
-    let mut map = BTreeMap::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((k, v)) = line.split_once(':') {
-            map.insert(k.trim().to_string(), v.trim().to_string());
-        }
-    }
-    map
-}
-
-fn load_manifest(dir: &Path) -> Option<Manifest> {
-    let text = fs::read_to_string(dir.join("manifest.txt")).ok()?;
-    let fields = parse_manifest(&text);
-    let name = fields.get("name")?.clone();
-    let expected = fields.get("expected")?.clone();
-    if expected != "clean" && expected != "trapped" {
-        panic!(
-            "fixture {name}: invalid expected verdict '{expected}' \
-             (only clean|trapped may be expected; crashed/hung always fail)"
-        );
-    }
-    Some(Manifest {
-        name,
-        threat: fields.get("threat").cloned().unwrap_or_default(),
-        expected,
-        wat: fields.get("wat").cloned(),
-        binary: fields.get("binary").cloned(),
-        bytes: fields.get("bytes").cloned(),
-        budget_ms: fields
-            .get("budget_ms")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2000),
-        memory_mb: fields
-            .get("memory_mb")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1024),
-        host_abuse: fields
-            .get("host_abuse")
-            .map(|v| v == "true")
-            .unwrap_or(false),
-        region_pages: fields
-            .get("region_pages")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0),
-        entry: fields.get("entry").cloned().unwrap_or_default(),
-        i32_args: fields
-            .get("i32_args")
-            .map(|v| {
-                v.split_whitespace()
-                    .filter_map(|a| a.parse().ok())
-                    .collect()
-            })
-            .unwrap_or_default(),
-        selftest: fields.get("selftest").cloned(),
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Canaries
-// ---------------------------------------------------------------------------
-
 /// Host invariants checked from outside the sandbox after each
 /// fixture. Any violation is an escape attempt (or a leak): the run
 /// fails with the fixture and invariant named.
 #[derive(Debug)]
 struct Canaries {
     marker_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Clean,
+    Trapped,
+    Crashed,
+    Hung,
+}
+
+#[derive(Debug)]
+struct RunOutcome {
+    verdict: Verdict,
+    /// Runner stdout (diagnostics only — never the verdict source).
+    output: String,
+}
+
+/// One fixture failure report.
+struct Failure {
+    fixture: String,
+    reason: String,
 }
 
 impl Canaries {
@@ -213,18 +166,6 @@ impl Canaries {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Watchdog execution
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Verdict {
-    Clean,
-    Trapped,
-    Crashed,
-    Hung,
-}
-
 impl Verdict {
     fn tag(self) -> &'static str {
         match self {
@@ -236,83 +177,54 @@ impl Verdict {
     }
 }
 
-#[derive(Debug)]
-struct RunOutcome {
-    verdict: Verdict,
-    /// Runner stdout (diagnostics only — never the verdict source).
-    output: String,
+fn build_dir() -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/corpus-build");
+    fs::create_dir_all(&dir).expect("create corpus build dir");
+    dir
 }
 
-/// Spawns the runner in a new process group, enforces the harness
-/// deadline, and classifies the outcome from process state only.
-fn run_with_watchdog(mut cmd: Command, deadline: Duration) -> RunOutcome {
-    use std::os::unix::process::CommandExt;
+/// Canary self-test: each canary fires on a deliberate violation.
+#[test]
+fn canaries_detect_violations() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|p| p.into_inner());
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/corpus-canary-selftest");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).expect("create selftest dir");
+    let canaries = Canaries::new(&root);
+    assert!(canaries.check().is_empty(), "clean baseline must pass");
 
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
+    // Marker violation: write a new file into the marker dir.
+    fs::write(canaries.marker_dir.join("escaped.txt"), "hostile write")
+        .expect("deliberate marker write");
+    let violations = canaries.check();
+    assert!(
+        violations.iter().any(|v| v.contains("marker violation")),
+        "marker canary must fire: {violations:?}"
+    );
 
-    let mut child: Child = cmd.spawn().expect("spawn corpus runner");
-    let pgid: libc::pid_t = child.id() as libc::pid_t;
-    let start = Instant::now();
-
-    let verdict = loop {
-        match child.try_wait().expect("try_wait runner") {
-            Some(status) => {
-                break match status.code() {
-                    Some(0) => Verdict::Clean,
-                    Some(3) => Verdict::Trapped,
-                    // panic (101), abort, signal death, anything else.
-                    _ => Verdict::Crashed,
-                };
-            }
-            None => {
-                if start.elapsed() >= deadline {
-                    // Kill the whole process group: descendants must
-                    // not survive the fixture.
-                    // SAFETY: pgid is the child's process group.
-                    unsafe {
-                        libc::kill(-pgid, libc::SIGKILL);
-                    }
-                    child.wait().expect("reap killed runner");
-                    break Verdict::Hung;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-    };
-
-    // After terminal state, collect remaining piped output.
-    let output = child
-        .wait_with_output()
-        .expect("collect runner output")
-        .stdout;
-    let output = String::from_utf8_lossy(&output).to_string();
-
-    // Stray-process canary: the process group must be gone.
-    if verdict != Verdict::Hung {
-        // SAFETY: kill(2) with signal 0 is a pure existence probe.
-        let rc = unsafe { libc::kill(-pgid, 0) };
-        if rc == 0 {
-            return RunOutcome {
-                verdict: Verdict::Crashed,
-                output: format!("{output}\nSTRAY-PROCESS: pgid {pgid} still has members"),
-            };
-        }
-    }
-
-    RunOutcome { verdict, output }
+    // fd canary: leak enough fds that concurrent-test noise cannot
+    // mask the increase.
+    let baseline = Canaries::fd_snapshot();
+    let leaked: Vec<_> = (0..16)
+        .map(|_| fs::File::open(&root).expect("deliberate leaked fd"))
+        .collect();
+    assert!(
+        Canaries::fd_snapshot() > baseline,
+        "fd canary must fire: {} fds leaked, baseline {baseline}",
+        leaked.len()
+    );
+    drop(leaked);
+    assert!(
+        Canaries::fd_snapshot() <= baseline,
+        "fd count must return to baseline after dropping the leaks"
+    );
 }
 
-// ---------------------------------------------------------------------------
-// Corpus execution
-// ---------------------------------------------------------------------------
-
-/// One fixture failure report.
-struct Failure {
-    fixture: String,
-    reason: String,
+// Hand-assembled smoke modules (committed bytes, no toolchain faith).
+// clean: (module (func (export "main") (result i32) i32.const 42))
+fn clean_module_bytes() -> Vec<u8> {
+    wat::parse_str(r#"(module (func (export "main") (result i32) i32.const 42))"#)
+        .expect("clean smoke module")
 }
 
 fn corpus_dir() -> PathBuf {
@@ -321,10 +233,23 @@ fn corpus_dir() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/corpus"))
 }
 
-fn build_dir() -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/corpus-build");
-    fs::create_dir_all(&dir).expect("create corpus build dir");
-    dir
+/// The main gate: every adversarial fixture fails closed, safely, and
+/// all host invariants hold.
+#[test]
+fn corpus_fixtures_fail_closed() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|p| p.into_inner());
+    let failures = run_corpus(&corpus_dir());
+    let report = failures
+        .iter()
+        .map(|f| format!("  [{}] {}", f.fixture, f.reason.replace('\n', "\n  ")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        failures.is_empty(),
+        "corpus containment failures ({}):\n{}",
+        failures.len(),
+        report
+    );
 }
 
 /// Decodes an inline hex string (`bytes:` manifest field). Whitespace
@@ -341,6 +266,89 @@ fn decode_hex(hex: &str, fixture: &str) -> Result<Vec<u8>, String> {
                 .map_err(|e| format!("fixture {fixture}: bad hex: {e}"))
         })
         .collect()
+}
+
+fn load_manifest(dir: &Path) -> Option<Manifest> {
+    let text = fs::read_to_string(dir.join("manifest.txt")).ok()?;
+    let fields = parse_manifest(&text);
+    let name = fields.get("name")?.clone();
+    let expected = fields.get("expected")?.clone();
+    if expected != "clean" && expected != "trapped" {
+        panic!(
+            "fixture {name}: invalid expected verdict '{expected}' \
+             (only clean|trapped may be expected; crashed/hung always fail)"
+        );
+    }
+    Some(Manifest {
+        name,
+        threat: fields.get("threat").cloned().unwrap_or_default(),
+        expected,
+        wat: fields.get("wat").cloned(),
+        binary: fields.get("binary").cloned(),
+        bytes: fields.get("bytes").cloned(),
+        budget_ms: fields
+            .get("budget_ms")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2000),
+        memory_mb: fields
+            .get("memory_mb")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1024),
+        host_abuse: fields
+            .get("host_abuse")
+            .map(|v| v == "true")
+            .unwrap_or(false),
+        region_pages: fields
+            .get("region_pages")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0),
+        entry: fields.get("entry").cloned().unwrap_or_default(),
+        i32_args: fields
+            .get("i32_args")
+            .map(|v| {
+                v.split_whitespace()
+                    .filter_map(|a| a.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        selftest: fields.get("selftest").cloned(),
+    })
+}
+
+/// Manifest-integrity self-test: a manifest naming a missing binary
+/// fails with a clear error.
+#[test]
+fn manifest_with_missing_binary_fails_clearly() {
+    let tmp = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/corpus-manifest-selftest");
+    let _ = fs::remove_dir_all(&tmp);
+    let fixture = tmp.join("broken-fixture");
+    fs::create_dir_all(&fixture).expect("create selftest fixture dir");
+    fs::write(
+        fixture.join("manifest.txt"),
+        "name: broken\nthreat: TM-01\nexpected: trapped\nbinary: does-not-exist.wasm\n",
+    )
+    .expect("write manifest");
+
+    let manifest = load_manifest(&fixture).expect("manifest parses");
+    let err = resolve_wasm(&fixture, &manifest).expect_err("missing binary must fail");
+    assert!(
+        err.contains("committed binary missing"),
+        "error must be clear, got: {err}"
+    );
+}
+
+fn parse_manifest(text: &str) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            map.insert(k.trim().to_string(), v.trim().to_string());
+        }
+    }
+    map
 }
 
 /// Resolves a fixture's wasm binary: assembles `.wat` offline (wat is
@@ -380,10 +388,6 @@ fn resolve_wasm(dir: &Path, manifest: &Manifest) -> Result<PathBuf, String> {
             manifest.name
         ))
     }
-}
-
-fn runner_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_wasmtiny-corpus-runner"))
 }
 
 /// Runs the whole corpus in `dir`, returning all failures. Canaries
@@ -509,103 +513,70 @@ fn run_corpus(dir: &Path) -> Vec<Failure> {
     failures
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+/// Spawns the runner in a new process group, enforces the harness
+/// deadline, and classifies the outcome from process state only.
+fn run_with_watchdog(mut cmd: Command, deadline: Duration) -> RunOutcome {
+    use std::os::unix::process::CommandExt;
 
-/// The main gate: every adversarial fixture fails closed, safely, and
-/// all host invariants hold.
-#[test]
-fn corpus_fixtures_fail_closed() {
-    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|p| p.into_inner());
-    let failures = run_corpus(&corpus_dir());
-    let report = failures
-        .iter()
-        .map(|f| format!("  [{}] {}", f.fixture, f.reason.replace('\n', "\n  ")))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        failures.is_empty(),
-        "corpus containment failures ({}):\n{}",
-        failures.len(),
-        report
-    );
-}
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
 
-/// Watchdog classification self-test: all four verdict classes are
-/// produced end-to-end from real process state, and a hung fixture
-/// fails the run.
-#[test]
-fn watchdog_classifies_all_four_verdicts() {
-    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|p| p.into_inner());
-    let runner = runner_path();
+    let mut child: Child = cmd.spawn().expect("spawn corpus runner");
+    let pgid: libc::pid_t = child.id() as libc::pid_t;
+    let start = Instant::now();
 
-    let smoke = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/corpus-smoke");
-    fs::create_dir_all(&smoke).expect("create smoke dir");
-    let clean_wasm = smoke.join("clean.wasm");
-    fs::write(&clean_wasm, clean_module_bytes()).expect("write smoke module");
-
-    let mk = |args: &[&str]| {
-        let mut cmd = Command::new(&runner);
-        cmd.arg(&clean_wasm).arg("--entry").arg("main");
-        for a in args {
-            cmd.arg(a);
+    let verdict = loop {
+        match child.try_wait().expect("try_wait runner") {
+            Some(status) => {
+                break match status.code() {
+                    Some(0) => Verdict::Clean,
+                    Some(3) => Verdict::Trapped,
+                    // panic (101), abort, signal death, anything else.
+                    _ => Verdict::Crashed,
+                };
+            }
+            None => {
+                if start.elapsed() >= deadline {
+                    // Kill the whole process group: descendants must
+                    // not survive the fixture.
+                    // SAFETY: pgid is the child's process group.
+                    unsafe {
+                        libc::kill(-pgid, libc::SIGKILL);
+                    }
+                    child.wait().expect("reap killed runner");
+                    break Verdict::Hung;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
-        cmd
     };
 
-    let clean_outcome = run_with_watchdog(mk(&[]), Duration::from_secs(5));
-    assert_eq!(clean_outcome.verdict, Verdict::Clean, "{:?}", clean_outcome);
+    // After terminal state, collect remaining piped output.
+    let output = child
+        .wait_with_output()
+        .expect("collect runner output")
+        .stdout;
+    let output = String::from_utf8_lossy(&output).to_string();
 
-    let trapped_wasm = smoke.join("trapped.wasm");
-    fs::write(&trapped_wasm, trapped_module_bytes()).expect("write smoke module");
-    let mut trapped_cmd = Command::new(&runner);
-    trapped_cmd.arg(&trapped_wasm).arg("--entry").arg("main");
-    let trapped = run_with_watchdog(trapped_cmd, Duration::from_secs(5));
-    assert_eq!(trapped.verdict, Verdict::Trapped, "{:?}", trapped);
+    // Stray-process canary: the process group must be gone.
+    if verdict != Verdict::Hung {
+        // SAFETY: kill(2) with signal 0 is a pure existence probe.
+        let rc = unsafe { libc::kill(-pgid, 0) };
+        if rc == 0 {
+            return RunOutcome {
+                verdict: Verdict::Crashed,
+                output: format!("{output}\nSTRAY-PROCESS: pgid {pgid} still has members"),
+            };
+        }
+    }
 
-    let crashed = run_with_watchdog(mk(&["--selftest-crash"]), Duration::from_secs(5));
-    assert_eq!(crashed.verdict, Verdict::Crashed, "{:?}", crashed);
-
-    let hung = run_with_watchdog(mk(&["--selftest-hang"]), Duration::from_millis(500));
-    assert_eq!(hung.verdict, Verdict::Hung, "{:?}", hung);
+    RunOutcome { verdict, output }
 }
 
-/// Canary self-test: each canary fires on a deliberate violation.
-#[test]
-fn canaries_detect_violations() {
-    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|p| p.into_inner());
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/corpus-canary-selftest");
-    let _ = fs::remove_dir_all(&root);
-    fs::create_dir_all(&root).expect("create selftest dir");
-    let canaries = Canaries::new(&root);
-    assert!(canaries.check().is_empty(), "clean baseline must pass");
-
-    // Marker violation: write a new file into the marker dir.
-    fs::write(canaries.marker_dir.join("escaped.txt"), "hostile write")
-        .expect("deliberate marker write");
-    let violations = canaries.check();
-    assert!(
-        violations.iter().any(|v| v.contains("marker violation")),
-        "marker canary must fire: {violations:?}"
-    );
-
-    // fd canary: leak enough fds that concurrent-test noise cannot
-    // mask the increase.
-    let baseline = Canaries::fd_snapshot();
-    let leaked: Vec<_> = (0..16)
-        .map(|_| fs::File::open(&root).expect("deliberate leaked fd"))
-        .collect();
-    assert!(
-        Canaries::fd_snapshot() > baseline,
-        "fd canary must fire: {} fds leaked, baseline {baseline}",
-        leaked.len()
-    );
-    drop(leaked);
-    assert!(
-        Canaries::fd_snapshot() <= baseline,
-        "fd count must return to baseline after dropping the leaks"
-    );
+fn runner_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_wasmtiny-corpus-runner"))
 }
 
 /// TM-06 host-side check: guests can only reach shared ranges mapped
@@ -700,35 +671,6 @@ fn shared_region_boundary_probes_are_denied() {
     );
 }
 
-/// Manifest-integrity self-test: a manifest naming a missing binary
-/// fails with a clear error.
-#[test]
-fn manifest_with_missing_binary_fails_clearly() {
-    let tmp = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/corpus-manifest-selftest");
-    let _ = fs::remove_dir_all(&tmp);
-    let fixture = tmp.join("broken-fixture");
-    fs::create_dir_all(&fixture).expect("create selftest fixture dir");
-    fs::write(
-        fixture.join("manifest.txt"),
-        "name: broken\nthreat: TM-01\nexpected: trapped\nbinary: does-not-exist.wasm\n",
-    )
-    .expect("write manifest");
-
-    let manifest = load_manifest(&fixture).expect("manifest parses");
-    let err = resolve_wasm(&fixture, &manifest).expect_err("missing binary must fail");
-    assert!(
-        err.contains("committed binary missing"),
-        "error must be clear, got: {err}"
-    );
-}
-
-// Hand-assembled smoke modules (committed bytes, no toolchain faith).
-// clean: (module (func (export "main") (result i32) i32.const 42))
-fn clean_module_bytes() -> Vec<u8> {
-    wat::parse_str(r#"(module (func (export "main") (result i32) i32.const 42))"#)
-        .expect("clean smoke module")
-}
-
 // trapped: OOB load past a 1-page memory.
 fn trapped_module_bytes() -> Vec<u8> {
     wat::parse_str(
@@ -739,4 +681,43 @@ fn trapped_module_bytes() -> Vec<u8> {
                 drop))"#,
     )
     .expect("trapped smoke module")
+}
+
+/// Watchdog classification self-test: all four verdict classes are
+/// produced end-to-end from real process state, and a hung fixture
+/// fails the run.
+#[test]
+fn watchdog_classifies_all_four_verdicts() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|p| p.into_inner());
+    let runner = runner_path();
+
+    let smoke = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/corpus-smoke");
+    fs::create_dir_all(&smoke).expect("create smoke dir");
+    let clean_wasm = smoke.join("clean.wasm");
+    fs::write(&clean_wasm, clean_module_bytes()).expect("write smoke module");
+
+    let mk = |args: &[&str]| {
+        let mut cmd = Command::new(&runner);
+        cmd.arg(&clean_wasm).arg("--entry").arg("main");
+        for a in args {
+            cmd.arg(a);
+        }
+        cmd
+    };
+
+    let clean_outcome = run_with_watchdog(mk(&[]), Duration::from_secs(5));
+    assert_eq!(clean_outcome.verdict, Verdict::Clean, "{:?}", clean_outcome);
+
+    let trapped_wasm = smoke.join("trapped.wasm");
+    fs::write(&trapped_wasm, trapped_module_bytes()).expect("write smoke module");
+    let mut trapped_cmd = Command::new(&runner);
+    trapped_cmd.arg(&trapped_wasm).arg("--entry").arg("main");
+    let trapped = run_with_watchdog(trapped_cmd, Duration::from_secs(5));
+    assert_eq!(trapped.verdict, Verdict::Trapped, "{:?}", trapped);
+
+    let crashed = run_with_watchdog(mk(&["--selftest-crash"]), Duration::from_secs(5));
+    assert_eq!(crashed.verdict, Verdict::Crashed, "{:?}", crashed);
+
+    let hung = run_with_watchdog(mk(&["--selftest-hang"]), Duration::from_millis(500));
+    assert_eq!(hung.verdict, Verdict::Hung, "{:?}", hung);
 }

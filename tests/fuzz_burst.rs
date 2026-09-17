@@ -9,17 +9,15 @@
 
 #![cfg(feature = "security-test")]
 
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 /// Fixed burst parameters: reproducible by construction.
 const ITERATIONS: u32 = 400;
 const PRNG_SEED: u64 = 0x0C0F_FEE0_0D15_EA5E;
-
-fn manifest_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
 
 /// Assembles the seed corpus: corpus fixture modules (valid-ish and
 /// loadable) plus every committed malformed binary. Deterministic and
@@ -68,22 +66,6 @@ fn assemble_seeds(out: &Path) {
 
 fn fuzz_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_wasmtiny-fuzz"))
-}
-
-fn run_burst(seeds: &Path, extra: &[&str]) -> std::process::Output {
-    let mut cmd = Command::new(fuzz_bin());
-    cmd.arg("--seeds")
-        .arg(seeds)
-        .arg("--iterations")
-        .arg(ITERATIONS.to_string())
-        .arg("--seed")
-        .arg(PRNG_SEED.to_string())
-        .arg("--crash-dir")
-        .arg(manifest_root().join("target"));
-    for arg in extra {
-        cmd.arg(arg);
-    }
-    cmd.output().expect("run fuzz burst")
 }
 
 /// The CI burst: a fixed-seed mutation run over the seed corpus must
@@ -159,4 +141,24 @@ fn fuzz_crash_discovery_works_end_to_end() {
         "clean rerun must go green: {}",
         String::from_utf8_lossy(&clean.stdout)
     );
+}
+
+fn manifest_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn run_burst(seeds: &Path, extra: &[&str]) -> std::process::Output {
+    let mut cmd = Command::new(fuzz_bin());
+    cmd.arg("--seeds")
+        .arg(seeds)
+        .arg("--iterations")
+        .arg(ITERATIONS.to_string())
+        .arg("--seed")
+        .arg(PRNG_SEED.to_string())
+        .arg("--crash-dir")
+        .arg(manifest_root().join("target"));
+    for arg in extra {
+        cmd.arg(arg);
+    }
+    cmd.output().expect("run fuzz burst")
 }

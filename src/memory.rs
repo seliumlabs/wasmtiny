@@ -57,7 +57,7 @@ pub struct SharedRange {
     pub reader_slot: Option<u32>,
     /// Base pointer of the region's host mapping. Used for Stage 2 platform
     /// wake emission (`region.ptr() + offset`); not valid for data access
-    /// from guests.
+    /// by the guest (the guest accesses via its own mapping).
     pub(crate) region_ptr: *mut u8,
     /// Shared waiters for atomic wait/notify on addresses within this range.
     /// This is a reference to the SharedRegion's waiters map.

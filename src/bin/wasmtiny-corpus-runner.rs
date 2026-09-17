@@ -6,8 +6,7 @@
 //! process state; this binary only runs the guest and reports what the
 //! runtime did with it.
 
-use std::path::PathBuf;
-use std::process::exit;
+use std::{path::PathBuf, process::exit};
 
 use wasmtiny::security_test::FixtureOptions;
 

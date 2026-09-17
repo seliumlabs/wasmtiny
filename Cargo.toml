@@ -8,20 +8,15 @@ license = "Apache-2.0 OR MIT"
 
 [dependencies]
 anyhow = { version = "1.0", optional = true }
-byteorder = "1.5"
 clap = { version = "4.6", features = ["derive"], optional = true }
-leb128 = "0.2"
 libc = "0.2"
-memchr = "2.8"
 parking_lot = "0.12"
 thiserror = "2.0"
 
 [dev-dependencies]
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 walkdir = "2.5"
-wast = "258.0"
-wat = "1.258"
+wast = "259.0"
+wat = "1.259"
 
 [features]
 default = []

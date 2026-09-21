@@ -9,6 +9,11 @@
 # Guests (tests/corpus) are EXEMPT by design: they are hostile
 # binaries/fixtures, not wasmtiny code. No static gate applies to
 # guest payloads (docs/threat-model.md).
+src/aot/code.rs 11 W^X executable-code mapping: mmap + byte copy + mprotect flip to RX + munmap, icache flush, and raw-pointer Send/Sync for the owned mapping; every site carries a SAFETY comment
+src/aot/context.rs 2 unsafe Send/Sync for FuncDesc, whose raw pointers reference store-owned code images and vmctx that outlive the store; the struct layout is the ABI contract with wasmtiny-aotc
+src/aot/exec.rs 21 native ABI boundary: transmuting loader-validated image entries to fn pointers, dereferencing vmctx/dispatch pointers behind compiled-call and libcall contracts with SAFETY comments
+src/aot/store.rs 2 unsafe Send/Sync for AotTable, whose published base points at capacity-reserved cell storage that is never reallocated and is only read by compiled code under the documented concurrency contract
+src/aot/traps.rs 29 signal-based trap recovery: sigaction/sigaltstack/mmap installation, sigsetjmp/siglongjmp boundary, lock-free raw-pointer trap registry, and ucontext PC extraction; every site carries a SAFETY comment
 src/memory.rs 23 mmap-backed linear memory: raw pointer arithmetic, mprotect/munmap on mappings, and slice views over mmap regions; every site carries a SAFETY comment
 src/runtime/shared_memory.rs 12 shm_open/mmap/ftruncate for shared regions and raw mapping teardown; every site carries a SAFETY comment
 src/runtime/os_wake.rs 5 platform wake-word primitives (futex/_umtx_op/WaitOnAddress) on raw pointers behind cfg(os)

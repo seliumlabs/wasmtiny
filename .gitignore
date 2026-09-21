@@ -1,3 +1,5 @@
 /target
 /.opencode
 .DS_Store
+# Scratch todo list kept by the development workflow — never part of the tree.
+/todo.md

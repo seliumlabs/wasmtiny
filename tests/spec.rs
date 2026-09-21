@@ -816,18 +816,23 @@ fn run_spec_test(filename: &str) -> SpecTestResult {
 
     let mut harness = SpecHarness::new();
     let mut stats = SpecRunStats::default();
+    let mut executed = 0usize;
 
     for (index, directive) in wast.directives.into_iter().enumerate() {
         let (line, _column) = directive.span().linecol_in(&source);
         match harness.run_directive(directive) {
-            Ok(DirectiveOutcome::None) => {}
-            Ok(DirectiveOutcome::Passed) => stats.passed += 1,
+            Ok(DirectiveOutcome::None) => executed += 1,
+            Ok(DirectiveOutcome::Passed) => {
+                stats.passed += 1;
+                executed += 1;
+            }
             Ok(DirectiveOutcome::Skipped(reason)) => {
                 stats.skipped += 1;
                 let _ = reason;
             }
             Err(error) => {
                 stats.failed += 1;
+                executed += 1;
                 stats.errors.push(format!(
                     "directive {} (line {}): {}",
                     index + 1,
@@ -836,6 +841,15 @@ fn run_spec_test(filename: &str) -> SpecTestResult {
                 ));
             }
         }
+    }
+
+    // Skip ceiling: a file whose every directive was skipped provides no
+    // evidence and must fail loudly instead of silently "passing".
+    if executed == 0 {
+        return SpecTestResult::Failed(format!(
+            "all {} directives skipped — the file exercised nothing",
+            stats.skipped
+        ));
     }
 
     if stats.failed > 0 {

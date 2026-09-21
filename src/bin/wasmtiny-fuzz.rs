@@ -2,10 +2,12 @@
 //!
 //! Runs short, deterministic fuzz bursts over the fuzz entry points in
 //! `wasmtiny::security_test` (module loader/validator, interpreter
-//! dispatch, shared-region API) using an in-repo mutation loop with a
-//! fixed PRNG seed — honoring the self-contained test constraint (no
-//! external fuzzer binaries). The entry points are structured so a
-//! real coverage-guided fuzzer can drive them unchanged later.
+//! dispatch, shared-region API, and — with the `aot` feature — the
+//! artifact loader/verifier and native AOT dispatch) using an in-repo
+//! mutation loop with a fixed PRNG seed — honoring the self-contained
+//! test constraint (no external fuzzer binaries). The entry points are
+//! structured so a real coverage-guided fuzzer can drive them unchanged
+//! later.
 //!
 //! Exit codes: 0 = burst completed with no findings; 1 = finding
 //! (failing input written next to the report on stdout); 2 = usage.
@@ -13,6 +15,9 @@
 use std::{path::PathBuf, process::exit};
 
 use wasmtiny::security_test::{Prng, fuzz_execute, fuzz_load, fuzz_shared_region, mutate};
+
+#[cfg(feature = "aot")]
+use wasmtiny::security_test::{fuzz_execute_aot, fuzz_load_aot};
 
 const USAGE: &str = "usage: wasmtiny-fuzz --seeds <path>... [--iterations N] [--seed N]
        [--crash-dir DIR] [--inject-panic-at N]";
@@ -166,6 +171,17 @@ fn run_input(input: &[u8], injection: &mut Option<usize>, iteration: usize) {
     {
         panic!("inject-panic-at: simulated fuzz finding");
     }
+    // Seed corpora may contain `.wasm` seeds, `.aot` artifacts, or both;
+    // every target simply refuses inputs it cannot interpret.
+    #[cfg(feature = "aot")]
+    let closures: [&dyn Fn(); 5] = [
+        &|| fuzz_load(input),
+        &|| fuzz_execute(input),
+        &|| fuzz_shared_region(input),
+        &|| fuzz_load_aot(input),
+        &|| fuzz_execute_aot(input),
+    ];
+    #[cfg(not(feature = "aot"))]
     let closures: [&dyn Fn(); 3] = [&|| fuzz_load(input), &|| fuzz_execute(input), &|| {
         fuzz_shared_region(input)
     }];

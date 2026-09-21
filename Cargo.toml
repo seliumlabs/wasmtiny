@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "crates/wasmtiny-aotc"]
+resolver = "3"
+
 [package]
 name = "wasmtiny"
 version = "0.1.0"
@@ -11,15 +15,24 @@ anyhow = { version = "1.0", optional = true }
 clap = { version = "4.6", features = ["derive"], optional = true }
 libc = "0.2"
 parking_lot = "0.12"
+sha2 = { version = "0.10", optional = true }
 thiserror = "2.0"
 
 [dev-dependencies]
 walkdir = "2.5"
+wasmtiny-aotc = { path = "crates/wasmtiny-aotc" }
 wast = "259.0"
 wat = "1.259"
 
 [features]
-default = []
+default = ["aot"]
+# AOT execution path: artifact loading, integrity verification and native
+# execution. This is the default and, once the interpreter is feature-gated,
+# the AOT-only build excludes wasm parsing and the interpreter.
+aot = ["dep:sha2"]
+# Interpreter execution path plus the wasm parser/validator. Optional;
+# retained as the test/reference oracle and for differential testing.
+interpreter = []
 cli = ["clap", "anyhow"]
 # Stage 2 of host-region-wait-notify: compile in platform wake emission
 # (Linux futex, Windows WakeByAddress, FreeBSD _umtx_op) as a side effect

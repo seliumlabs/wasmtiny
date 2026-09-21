@@ -1,19 +1,55 @@
-## ADDED Requirements
+## Purpose
+
+The interpreter execution mode for WebAssembly bytecode, using a stack-based virtual machine with operand and control stacks and deterministic, trap-safe semantics.
+
+## Requirements
 
 ### Requirement: Classic interpreter execution
-The interpreter SHALL execute WebAssembly bytecode using a stack-based virtual machine with operand and control stacks. It SHALL be the only execution mode; it SHALL NOT contain safepoint, suspension, or per-instruction metering hooks (those subsystems are removed), and it SHALL NOT dispatch host calls through a pending/outcome protocol — host functions return results or errors synchronously.
+The interpreter SHALL execute WebAssembly bytecode using a stack-based virtual machine with operand and control stacks. It SHALL be available in every build alongside the AOT execution path (no longer the only execution mode). It SHALL NOT contain safepoint, suspension, or per-instruction metering hooks (those subsystems are removed), and it SHALL NOT dispatch host calls through a pending/outcome protocol — host functions return results or errors synchronously.
+
+#### Scenario: Bytecode executes via operand and control stacks
+- **WHEN** a function is invoked through the interpreter
+- **THEN** its bytecode executes sequentially via the operand and control stacks and its results are returned
+
+#### Scenario: Default build includes the interpreter
+- **WHEN** the crate is built with default features
+- **THEN** the interpreter is present and `.wasm` input loads and executes through it alongside the AOT path
+
+#### Scenario: Wasm modules execute via the interpreter
+- **WHEN** a `.wasm` module is loaded and its function invoked through the interpreter
+- **THEN** it executes and host calls complete synchronously
 
 ### Requirement: Instruction coverage
 The interpreter SHALL implement all WebAssembly MVP instructions including control flow, memory, numeric, and parametric operations.
 
+#### Scenario: Control flow instructions execute
+- **WHEN** a module uses `block`, `loop`, `if`, `br`, `br_table`, and `return` instructions
+- **THEN** control flow follows the specified semantics
+
+#### Scenario: Numeric and parametric instructions execute
+- **WHEN** a module uses numeric (I32, I64, F32, F64 arithmetic and conversion) and parametric (`drop`, `select`) instructions
+- **THEN** results match the WebAssembly specification
+
 ### Requirement: Host function imports
 The interpreter SHALL support calling imported host functions with proper parameter passing.
+
+#### Scenario: Imported host function receives arguments
+- **WHEN** a module calls an imported host function with arguments
+- **THEN** the host function is invoked with the arguments in order and its return value is delivered back to the guest
 
 ### Requirement: Branch table support
 The interpreter SHALL efficiently handle `br_table` instructions with arbitrary branch table sizes.
 
+#### Scenario: Large branch table with default target
+- **WHEN** a module executes `br_table` with many targets and an index beyond the target range
+- **THEN** in-range indices select their target and out-of-range indices take the default target
+
 ### Requirement: Cross-module funcref dispatch
 The interpreter SHALL execute `call_indirect` through funcrefs stored in imported or shared tables, including functions defined in other modules.
+
+#### Scenario: Funcref from another module dispatched indirectly
+- **WHEN** a table entry holds a funcref defined by a different module and is invoked via `call_indirect`
+- **THEN** the other module's function executes with the expected type checks and result
 
 ### Requirement: Stack overflow detection
 The interpreter SHALL detect and trap on operand stack overflow. The interpreter's stack/call-depth limits SHALL be consistent with the validator's static guarantees, so that no module passing validation fails at runtime for exceeding a limit the validator did not check.

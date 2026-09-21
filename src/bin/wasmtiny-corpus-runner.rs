@@ -10,9 +10,11 @@ use std::{path::PathBuf, process::exit};
 
 use wasmtiny::security_test::FixtureOptions;
 
-const USAGE: &str = "usage: wasmtiny-corpus-runner <module.wasm> [--budget-ms N]
+const USAGE: &str = "usage: wasmtiny-corpus-runner <module.wasm|module.aot> [--budget-ms N]
        [--memory-mb N] [--entry NAME] [--i32-arg N]... [--host-abuse]
-       [--region-pages N] [--selftest-crash] [--selftest-hang]";
+       [--region-pages N] [--selftest-crash] [--selftest-hang]
+       (.aot inputs run through the AOT artifact path; --host-abuse and
+       --region-pages are unsupported for .aot)";
 
 fn main() {
     let mut module: Option<PathBuf> = None;
@@ -105,6 +107,15 @@ fn main() {
     }
 
     wasmtiny::security_test::install_budget_timer(budget_ms);
+
+    // `.aot` fixtures run through the AOT artifact path (load + verify +
+    // native execution); everything else is a `.wasm` for the interpreter
+    // path. `host_abuse`/`region_pages` are interpreter-embedder plumbing
+    // and are rejected by the AOT runner.
+    #[cfg(feature = "aot")]
+    if module.extension().is_some_and(|ext| ext == "aot") {
+        exit(wasmtiny::security_test::run_fixture_aot(&module, &opts));
+    }
 
     exit(wasmtiny::security_test::run_fixture(&module, &opts));
 }

@@ -28,6 +28,12 @@ use crate::{
     runtime::HostFunc, runtime::NumType, runtime::ValType,
 };
 
+#[cfg(feature = "aot")]
+use crate::{
+    aot::{AotInstance, AotLoader},
+    runtime::ExportKind,
+};
+
 /// Fixed verdict line written by the alarm handler. Pre-formatted so
 /// the handler only calls async-signal-safe functions.
 const BUDGET_MSG: &[u8] = b"VERDICT: trapped budget-exhausted\n";
@@ -265,6 +271,51 @@ pub fn fuzz_load(bytes: &[u8]) {
     let _ = app.load_module_from_memory(bytes);
 }
 
+/// Fuzz target: AOT artifact load + native dispatch on mutated artifacts
+/// and adversarial argument values. Traps and errors are acceptable
+/// outcomes; runtime panics are findings.
+#[cfg(feature = "aot")]
+pub fn fuzz_execute_aot(bytes: &[u8]) {
+    let module = match AotLoader::new().load(bytes) {
+        Ok(module) => module,
+        Err(_) => return,
+    };
+    let Ok(mut instance) = AotInstance::new(&module) else {
+        return;
+    };
+
+    // Adversarial argument values derived from the input itself.
+    let arg = |i: usize| {
+        let b = bytes.get(i..i + 4).unwrap_or(&[0; 4]);
+        WasmValue::I32(i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+
+    let func_index = |name: &str| {
+        module
+            .exports
+            .iter()
+            .find(|export| export.name == name)
+            .and_then(|export| match export.kind {
+                ExportKind::Func(idx) => Some(idx),
+                _ => None,
+            })
+    };
+
+    if let Some(idx) = func_index("run") {
+        let _ = instance.invoke(idx, &[arg(0), arg(4)]);
+    }
+    if let Some(idx) = func_index("main") {
+        let _ = instance.invoke(idx, &[arg(8)]);
+    }
+}
+
+/// Fuzz target: AOT artifact loader + verifier. Any `Ok`/`Err` outcome is
+/// acceptable; a panic is a finding.
+#[cfg(feature = "aot")]
+pub fn fuzz_load_aot(bytes: &[u8]) {
+    let _ = AotLoader::new().load(bytes);
+}
+
 /// Fuzz target: shared-region API surface — allocate, attach, write,
 /// read, detach, destroy with adversarial sizes and offsets (TM-09).
 /// `Ok`/`Err` outcomes are acceptable; panics are findings.
@@ -454,6 +505,51 @@ pub fn run_fixture(wasm_path: &Path, opts: &FixtureOptions) -> i32 {
 
     match result {
         Ok(()) => finish(Verdict::Clean, "guest completed"),
+        Err(e) => finish(Verdict::Trapped, &format!("runtime: {e}")),
+    }
+}
+
+/// Runs one AOT fixture inside this process: loads and verifies a `.aot`
+/// artifact, instantiates it (replaying segments and running the start
+/// function), and invokes the requested entry export. Same verdict
+/// protocol as [`run_fixture`]; panics are likewise *not* caught (a
+/// crashing runner is the `crashed` verdict).
+///
+/// The `host_abuse` and `region_pages` options are embedder-interpreter
+/// plumbing and are rejected here; the AOT corpus pass never requests
+/// them.
+#[cfg(feature = "aot")]
+pub fn run_fixture_aot(aot_path: &Path, opts: &FixtureOptions) -> i32 {
+    if opts.host_abuse || opts.region_pages > 0 {
+        return finish(
+            Verdict::Trapped,
+            "aot-runner: host_abuse/region_pages are unsupported on the AOT path",
+        );
+    }
+
+    let bytes = match std::fs::read(aot_path) {
+        Ok(bytes) => bytes,
+        Err(e) => return finish(Verdict::Trapped, &format!("read-rejected: {e}")),
+    };
+    let module = match AotLoader::new().load(&bytes) {
+        Ok(module) => module,
+        Err(e) => return finish(Verdict::Trapped, &format!("load-rejected: {e}")),
+    };
+    // Instantiation replays data/elem segments and runs the start
+    // function; a trapping start fails instantiation here, mapping to
+    // the trapped verdict just like the interpreter path.
+    let mut instance = match AotInstance::new(&module) {
+        Ok(instance) => instance,
+        Err(e) => return finish(Verdict::Trapped, &format!("instantiate-rejected: {e}")),
+    };
+
+    if opts.entry.is_empty() {
+        return finish(Verdict::Clean, "guest completed");
+    }
+
+    let args: Vec<WasmValue> = opts.i32_args.iter().map(|v| WasmValue::I32(*v)).collect();
+    match instance.invoke_export(&opts.entry, &args) {
+        Ok(_) => finish(Verdict::Clean, "guest completed"),
         Err(e) => finish(Verdict::Trapped, &format!("runtime: {e}")),
     }
 }

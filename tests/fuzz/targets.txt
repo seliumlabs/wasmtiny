@@ -4,6 +4,10 @@
 #   loader-validator     -> fuzz_load
 #   interpreter-dispatch -> fuzz_execute
 #   shared-region-api    -> fuzz_shared_region
+#   aot-loader-verifier  -> fuzz_load_aot   (aot feature)
+#   aot-native-dispatch   -> fuzz_execute_aot (aot feature)
 loader-validator TM-07
 interpreter-dispatch TM-08
 shared-region-api TM-09
+aot-loader-verifier TM-02 TM-07
+aot-native-dispatch TM-01 TM-03 TM-08

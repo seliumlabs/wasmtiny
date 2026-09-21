@@ -1341,7 +1341,7 @@ where
     }
 }
 
-fn evaluate_const_expr(
+pub(crate) fn evaluate_const_expr(
     expr: &[u8],
     globals: &[Option<SharedGlobal>],
     func_refs: &[u32],

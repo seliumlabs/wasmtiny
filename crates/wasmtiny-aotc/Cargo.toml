@@ -1,0 +1,31 @@
+[package]
+name = "wasmtiny-aotc"
+version = "0.1.0"
+edition = "2024"
+description = "Ahead-of-time compiler for the wasmtiny runtime; compiles .wasm to .aot using Cranelift"
+repository = "https://github.com/seliumlabs/wasmtiny"
+license = "Apache-2.0 OR MIT"
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"], optional = true }
+cranelift-codegen = { version = "0.111.13", features = ["all-arch"] }
+cranelift-entity = "0.111.13"
+cranelift-frontend = "0.111.13"
+cranelift-wasm = "0.111.13"
+sha2 = "0.10"
+target-lexicon = "0.12"
+thiserror = "2.0"
+wasmparser = "0.215"
+
+[dev-dependencies]
+wasmtiny = { path = "../.." }
+wat = "1.259"
+
+[features]
+default = ["cli"]
+cli = ["dep:clap"]
+
+[[bin]]
+name = "wasmtiny-aotc"
+path = "src/main.rs"
+required-features = ["cli"]

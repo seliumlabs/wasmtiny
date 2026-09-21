@@ -1,15 +1,8 @@
-## ADDED Requirements
+## Purpose
 
-### Requirement: Accurately named core engine
-The crate SHALL expose its core runtime (module loading, instantiation, invocation) under an `engine` module with type names reflecting its interpreter-backed nature. No public item SHALL use `Aot`/`aot_runtime` naming, and no ahead-of-time compilation pipeline SHALL exist.
+Core runtime semantics for loaded WebAssembly modules: module representation and instantiation, isolated memories and tables, globals, cross-module import aliasing, trap handling, error handling, thread safety, and build configurations.
 
-#### Scenario: No AOT-named public API
-- **WHEN** the crate's public API is inspected
-- **THEN** there SHALL be no `aot_runtime` module and no `AotRuntime`/`AotModule`/`AotLoader`/`AotExport` types; their roles SHALL be provided by accurately named equivalents under `engine`
-
-#### Scenario: No native-symbol concept
-- **WHEN** the engine API is inspected
-- **THEN** there SHALL be no `NativeFunc`/`native_functions`/`call_native` registration concept; host interaction SHALL occur exclusively through imported `HostFunc` functions
+## Requirements
 
 ### Requirement: Consumer-driven public API surface
 Public API items SHALL exist only where they serve the interpreter-based embedder use case (module loading, host-function registration, instantiation, invocation, shared-region management, memory access). Items without any caller in the crate or its known embedder SHALL be removed rather than retained.
@@ -20,6 +13,10 @@ Public API items SHALL exist only where they serve the interpreter-based embedde
 
 ### Requirement: Module initialization
 The runtime SHALL provide a `Module` struct representing a loaded WASM module with types, functions, memories, tables, globals, and exports.
+
+#### Scenario: Loaded module exposes its sections
+- **WHEN** a valid wasm binary containing types, functions, memories, tables, globals, and exports is loaded
+- **THEN** the returned `Module` exposes those collections and exports resolve by name
 
 ### Requirement: Instance creation
 The runtime SHALL allow instantiation of a module into an `Instance` with isolated linear memory and table spaces. Instance construction and binding SHALL be managed by the core engine; per-invocation instance state SHALL be cached and reused across calls to the same loaded module rather than rebuilt from a cloned module.
@@ -50,6 +47,14 @@ The runtime SHALL provide safe read/write access to linear memory with bounds ch
 ### Requirement: Table operations
 The runtime SHALL support WebAssembly table operations including get, set, and size.
 
+#### Scenario: Table get, set, and size
+- **WHEN** a guest executes `table.get`, `table.set`, and `table.size` on an in-bounds table
+- **THEN** values are read and written at the requested indices and the reported size matches the table's element count
+
+#### Scenario: Out-of-bounds table access traps
+- **WHEN** a guest executes `table.get` or `table.set` at an index at or beyond the table size
+- **THEN** execution traps with `TrapCode::TableOutOfBounds`
+
 ### Requirement: Cross-module import aliasing
 The runtime SHALL preserve shared state for imported guest functions, tables, memories, and globals across module boundaries. Imported tables SHALL be shared by reference (mutations visible to all importers), and nested instantiation for imported guest functions SHALL share the caller's store (native registry and shared-memory registry).
 
@@ -66,8 +71,20 @@ The runtime SHALL preserve shared state for imported guest functions, tables, me
 ### Requirement: Global variables
 The runtime SHALL support reading and writing mutable global variables.
 
+#### Scenario: Mutable global read/write
+- **WHEN** a module declares a mutable global and a function writes then reads it
+- **THEN** the read returns the written value, and the value persists across invocations sharing the module's state
+
 ### Requirement: Trap handling
 The runtime SHALL propagate traps as errors and provide trap codes for common failure modes.
+
+#### Scenario: Division by zero traps with a typed code
+- **WHEN** a guest executes an integer division where the divisor is zero
+- **THEN** execution returns an `Err` carrying `TrapCode::IntegerDivisionByZero`
+
+#### Scenario: Trap propagates to the caller
+- **WHEN** an exported function traps during invocation
+- **THEN** the error returned to the host preserves the typed `TrapCode`
 
 ### Requirement: Callback-safe lock discipline
 The engine SHALL NOT hold any store, instance, memory, or registry lock across a call into embedder-provided code (`HostFunc` implementations), and lock acquisition order across these objects SHALL follow a single global order to prevent ABBA deadlock.
@@ -83,8 +100,16 @@ The engine SHALL NOT hold any store, instance, memory, or registry lock across a
 ### Requirement: Error handling
 The runtime SHALL use `Result<T, WasmError>` for all fallible operations with structured error types. `WasmError` SHALL use structured, typed variants (via `thiserror`) rather than free-form string payloads where variant data has known shape; variants constructed or matched by known embedders (`Runtime`, `Instantiate`) SHALL remain constructible/matchable with compatible shapes or be migrated with the embedder.
 
+#### Scenario: Fallible operations return typed errors
+- **WHEN** any fallible runtime operation (loading, instantiation, invocation, memory or table access) fails
+- **THEN** the result is an `Err(WasmError)` whose typed variant embedders can match programmatically without parsing message text
+
 ### Requirement: Thread safety
 The runtime SHALL support `Send + Sync` on types where it is safe to share across threads.
+
+#### Scenario: Shared instance invoked from multiple threads
+- **WHEN** an instance wrapped in an `Arc` has its exported functions invoked concurrently from multiple threads
+- **THEN** all invocations complete correctly without data races, panics, or lock poisoning
 
 ### Requirement: Bounded per-invocation engine cost
 Calling an exported function on an already-instantiated module SHALL NOT deep-clone the module, SHALL reuse the module's instance state, and SHALL NOT permanently grow any engine registry (funcref store, native table) as a function of call count.
@@ -129,3 +154,14 @@ The `Memory` struct SHALL track which page ranges are owned vs. mapped from shar
 #### Scenario: Shared instance across threads
 - **WHEN** an `Arc<Instance>` is created and shared between threads
 - **THEN** compilation succeeds only if the instance is thread-safe
+
+### Requirement: Execution build configurations
+The crate SHALL build with the AOT execution path enabled by default (via the `aot` feature). The classic interpreter and `.wasm` parsing SHALL remain compiled and available across builds, and an `interpreter` feature SHALL exist to select the interpreter path for interpreter-only and differential AOT+interpreter builds.
+
+#### Scenario: Default build executes AOT artifacts
+- **WHEN** the crate is built with default features
+- **THEN** it loads, verifies, and executes `.aot` artifacts through the AOT path
+
+#### Scenario: AOT plus interpreter build
+- **WHEN** the crate is built with both the AOT and `interpreter` features enabled
+- **THEN** both execution paths are available for differential testing

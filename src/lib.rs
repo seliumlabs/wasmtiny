@@ -1,24 +1,20 @@
 //! A tiny WebAssembly runtime written in Rust.
 //!
 //! This library provides an API for loading, instantiating, and
-//! executing WebAssembly modules via an interpreter.
+//! executing WebAssembly modules ahead-of-time, plus an optional
+//! feature-gated classic interpreter.
 //!
-//! # Basic Usage
+//! # Basic Usage (AOT path)
 //!
 //! ```ignore
-//! use wasmtiny::{WasmApplication, WasmValue};
+//! use wasmtiny::aot::{AotInstance, AotLoader};
 //!
-//! // Create a new application
-//! let mut app = WasmApplication::new();
-//!
-//! // Load a WebAssembly module
-//! let module_idx = app.load_module_from_file("module.wasm")?;
-//!
-//! // Instantiate the module (resolves imports)
-//! app.instantiate(module_idx)?;
+//! // Load a compiled .aot artifact
+//! let module = AotLoader::new().load(&aot_bytes)?;
+//! let mut instance = AotInstance::new(&module)?;
 //!
 //! // Call a function
-//! let result = app.call_function(module_idx, "add", &[WasmValue::I32(1), WasmValue::I32(2)])?;
+//! let result = instance.invoke(0, &[WasmValue::I32(1), WasmValue::I32(2)])?;
 //! assert_eq!(result, vec![WasmValue::I32(3)]);
 //! ```
 
@@ -42,6 +38,9 @@ pub use runtime::ValType;
 pub use runtime::WasmError;
 pub use runtime::WasmValue;
 
+/// Ahead-of-time execution: artifact loading, verification and native dispatch.
+#[cfg(feature = "aot")]
+pub mod aot;
 /// Application APIs.
 pub mod application;
 pub mod engine;

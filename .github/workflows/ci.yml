@@ -33,6 +33,19 @@ jobs:
       - name: Run tests
         run: cargo test
 
+      # Execution-mode matrix: the default build is AOT-only, and the
+      # interpreter is available behind its feature for both standalone use
+      # and differential testing (aot+interpreter). Every combination must
+      # compile and pass.
+      - name: Run tests (aot + interpreter, differential)
+        run: cargo test --features interpreter
+
+      - name: Run tests (interpreter only)
+        run: cargo test --no-default-features --features interpreter
+
+      - name: Clippy (aot + interpreter, all targets)
+        run: cargo clippy --all-targets --features interpreter -- -D warnings
+
       # Stage 2 of host-region-wait-notify: the emission conformance tests
       # are gated behind the feature; run them on platforms where the
       # backends are compiled in (Linux; Windows/FreeBSD would need a

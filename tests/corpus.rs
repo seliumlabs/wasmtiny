@@ -508,9 +508,82 @@ fn run_corpus(dir: &Path) -> Vec<Failure> {
                 reason: format!("canary violation: {violation}"),
             });
         }
+
+        // AOT pass: the same fixture, compiled ahead of time (in-harness;
+        // the runner binary never links the compiler) and executed
+        // natively through the corpus-runner's `.aot` path, must yield
+        // the same verdict. Fixtures exercising embedder-interpreter
+        // plumbing (host abuse, shared regions) or harness selftests are
+        // interpreter-only.
+        #[cfg(feature = "aot")]
+        if !manifest.host_abuse && manifest.region_pages == 0 && manifest.selftest.is_none() {
+            match compile_aot(&wasm, &manifest.name) {
+                Ok(aot) => {
+                    let mut cmd = Command::new(runner_path());
+                    cmd.arg(&aot)
+                        .arg("--budget-ms")
+                        .arg(manifest.budget_ms.to_string())
+                        .arg("--memory-mb")
+                        .arg(manifest.memory_mb.to_string());
+                    if !manifest.entry.is_empty() {
+                        cmd.arg("--entry").arg(&manifest.entry);
+                    }
+                    for arg in &manifest.i32_args {
+                        cmd.arg("--i32-arg").arg(arg.to_string());
+                    }
+                    let deadline = Duration::from_millis(manifest.budget_ms + DEADLINE_GRACE_MS);
+                    let outcome = run_with_watchdog(cmd, deadline);
+                    if outcome.verdict == Verdict::Hung {
+                        failures.push(Failure {
+                            fixture: format!("{} (aot)", manifest.name),
+                            reason: "HUNG: exceeded the harness deadline on the AOT path \
+                                     (resource-management defect; not a flake)"
+                                .to_string(),
+                        });
+                    } else if outcome.verdict.tag() != manifest.expected {
+                        failures.push(Failure {
+                            fixture: format!("{} (aot)", manifest.name),
+                            reason: format!(
+                                "AOT verdict mismatch: expected {}, got {}\n--- runner output ---\n{}",
+                                manifest.expected,
+                                outcome.verdict.tag(),
+                                outcome.output
+                            ),
+                        });
+                    }
+                }
+                Err(reason) => {
+                    // Compilation refusing the fixture is the AOT
+                    // equivalent of a load rejection: accepted only when
+                    // the interpreter path rejected it too. A guest the
+                    // interpreter accepts but the compiler cannot
+                    // compile is a coverage-parity failure.
+                    if outcome.output.contains("load-rejected") {
+                        continue;
+                    }
+                    failures.push(Failure {
+                        fixture: format!("{} (aot)", manifest.name),
+                        reason,
+                    });
+                }
+            }
+        }
     }
 
     failures
+}
+
+/// Compiles a resolved fixture `.wasm` into a `.aot` artifact for the
+/// AOT corpus pass. The runner binary itself never links the compiler —
+/// it only loads the finished artifact.
+#[cfg(feature = "aot")]
+fn compile_aot(wasm: &Path, name: &str) -> Result<PathBuf, String> {
+    let bytes = fs::read(wasm).map_err(|e| format!("read {}: {e}", wasm.display()))?;
+    let artifact = wasmtiny_aotc::compile_artifact(&bytes, &wasmtiny_aotc::CompilerConfig::host())
+        .map_err(|e| format!("AOT compile failed: {e}"))?;
+    let out = build_dir().join(format!("{name}.aot"));
+    fs::write(&out, artifact).map_err(|e| format!("write {}: {e}", out.display()))?;
+    Ok(out)
 }
 
 /// Spawns the runner in a new process group, enforces the harness

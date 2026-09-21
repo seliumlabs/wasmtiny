@@ -22,6 +22,8 @@ pub use atomic_op::{ATOMIC_OPS, AtomicKind, AtomicOpMeta, lookup as atomic_looku
 pub use error::{Result, TrapCode, WasmError};
 pub use export::{ExportKind, ExportType};
 pub use import::{Import, ImportKind};
+#[cfg(feature = "aot")]
+pub(crate) use instance::evaluate_const_expr;
 pub use instance::{
     Extern, GuestFuncBinding, HostCaller, HostFunc, Instance, SharedGlobal, SharedMemory,
     SharedTable, Store,

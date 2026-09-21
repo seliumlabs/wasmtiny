@@ -61,6 +61,40 @@ fn assemble_seeds(out: &Path) {
         let _ = fs::copy(&file, out.join(format!("seed-malformed-{count:03}.wasm")));
     }
 
+    // AOT seeds: corpus fixtures compiled ahead of time (in-test, via the
+    // compiler's library — the fuzz binary itself never links it), so the
+    // artifact loader/verifier and native-dispatch targets get valid
+    // seeds to mutate. Fixtures the compiler rejects (malformed,
+    // unsupported) are skipped — their `.wasm` seeds already cover the
+    // interpreter loader targets.
+    #[cfg(feature = "aot")]
+    {
+        let corpus = manifest_root().join("tests/corpus");
+        let mut dirs: Vec<_> = fs::read_dir(&corpus)
+            .expect("corpus dir readable")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        dirs.sort();
+        for dir in dirs {
+            let wat_path = dir.join("fixture.wat");
+            let Ok(text) = fs::read_to_string(&wat_path) else {
+                continue;
+            };
+            let Ok(wasm) = wat::parse_str(&text) else {
+                continue;
+            };
+            if let Ok(artifact) =
+                wasmtiny_aotc::compile_artifact(&wasm, &wasmtiny_aotc::CompilerConfig::host())
+            {
+                count += 1;
+                fs::write(out.join(format!("seed-aot-{count:03}.aot")), artifact)
+                    .expect("write aot seed");
+            }
+        }
+    }
+
     assert!(count > 0, "seed corpus must not be empty");
 }
 

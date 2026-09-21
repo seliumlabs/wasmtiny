@@ -4,8 +4,10 @@
 //! Living in the compiler crate keeps the runtime's dependency tree free of
 //! Cranelift; it is the runtime's `aot::AotLoader` under test here.
 
-use wasmtiny::aot::{AotLoader, ExecutableCode};
-use wasmtiny::runtime::{Instance, WasmValue};
+use wasmtiny::{
+    aot::{AotLoader, ExecutableCode},
+    runtime::{Instance, WasmValue},
+};
 use wasmtiny_aotc::{CompilerConfig, artifact::SHA512_LEN, compile_artifact};
 
 const MODULE: &str = r#"(module
@@ -16,6 +18,19 @@ const MODULE: &str = r#"(module
     (func $add (export "add") (param i32 i32) (result i32)
       (i32.add (local.get 0) (local.get 1)))
     (elem (i32.const 0) $add))"#;
+
+#[test]
+fn code_image_maps_executable() {
+    let bytes = from_source("(module (func (export \"f\") (result i32) (i32.const 7)))");
+    let loader = AotLoader::new();
+    let module = loader.load(&bytes).expect("artifact loads");
+    let code = ExecutableCode::from_bytes(&module.code_image).expect("code maps executable");
+    assert_eq!(code.len(), module.code_image.len());
+    // The mapping is at minimum non-empty and executable (the machine code for
+    // the exported function). Execution itself is exercised by the runtime
+    // trampoline path in later stages.
+    assert!(!code.is_empty());
+}
 
 fn from_source(source: &str) -> Vec<u8> {
     let wasm = wat::parse_str(source).expect("wat parses");
@@ -107,6 +122,18 @@ fn tampered_artifact_is_refused() {
 }
 
 #[test]
+fn truncated_artifact_errors_without_panicking() {
+    let bytes = from_source(MODULE);
+    let loader = AotLoader::new();
+    for cut in [4usize, 16, 40, bytes.len() / 2, bytes.len() - 1] {
+        assert!(
+            loader.load(&bytes[..cut]).is_err(),
+            "truncation at {cut} must be refused"
+        );
+    }
+}
+
+#[test]
 fn unsigned_artifact_is_refused() {
     // Remove the entire trailing integrity section (id + length + scheme +
     // key_id_len + digest).
@@ -125,18 +152,6 @@ fn unsigned_artifact_is_refused() {
 }
 
 #[test]
-fn truncated_artifact_errors_without_panicking() {
-    let bytes = from_source(MODULE);
-    let loader = AotLoader::new();
-    for cut in [4usize, 16, 40, bytes.len() / 2, bytes.len() - 1] {
-        assert!(
-            loader.load(&bytes[..cut]).is_err(),
-            "truncation at {cut} must be refused"
-        );
-    }
-}
-
-#[test]
 fn wrong_abi_version_is_refused() {
     let mut bytes = from_source(MODULE);
     // ABI version field is the second u32 (offset 4 within the header, + magic 4).
@@ -148,17 +163,4 @@ fn wrong_abi_version_is_refused() {
         .load(&bytes)
         .expect_err("mismatched ABI must be refused");
     assert!(format!("{err}").contains("ABI"), "got {err}");
-}
-
-#[test]
-fn code_image_maps_executable() {
-    let bytes = from_source("(module (func (export \"f\") (result i32) (i32.const 7)))");
-    let loader = AotLoader::new();
-    let module = loader.load(&bytes).expect("artifact loads");
-    let code = ExecutableCode::from_bytes(&module.code_image).expect("code maps executable");
-    assert_eq!(code.len(), module.code_image.len());
-    // The mapping is at minimum non-empty and executable (the machine code for
-    // the exported function). Execution itself is exercised by the runtime
-    // trampoline path in later stages.
-    assert!(!code.is_empty());
 }

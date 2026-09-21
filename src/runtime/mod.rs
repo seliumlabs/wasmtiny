@@ -14,6 +14,8 @@
 //! - [`WasmError`] - Error types for validation, loading, instantiation, and runtime
 //! - [`Memory`], [`Table`], [`Global`] - Runtime objects
 
+#[cfg(feature = "aot")]
+pub(crate) use instance::evaluate_const_expr;
 pub(crate) use shared_memory::WaiterMap;
 pub(crate) use shared_memory::{ensure_shared_waiter, shared_notify, shared_wait};
 
@@ -22,8 +24,6 @@ pub use atomic_op::{ATOMIC_OPS, AtomicKind, AtomicOpMeta, lookup as atomic_looku
 pub use error::{Result, TrapCode, WasmError};
 pub use export::{ExportKind, ExportType};
 pub use import::{Import, ImportKind};
-#[cfg(feature = "aot")]
-pub(crate) use instance::evaluate_const_expr;
 pub use instance::{
     Extern, GuestFuncBinding, HostCaller, HostFunc, Instance, SharedGlobal, SharedMemory,
     SharedTable, Store,

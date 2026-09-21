@@ -2,11 +2,15 @@
 
 use std::sync::{Arc, OnceLock};
 
-use wasmtiny::aot::{AotExtern, AotInstance, AotLoader, AotStore};
-use wasmtiny::runtime::{FunctionType, HostCaller, HostFunc, NumType, Result, ValType, WasmValue};
+use wasmtiny::{
+    aot::{AotExtern, AotInstance, AotLoader, AotStore},
+    runtime::{FunctionType, HostCaller, HostFunc, NumType, Result, ValType, WasmValue},
+};
 use wasmtiny_aotc::{CompilerConfig, compile_artifact};
 
 struct AddHost;
+
+struct ScaleHost;
 
 impl HostFunc for AddHost {
     fn call(&self, _caller: &mut HostCaller<'_>, args: &[WasmValue]) -> Result<Vec<WasmValue>> {
@@ -25,8 +29,6 @@ impl HostFunc for AddHost {
         }))
     }
 }
-
-struct ScaleHost;
 
 impl HostFunc for ScaleHost {
     fn call(&self, _caller: &mut HostCaller<'_>, args: &[WasmValue]) -> Result<Vec<WasmValue>> {
@@ -79,6 +81,27 @@ fn host_function_is_called_with_correct_arguments() {
 }
 
 #[test]
+fn import_type_mismatch_is_rejected() {
+    let loader = AotLoader::new();
+    let module = loader
+        .load(&compile(
+            "(module (import \"env\" \"add\" (func $add (param i64 i64) (result i64))))",
+        ))
+        .expect("artifact loads");
+
+    // AddHost declares (i32,i32)->i32; the module demands (i64,i64)->i64.
+    let imports = [(
+        "env".to_string(),
+        "add".to_string(),
+        AotExtern::HostFunc(Arc::new(AddHost)),
+    )];
+    let err = AotInstance::instantiate(&AotStore::shared(), &module, &imports)
+        .err()
+        .expect("type mismatch must fail instantiation");
+    assert!(format!("{err}").contains("mismatch"), "got {err}");
+}
+
+#[test]
 fn mixed_type_host_function_receives_types() {
     let loader = AotLoader::new();
     let module = loader
@@ -117,25 +140,4 @@ fn unsatisfied_import_is_rejected() {
         .err()
         .expect("unsatisfied import must fail instantiation");
     assert!(format!("{err}").contains("not satisfied"), "got {err}");
-}
-
-#[test]
-fn import_type_mismatch_is_rejected() {
-    let loader = AotLoader::new();
-    let module = loader
-        .load(&compile(
-            "(module (import \"env\" \"add\" (func $add (param i64 i64) (result i64))))",
-        ))
-        .expect("artifact loads");
-
-    // AddHost declares (i32,i32)->i32; the module demands (i64,i64)->i64.
-    let imports = [(
-        "env".to_string(),
-        "add".to_string(),
-        AotExtern::HostFunc(Arc::new(AddHost)),
-    )];
-    let err = AotInstance::instantiate(&AotStore::shared(), &module, &imports)
-        .err()
-        .expect("type mismatch must fail instantiation");
-    assert!(format!("{err}").contains("mismatch"), "got {err}");
 }

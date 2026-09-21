@@ -4,202 +4,20 @@
 
 #![cfg(all(feature = "aot", feature = "interpreter"))]
 
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    rc::Rc,
+    sync::{Arc, Mutex},
+};
+
 use wasmtiny::{
     WasmApplication,
     aot::{AotExtern, AotInstance, AotLoader, AotStore},
+    runtime::Import,
     runtime::{ExportKind, FunctionType, RefType, WasmValue},
 };
 use wasmtiny_aotc::{CompilerConfig, compile_artifact};
-
-/// Runs `source` (with one exported `run` function) through both engines and
-/// asserts the results (values or typed traps) are identical for `args`.
-fn check(source: &str, args: &[WasmValue]) {
-    let wasm = wat::parse_str(source).expect("wat parses");
-
-    // Interpreter.
-    let mut app = WasmApplication::new();
-    let idx = app
-        .load_module_from_memory(&wasm)
-        .expect("interpreter loads");
-    app.instantiate(idx).expect("interpreter instantiates");
-    let interp = app.call_function(idx, "run", args);
-
-    // AOT.
-    let artifact = compile_artifact(&wasm, &CompilerConfig::host()).expect("compilation succeeds");
-    let module = AotLoader::new().load(&artifact).expect("artifact loads");
-    let mut instance = AotInstance::new(&module).expect("instantiation succeeds");
-    let run_index = module
-        .exports
-        .iter()
-        .find(|e| e.name == "run")
-        .and_then(|e| match e.kind {
-            ExportKind::Func(idx) => Some(idx),
-            _ => None,
-        })
-        .expect("run export exists");
-    let aot = instance.invoke(run_index, args);
-
-    let shape = |result: &Result<Vec<WasmValue>, wasmtiny::runtime::WasmError>| match result {
-        Ok(values) => format!(
-            "ok[{}]",
-            values.iter().map(normalise).collect::<Vec<_>>().join(",")
-        ),
-        Err(error) => format!("err:{error:?}"),
-    };
-
-    assert_eq!(
-        shape(&aot),
-        shape(&interp),
-        "divergence for {source:?} with args {args:?}\ninterp: {interp:?}\naot: {aot:?}"
-    );
-}
-
-/// Collapses NaN payloads (engines may differ in NaN bit patterns).
-fn normalise(value: &WasmValue) -> String {
-    match value {
-        WasmValue::F32(v) if v.is_nan() => "nan:f32".to_string(),
-        WasmValue::F64(v) if v.is_nan() => "nan:f64".to_string(),
-        other => format!("{other:?}"),
-    }
-}
-
-#[test]
-fn arithmetic_and_control_flow() {
-    check(
-        "(module (func (export \"run\") (param i32 i32) (result i32)
-           (i32.mul (i32.add (local.get 0) (local.get 1)) (i32.const 3))))",
-        &[WasmValue::I32(4), WasmValue::I32(7)],
-    );
-    check(
-        "(module (func (export \"run\") (param i32) (result i32)
-           (if (result i32) (i32.gt_s (local.get 0) (i32.const 0))
-             (then (i32.const 111)) (else (i32.const 222)))))",
-        &[WasmValue::I32(5)],
-    );
-    check(
-        "(module (func (export \"run\") (param i32) (result i32)
-           (local $n i32) (local $acc i32)
-           (local.set $n (local.get 0))
-           (block $exit
-             (loop $l
-               (br_if $exit (i32.le_s (local.get $n) (i32.const 0)))
-               (local.set $acc (i32.add (local.get $acc) (local.get $n)))
-               (local.set $n (i32.sub (local.get $n) (i32.const 1)))
-               (br $l)))
-           (local.get $acc)))",
-        &[WasmValue::I32(5)],
-    );
-}
-
-#[test]
-fn memory_and_bulk_operations() {
-    check(
-        "(module (memory 1)
-           (func (export \"run\") (result i32)
-             (i32.store (i32.const 100) (i32.const 42))
-             (i32.load (i32.const 100))))",
-        &[],
-    );
-    check(
-        "(module (memory 1)
-           (func (export \"run\") (result i32)
-             (memory.fill (i32.const 0) (i32.const 7) (i32.const 4))
-             (i32.load8_u (i32.const 3))))",
-        &[],
-    );
-    check(
-        "(module (memory 1) (data (i32.const 0) \"abcd\")
-           (func (export \"run\") (result i32)
-             (memory.copy (i32.const 4) (i32.const 0) (i32.const 4))
-             (i32.load8_u (i32.const 6))))",
-        &[],
-    );
-    check(
-        "(module (memory 1 3)
-           (func (export \"run\") (result i32) (memory.grow (i32.const 2))))",
-        &[],
-    );
-}
-
-#[test]
-fn globals_and_call_indirect() {
-    check(
-        "(module (global $g (mut i32) (i32.const 1))
-           (func (export \"run\") (result i32)
-             (global.set $g (i32.add (global.get $g) (i32.const 10)))
-             (global.get $g)))",
-        &[],
-    );
-    check(
-        "(module (type $t (func (result i32)))
-           (table 2 funcref)
-           (func $f (result i32) (i32.const 99))
-           (elem (i32.const 0) func $f)
-           (func (export \"run\") (result i32)
-             (call_indirect (type $t) (i32.const 0))))",
-        &[],
-    );
-}
-
-#[test]
-fn refs_and_tables() {
-    // Element segments + `call_indirect` through a table (no in-body ref.func,
-    // which the interpreter's declaration-order check rejects).
-    check(
-        "(module (table 2 funcref)
-           (func $f (result i32) (i32.const 7))
-           (elem (i32.const 1) func $f)
-           (func (export \"run\") (result i32)
-             (call_indirect (type 0) (i32.const 1))))",
-        &[],
-    );
-}
-
-#[test]
-fn trap_parity() {
-    // These must trap identically in both engines.
-    check(
-        "(module (memory 1)
-           (func (export \"run\") (result i32)
-             (i32.load (i32.const 100000))))",
-        &[],
-    );
-    check(
-        "(module (func (export \"run\") (result i32) (unreachable)))",
-        &[],
-    );
-    check(
-        "(module (table 1 funcref)
-           (func (export \"run\") (result i32)
-             (call_indirect (type 0) (i32.const 5))))",
-        &[],
-    );
-}
-
-#[test]
-fn saturating_conversions() {
-    check(
-        "(module (func (export \"run\") (result i32)
-           (i32.trunc_sat_f64_s (f64.const 1.0e20))))",
-        &[],
-    );
-    check(
-        "(module (func (export \"run\") (result i32)
-           (i32.trunc_sat_f32_u (f32.const -1.0))))",
-        &[],
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Corpus differential: every vendored spec-corpus directive is executed
-// through both engines and the observable outcomes are compared.
-// ---------------------------------------------------------------------------
-
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::rc::Rc;
-use std::sync::{Arc, Mutex};
-
 use wast::{
     Wast, WastArg, WastDirective, WastExecute, WastInvoke,
     core::{AbstractHeapType, WastArgCore},
@@ -207,7 +25,6 @@ use wast::{
 };
 
 const SPEC_DIR: &str = "tests/spec-core/";
-
 const SPEC_FILES: &[&str] = &[
     "block.wast",
     "br.wast",
@@ -308,145 +125,56 @@ enum Obs {
     Skip,
 }
 
-fn prepare(directive: WastDirective<'_>) -> Prepared {
-    match directive {
-        WastDirective::Module(mut module) => Prepared::Module {
-            name: module.name().map(|id| id.name().to_string()),
-            wasm: module.encode().ok(),
-        },
-        WastDirective::ModuleDefinition(mut module) => Prepared::Definition {
-            wasm: module.encode().ok(),
-        },
-        WastDirective::Register { name, module, .. } => Prepared::Register {
-            name: name.to_string(),
-            module: module.map(|id| id.name().to_string()),
-        },
-        WastDirective::Invoke(invoke) => prepare_invoke(&invoke),
-        WastDirective::AssertReturn { exec, .. } => prepare_exec(exec),
-        WastDirective::AssertTrap { exec, .. } => prepare_exec(exec),
-        WastDirective::AssertExhaustion { call, .. } => prepare_invoke(&call),
-        WastDirective::AssertInvalid { mut module, .. }
-        | WastDirective::AssertMalformed { mut module, .. } => Prepared::MustReject {
-            wasm: module.encode().ok(),
-        },
-        WastDirective::AssertUnlinkable { mut module, .. } => Prepared::MustReject {
-            wasm: module.encode().ok(),
-        },
-        WastDirective::AssertException { .. }
-        | WastDirective::AssertSuspension { .. }
-        | WastDirective::AssertInvalidCustom { .. }
-        | WastDirective::AssertMalformedCustom { .. }
-        | WastDirective::Thread(_)
-        | WastDirective::Wait { .. }
-        | WastDirective::ModuleInstance { .. } => Prepared::Ignored,
-    }
-}
-
-fn prepare_exec(exec: WastExecute<'_>) -> Prepared {
-    match exec {
-        WastExecute::Invoke(invoke) => prepare_invoke(&invoke),
-        WastExecute::Wat(mut module) => Prepared::Module {
-            name: None,
-            wasm: module.encode().ok(),
-        },
-        WastExecute::Get { module, global, .. } => Prepared::Get {
-            module: module.map(|id| id.name().to_string()),
-            global: global.to_string(),
-        },
-    }
-}
-
-fn prepare_invoke(invoke: &WastInvoke<'_>) -> Prepared {
-    Prepared::Invoke {
-        module: invoke.module.map(|id| id.name().to_string()),
-        function: invoke.name.to_string(),
-        args: invoke
-            .args
-            .iter()
-            .map(wast_arg_to_value)
-            .collect::<Option<Vec<_>>>(),
-    }
-}
-
-fn wast_arg_to_value(arg: &WastArg<'_>) -> Option<WasmValue> {
-    let WastArg::Core(core) = arg else {
-        return None;
-    };
-    match core {
-        WastArgCore::I32(value) => Some(WasmValue::I32(*value)),
-        WastArgCore::I64(value) => Some(WasmValue::I64(*value)),
-        WastArgCore::F32(value) => Some(WasmValue::F32(f32::from_bits(value.bits))),
-        WastArgCore::F64(value) => Some(WasmValue::F64(f64::from_bits(value.bits))),
-        WastArgCore::RefNull(heap_type) => {
-            let reftype = match heap_type {
-                wast::core::HeapType::Abstract { ty, .. } => match ty {
-                    AbstractHeapType::Func | AbstractHeapType::NoFunc => Some(RefType::FuncRef),
-                    AbstractHeapType::Extern | AbstractHeapType::NoExtern => {
-                        Some(RefType::ExternRef)
-                    }
-                    _ => None,
-                },
-                _ => None,
-            }?;
-            Some(WasmValue::NullRef(reftype))
-        }
-        WastArgCore::RefExtern(value) => Some(WasmValue::ExternRef(*value)),
-        WastArgCore::RefHost(value) => Some(WasmValue::ExternRef(*value)),
-        WastArgCore::V128(_) => None,
-    }
-}
-
-/// Value normalisation for cross-engine comparison: NaNs collapse to their
-/// class; funcref handles are engine-internal, so only "a funcref" compares.
-fn normalise_value(value: &WasmValue) -> String {
-    match value {
-        WasmValue::F32(v) if v.is_nan() => "nan:f32".to_string(),
-        WasmValue::F64(v) if v.is_nan() => "nan:f64".to_string(),
-        WasmValue::FuncRef(_) => "funcref".to_string(),
-        WasmValue::NullRef(t) => format!("null:{t:?}"),
-        other => format!("{other:?}"),
-    }
-}
-
-/// Classifies an execution error for comparison.
-fn classify_error(error: &wasmtiny::runtime::WasmError) -> Obs {
-    use wasmtiny::runtime::WasmError;
-    match error {
-        WasmError::Trap(code) => Obs::Trap(*code),
-        other => {
-            let text = other.to_string();
-            if text.contains("no current module")
-                || text.contains("unknown module id")
-                || text.contains("unknown import module")
-                || text.contains("register directive")
-            {
-                Obs::Skip
-            } else {
-                Obs::Failed
-            }
-        }
-    }
-}
-
-/// The fixed signatures of the `spectest` host functions.
-fn spectest_function_type(name: &str) -> Result<FunctionType, String> {
-    use wasmtiny::runtime::{NumType, ValType};
-    let params = match name {
-        "print" => vec![],
-        "print_i32" => vec![ValType::Num(NumType::I32)],
-        "print_i64" => vec![ValType::Num(NumType::I64)],
-        "print_f32" => vec![ValType::Num(NumType::F32)],
-        "print_f64" => vec![ValType::Num(NumType::F64)],
-        "print_i32_f32" => vec![ValType::Num(NumType::I32), ValType::Num(NumType::F32)],
-        "print_f64_f64" => vec![ValType::Num(NumType::F64), ValType::Num(NumType::F64)],
-        other => return Err(format!("unknown spectest function {other}")),
-    };
-    Ok(FunctionType::new(params, vec![]))
-}
-
 /// A host function that accepts anything and returns nothing.
 struct NoOpHostFunc {
     function_type: FunctionType,
+}
+
+struct InterpSide {
+    app: WasmApplication,
+    parser: wasmtiny::loader::Parser,
+    validator: wasmtiny::loader::Validator,
+    named: HashMap<String, u32>,
+    registered: HashMap<String, u32>,
+    current: Option<u32>,
+}
+
+/// A compiled, loaded, instantiated AOT module, kept alive under its WAST
+/// `$name` or registered import name (the instance holds mutable state —
+/// memories, globals — that later directives must observe).
+struct AotSideModule {
+    module: wasmtiny::aot::AotModule,
+    instance: RefCell<AotInstance>,
+}
+
+struct AotSide {
+    store: Arc<Mutex<AotStore>>,
+    modules: HashMap<String, Rc<AotSideModule>>,
+    current: Option<Rc<AotSideModule>>,
+}
+
+struct CountingHost {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+/// A one-shot engine pair for a regression scenario.
+struct Scenario {
+    wat: &'static str,
+    /// Optional host function bound to `env.host` (param i32 i32, result i64).
+    host: Option<std::sync::Arc<CountingHost>>,
+}
+
+/// Boxable wrapper so the same host function feeds both engines.
+struct SharedCountingHost(std::sync::Arc<CountingHost>);
+
+struct InterpScenario {
+    app: WasmApplication,
+    idx: u32,
+}
+
+struct AotScenario {
+    instance: AotInstance,
+    _module: wasmtiny::aot::AotModule,
 }
 
 impl wasmtiny::runtime::HostFunc for NoOpHostFunc {
@@ -461,37 +189,6 @@ impl wasmtiny::runtime::HostFunc for NoOpHostFunc {
     fn function_type(&self) -> Option<&FunctionType> {
         Some(&self.function_type)
     }
-}
-
-/// Whether a compile refusal means "outside the supported feature set"
-/// (not comparable across engines) rather than a genuine rejection.
-fn is_unsupported(error: &wasmtiny_aotc::CompileError) -> bool {
-    match error {
-        wasmtiny_aotc::CompileError::Unsupported(_) => true,
-        wasmtiny_aotc::CompileError::Validation(message) => {
-            let message = message.to_ascii_lowercase();
-            message.contains("constant expression required")
-                || message.contains("function references required")
-                || message.contains("tables with expression initializers")
-                || message.contains("gc feature")
-                || message.contains("exceptions proposal")
-                || message.contains("table size is out of bounds")
-        }
-        _ => false,
-    }
-}
-
-// --- interpreter side -------------------------------------------------------
-
-use wasmtiny::runtime::Import;
-
-struct InterpSide {
-    app: WasmApplication,
-    parser: wasmtiny::loader::Parser,
-    validator: wasmtiny::loader::Validator,
-    named: HashMap<String, u32>,
-    registered: HashMap<String, u32>,
-    current: Option<u32>,
 }
 
 impl InterpSide {
@@ -841,22 +538,6 @@ impl InterpSide {
     }
 }
 
-// --- AOT side ---------------------------------------------------------------
-
-/// A compiled, loaded, instantiated AOT module, kept alive under its WAST
-/// `$name` or registered import name (the instance holds mutable state —
-/// memories, globals — that later directives must observe).
-struct AotSideModule {
-    module: wasmtiny::aot::AotModule,
-    instance: RefCell<AotInstance>,
-}
-
-struct AotSide {
-    store: Arc<Mutex<AotStore>>,
-    modules: HashMap<String, Rc<AotSideModule>>,
-    current: Option<Rc<AotSideModule>>,
-}
-
 impl AotSide {
     fn new() -> Self {
         Self {
@@ -1125,142 +806,6 @@ impl AotSide {
     }
 }
 
-fn compile_and_load(wasm: &[u8]) -> Result<wasmtiny::aot::AotModule, wasmtiny_aotc::CompileError> {
-    let artifact = wasmtiny_aotc::compile_artifact(wasm, &CompilerConfig::host())?;
-    AotLoader::new()
-        .load(&artifact)
-        .map_err(|error| wasmtiny_aotc::CompileError::Internal(error.to_string()))
-}
-
-fn export_index(
-    module: &wasmtiny::aot::AotModule,
-    name: &str,
-    want: impl Fn(&wasmtiny::runtime::ExportKind) -> Option<u32>,
-) -> Option<u32> {
-    module
-        .exports
-        .iter()
-        .find(|export| export.name == name)
-        .and_then(|export| want(&export.kind))
-}
-
-// --- the differential driver ------------------------------------------------
-
-/// Runs every directive of every vendored spec-corpus file through both
-/// engines and compares the observable outcomes: identical values (with NaN
-/// classes collapsed), identical typed trap codes, identical rejection of
-/// invalid/malformed/unlinkable modules. Directives an engine cannot handle
-/// (unsupported proposals, missing context) are skipped symmetrically; a
-/// file whose directives are all skipped fails the run.
-#[test]
-fn corpus_directives_agree_across_engines() {
-    let mut divergences: Vec<String> = Vec::new();
-    let mut compared = 0usize;
-    let mut skipped = 0usize;
-
-    for file in SPEC_FILES {
-        let path = format!("{SPEC_DIR}{file}");
-        let source = std::fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("failed to read spec file {path}: {error}"));
-        let buf = ParseBuffer::new(&source).expect("parse WAST buffer");
-        let wast = parser::parse::<Wast<'_>>(&buf).expect("parse WAST");
-
-        let mut interp = InterpSide::new();
-        let mut aot = AotSide::new();
-        let (mut file_compared, mut file_skipped) = (0usize, 0usize);
-
-        for (index, directive) in wast.directives.into_iter().enumerate() {
-            let (line, _column) = directive.span().linecol_in(&source);
-            let prepared = prepare(directive);
-            let interp_obs = interp.observe(&prepared);
-            let aot_obs = aot.observe(&prepared);
-
-            if interp_obs == Obs::Skip || aot_obs == Obs::Skip {
-                file_skipped += 1;
-                continue;
-            }
-            if interp_obs != aot_obs {
-                divergences.push(format!(
-                    "{file} directive {} (line {}): interpreter {interp_obs:?} vs AOT {aot_obs:?}",
-                    index + 1,
-                    line + 1,
-                ));
-            }
-            file_compared += 1;
-        }
-
-        // Skip ceiling: a file that compared nothing provides no parity
-        // evidence at all and must fail loudly rather than "pass".
-        if file_compared == 0 && file_skipped > 0 {
-            divergences.push(format!(
-                "{file}: all {file_skipped} directives skipped — no differential evidence"
-            ));
-        }
-        compared += file_compared;
-        skipped += file_skipped;
-    }
-
-    assert!(
-        divergences.is_empty(),
-        "engine divergence ({} directives compared, {} skipped):\n{}",
-        compared,
-        skipped,
-        divergences.join("\n")
-    );
-    // Sanity: the corpus is large; a wiring bug that compares nothing must
-    // fail the run.
-    assert!(
-        compared > 10_000,
-        "suspiciously little differential coverage: {compared} directives compared"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Regression differential: the scenarios guarded by the regression suites
-// (spine_repro.rs, atomic_regression.rs) are executed through BOTH engines,
-// with the suites' expected results asserted on each and the outcomes
-// compared. host_region_wait_notify.rs exercises the embedder shared-region
-// API, which is interpreter-embedder plumbing (the AOT corpus covers the
-// same boundary from the guest side); its atomic semantics are covered by
-// the scenarios below.
-// ---------------------------------------------------------------------------
-
-/// A one-shot engine pair for a regression scenario.
-struct Scenario {
-    wat: &'static str,
-    /// Optional host function bound to `env.host` (param i32 i32, result i64).
-    host: Option<std::sync::Arc<CountingHost>>,
-}
-
-struct CountingHost {
-    calls: std::sync::atomic::AtomicUsize,
-}
-
-/// Boxable wrapper so the same host function feeds both engines.
-struct SharedCountingHost(std::sync::Arc<CountingHost>);
-
-impl wasmtiny::runtime::HostFunc for SharedCountingHost {
-    fn call(
-        &self,
-        caller: &mut wasmtiny::runtime::HostCaller<'_>,
-        args: &[WasmValue],
-    ) -> wasmtiny::runtime::Result<Vec<WasmValue>> {
-        self.0.call(caller, args)
-    }
-    fn function_type(&self) -> Option<&FunctionType> {
-        static TYPE: std::sync::OnceLock<FunctionType> = std::sync::OnceLock::new();
-        Some(TYPE.get_or_init(counting_host_type))
-    }
-}
-
-fn counting_host_type() -> FunctionType {
-    use wasmtiny::runtime::{NumType, ValType};
-    FunctionType::new(
-        vec![ValType::Num(NumType::I32), ValType::Num(NumType::I32)],
-        vec![ValType::Num(NumType::I64)],
-    )
-}
-
 impl wasmtiny::runtime::HostFunc for CountingHost {
     fn call(
         &self,
@@ -1352,9 +897,18 @@ impl Scenario {
     }
 }
 
-struct InterpScenario {
-    app: WasmApplication,
-    idx: u32,
+impl wasmtiny::runtime::HostFunc for SharedCountingHost {
+    fn call(
+        &self,
+        caller: &mut wasmtiny::runtime::HostCaller<'_>,
+        args: &[WasmValue],
+    ) -> wasmtiny::runtime::Result<Vec<WasmValue>> {
+        self.0.call(caller, args)
+    }
+    fn function_type(&self) -> Option<&FunctionType> {
+        static TYPE: std::sync::OnceLock<FunctionType> = std::sync::OnceLock::new();
+        Some(TYPE.get_or_init(counting_host_type))
+    }
 }
 
 impl InterpScenario {
@@ -1363,15 +917,38 @@ impl InterpScenario {
     }
 }
 
-struct AotScenario {
-    instance: AotInstance,
-    _module: wasmtiny::aot::AotModule,
-}
-
 impl AotScenario {
     fn call(&mut self, function: &str) -> wasmtiny::runtime::Result<Vec<WasmValue>> {
         self.instance.invoke_export(function, &[])
     }
+}
+
+#[test]
+fn arithmetic_and_control_flow() {
+    check(
+        "(module (func (export \"run\") (param i32 i32) (result i32)
+           (i32.mul (i32.add (local.get 0) (local.get 1)) (i32.const 3))))",
+        &[WasmValue::I32(4), WasmValue::I32(7)],
+    );
+    check(
+        "(module (func (export \"run\") (param i32) (result i32)
+           (if (result i32) (i32.gt_s (local.get 0) (i32.const 0))
+             (then (i32.const 111)) (else (i32.const 222)))))",
+        &[WasmValue::I32(5)],
+    );
+    check(
+        "(module (func (export \"run\") (param i32) (result i32)
+           (local $n i32) (local $acc i32)
+           (local.set $n (local.get 0))
+           (block $exit
+             (loop $l
+               (br_if $exit (i32.le_s (local.get $n) (i32.const 0)))
+               (local.set $acc (i32.add (local.get $acc) (local.get $n)))
+               (local.set $n (i32.sub (local.get $n) (i32.const 1)))
+               (br $l)))
+           (local.get $acc)))",
+        &[WasmValue::I32(5)],
+    );
 }
 
 /// Runs one invocation on both engines, asserting the shared expected
@@ -1422,6 +999,447 @@ fn assert_scenario_call(
             }
         }
     }
+}
+
+/// Runs `source` (with one exported `run` function) through both engines and
+/// asserts the results (values or typed traps) are identical for `args`.
+fn check(source: &str, args: &[WasmValue]) {
+    let wasm = wat::parse_str(source).expect("wat parses");
+
+    // Interpreter.
+    let mut app = WasmApplication::new();
+    let idx = app
+        .load_module_from_memory(&wasm)
+        .expect("interpreter loads");
+    app.instantiate(idx).expect("interpreter instantiates");
+    let interp = app.call_function(idx, "run", args);
+
+    // AOT.
+    let artifact = compile_artifact(&wasm, &CompilerConfig::host()).expect("compilation succeeds");
+    let module = AotLoader::new().load(&artifact).expect("artifact loads");
+    let mut instance = AotInstance::new(&module).expect("instantiation succeeds");
+    let run_index = module
+        .exports
+        .iter()
+        .find(|e| e.name == "run")
+        .and_then(|e| match e.kind {
+            ExportKind::Func(idx) => Some(idx),
+            _ => None,
+        })
+        .expect("run export exists");
+    let aot = instance.invoke(run_index, args);
+
+    let shape = |result: &Result<Vec<WasmValue>, wasmtiny::runtime::WasmError>| match result {
+        Ok(values) => format!(
+            "ok[{}]",
+            values.iter().map(normalise).collect::<Vec<_>>().join(",")
+        ),
+        Err(error) => format!("err:{error:?}"),
+    };
+
+    assert_eq!(
+        shape(&aot),
+        shape(&interp),
+        "divergence for {source:?} with args {args:?}\ninterp: {interp:?}\naot: {aot:?}"
+    );
+}
+
+/// Classifies an execution error for comparison.
+fn classify_error(error: &wasmtiny::runtime::WasmError) -> Obs {
+    use wasmtiny::runtime::WasmError;
+    match error {
+        WasmError::Trap(code) => Obs::Trap(*code),
+        other => {
+            let text = other.to_string();
+            if text.contains("no current module")
+                || text.contains("unknown module id")
+                || text.contains("unknown import module")
+                || text.contains("register directive")
+            {
+                Obs::Skip
+            } else {
+                Obs::Failed
+            }
+        }
+    }
+}
+
+fn compile_and_load(wasm: &[u8]) -> Result<wasmtiny::aot::AotModule, wasmtiny_aotc::CompileError> {
+    let artifact = wasmtiny_aotc::compile_artifact(wasm, &CompilerConfig::host())?;
+    AotLoader::new()
+        .load(&artifact)
+        .map_err(|error| wasmtiny_aotc::CompileError::Internal(error.to_string()))
+}
+
+/// Runs every directive of every vendored spec-corpus file through both
+/// engines and compares the observable outcomes: identical values (with NaN
+/// classes collapsed), identical typed trap codes, identical rejection of
+/// invalid/malformed/unlinkable modules. Directives an engine cannot handle
+/// (unsupported proposals, missing context) are skipped symmetrically; a
+/// file whose directives are all skipped fails the run.
+#[test]
+fn corpus_directives_agree_across_engines() {
+    let mut divergences: Vec<String> = Vec::new();
+    let mut compared = 0usize;
+    let mut skipped = 0usize;
+
+    for file in SPEC_FILES {
+        let path = format!("{SPEC_DIR}{file}");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read spec file {path}: {error}"));
+        let buf = ParseBuffer::new(&source).expect("parse WAST buffer");
+        let wast = parser::parse::<Wast<'_>>(&buf).expect("parse WAST");
+
+        let mut interp = InterpSide::new();
+        let mut aot = AotSide::new();
+        let (mut file_compared, mut file_skipped) = (0usize, 0usize);
+
+        for (index, directive) in wast.directives.into_iter().enumerate() {
+            let (line, _column) = directive.span().linecol_in(&source);
+            let prepared = prepare(directive);
+            let interp_obs = interp.observe(&prepared);
+            let aot_obs = aot.observe(&prepared);
+
+            if interp_obs == Obs::Skip || aot_obs == Obs::Skip {
+                file_skipped += 1;
+                continue;
+            }
+            if interp_obs != aot_obs {
+                divergences.push(format!(
+                    "{file} directive {} (line {}): interpreter {interp_obs:?} vs AOT {aot_obs:?}",
+                    index + 1,
+                    line + 1,
+                ));
+            }
+            file_compared += 1;
+        }
+
+        // Skip ceiling: a file that compared nothing provides no parity
+        // evidence at all and must fail loudly rather than "pass".
+        if file_compared == 0 && file_skipped > 0 {
+            divergences.push(format!(
+                "{file}: all {file_skipped} directives skipped — no differential evidence"
+            ));
+        }
+        compared += file_compared;
+        skipped += file_skipped;
+    }
+
+    assert!(
+        divergences.is_empty(),
+        "engine divergence ({} directives compared, {} skipped):\n{}",
+        compared,
+        skipped,
+        divergences.join("\n")
+    );
+    // Sanity: the corpus is large; a wiring bug that compares nothing must
+    // fail the run.
+    assert!(
+        compared > 10_000,
+        "suspiciously little differential coverage: {compared} directives compared"
+    );
+}
+
+fn counting_host_type() -> FunctionType {
+    use wasmtiny::runtime::{NumType, ValType};
+    FunctionType::new(
+        vec![ValType::Num(NumType::I32), ValType::Num(NumType::I32)],
+        vec![ValType::Num(NumType::I64)],
+    )
+}
+
+fn export_index(
+    module: &wasmtiny::aot::AotModule,
+    name: &str,
+    want: impl Fn(&wasmtiny::runtime::ExportKind) -> Option<u32>,
+) -> Option<u32> {
+    module
+        .exports
+        .iter()
+        .find(|export| export.name == name)
+        .and_then(|export| want(&export.kind))
+}
+
+#[test]
+fn globals_and_call_indirect() {
+    check(
+        "(module (global $g (mut i32) (i32.const 1))
+           (func (export \"run\") (result i32)
+             (global.set $g (i32.add (global.get $g) (i32.const 10)))
+             (global.get $g)))",
+        &[],
+    );
+    check(
+        "(module (type $t (func (result i32)))
+           (table 2 funcref)
+           (func $f (result i32) (i32.const 99))
+           (elem (i32.const 0) func $f)
+           (func (export \"run\") (result i32)
+             (call_indirect (type $t) (i32.const 0))))",
+        &[],
+    );
+}
+
+/// Whether a compile refusal means "outside the supported feature set"
+/// (not comparable across engines) rather than a genuine rejection.
+fn is_unsupported(error: &wasmtiny_aotc::CompileError) -> bool {
+    match error {
+        wasmtiny_aotc::CompileError::Unsupported(_) => true,
+        wasmtiny_aotc::CompileError::Validation(message) => {
+            let message = message.to_ascii_lowercase();
+            message.contains("constant expression required")
+                || message.contains("function references required")
+                || message.contains("tables with expression initializers")
+                || message.contains("gc feature")
+                || message.contains("exceptions proposal")
+                || message.contains("table size is out of bounds")
+        }
+        _ => false,
+    }
+}
+
+#[test]
+fn memory_and_bulk_operations() {
+    check(
+        "(module (memory 1)
+           (func (export \"run\") (result i32)
+             (i32.store (i32.const 100) (i32.const 42))
+             (i32.load (i32.const 100))))",
+        &[],
+    );
+    check(
+        "(module (memory 1)
+           (func (export \"run\") (result i32)
+             (memory.fill (i32.const 0) (i32.const 7) (i32.const 4))
+             (i32.load8_u (i32.const 3))))",
+        &[],
+    );
+    check(
+        "(module (memory 1) (data (i32.const 0) \"abcd\")
+           (func (export \"run\") (result i32)
+             (memory.copy (i32.const 4) (i32.const 0) (i32.const 4))
+             (i32.load8_u (i32.const 6))))",
+        &[],
+    );
+    check(
+        "(module (memory 1 3)
+           (func (export \"run\") (result i32) (memory.grow (i32.const 2))))",
+        &[],
+    );
+}
+
+/// Collapses NaN payloads (engines may differ in NaN bit patterns).
+fn normalise(value: &WasmValue) -> String {
+    match value {
+        WasmValue::F32(v) if v.is_nan() => "nan:f32".to_string(),
+        WasmValue::F64(v) if v.is_nan() => "nan:f64".to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// Value normalisation for cross-engine comparison: NaNs collapse to their
+/// class; funcref handles are engine-internal, so only "a funcref" compares.
+fn normalise_value(value: &WasmValue) -> String {
+    match value {
+        WasmValue::F32(v) if v.is_nan() => "nan:f32".to_string(),
+        WasmValue::F64(v) if v.is_nan() => "nan:f64".to_string(),
+        WasmValue::FuncRef(_) => "funcref".to_string(),
+        WasmValue::NullRef(t) => format!("null:{t:?}"),
+        other => format!("{other:?}"),
+    }
+}
+
+fn prepare(directive: WastDirective<'_>) -> Prepared {
+    match directive {
+        WastDirective::Module(mut module) => Prepared::Module {
+            name: module.name().map(|id| id.name().to_string()),
+            wasm: module.encode().ok(),
+        },
+        WastDirective::ModuleDefinition(mut module) => Prepared::Definition {
+            wasm: module.encode().ok(),
+        },
+        WastDirective::Register { name, module, .. } => Prepared::Register {
+            name: name.to_string(),
+            module: module.map(|id| id.name().to_string()),
+        },
+        WastDirective::Invoke(invoke) => prepare_invoke(&invoke),
+        WastDirective::AssertReturn { exec, .. } => prepare_exec(exec),
+        WastDirective::AssertTrap { exec, .. } => prepare_exec(exec),
+        WastDirective::AssertExhaustion { call, .. } => prepare_invoke(&call),
+        WastDirective::AssertInvalid { mut module, .. }
+        | WastDirective::AssertMalformed { mut module, .. } => Prepared::MustReject {
+            wasm: module.encode().ok(),
+        },
+        WastDirective::AssertUnlinkable { mut module, .. } => Prepared::MustReject {
+            wasm: module.encode().ok(),
+        },
+        WastDirective::AssertException { .. }
+        | WastDirective::AssertSuspension { .. }
+        | WastDirective::AssertInvalidCustom { .. }
+        | WastDirective::AssertMalformedCustom { .. }
+        | WastDirective::Thread(_)
+        | WastDirective::Wait { .. }
+        | WastDirective::ModuleInstance { .. } => Prepared::Ignored,
+    }
+}
+
+fn prepare_exec(exec: WastExecute<'_>) -> Prepared {
+    match exec {
+        WastExecute::Invoke(invoke) => prepare_invoke(&invoke),
+        WastExecute::Wat(mut module) => Prepared::Module {
+            name: None,
+            wasm: module.encode().ok(),
+        },
+        WastExecute::Get { module, global, .. } => Prepared::Get {
+            module: module.map(|id| id.name().to_string()),
+            global: global.to_string(),
+        },
+    }
+}
+
+fn prepare_invoke(invoke: &WastInvoke<'_>) -> Prepared {
+    Prepared::Invoke {
+        module: invoke.module.map(|id| id.name().to_string()),
+        function: invoke.name.to_string(),
+        args: invoke
+            .args
+            .iter()
+            .map(wast_arg_to_value)
+            .collect::<Option<Vec<_>>>(),
+    }
+}
+
+#[test]
+fn refs_and_tables() {
+    // Element segments + `call_indirect` through a table (no in-body ref.func,
+    // which the interpreter's declaration-order check rejects).
+    check(
+        "(module (table 2 funcref)
+           (func $f (result i32) (i32.const 7))
+           (elem (i32.const 1) func $f)
+           (func (export \"run\") (result i32)
+             (call_indirect (type 0) (i32.const 1))))",
+        &[],
+    );
+}
+
+/// atomic_regression: atomics on non-shared memory are rejected — by the
+/// interpreter's validator at load time, and by the AOT compiler at compile
+/// time. Neither engine executes the module.
+#[test]
+fn regression_atomic_on_nonshared_rejected_by_both_engines() {
+    let wasm = wat::parse_str(
+        "(module (memory 1)
+           (func (export \"bad\") i32.const 0 i32.atomic.load))",
+    )
+    .expect("wat parses");
+
+    let mut app = WasmApplication::new();
+    assert!(
+        app.load_module_from_memory(&wasm).is_err(),
+        "interpreter must reject atomics on non-shared memory"
+    );
+
+    assert!(
+        compile_artifact(&wasm, &CompilerConfig::host()).is_err(),
+        "AOT compiler must reject atomics on non-shared memory"
+    );
+}
+
+/// atomic_regression: misaligned and out-of-bounds atomics trap; RMW, load/
+/// store, notify and wait-not-equal execute with recorded results.
+#[test]
+fn regression_atomics_on_both_engines() {
+    // Misaligned atomic load traps with MemoryOutOfBounds.
+    let scenario = Scenario::new(
+        "(module (memory 1 1 shared)
+           (func (export \"misaligned_load\") (result i32)
+             i32.const 1 i32.atomic.load))",
+    );
+    let (mut interp, mut aot) = scenario.build();
+    assert_scenario_call(
+        "atomic_misaligned",
+        &mut interp,
+        &mut aot,
+        "misaligned_load",
+        Err(wasmtiny::runtime::TrapCode::MemoryOutOfBounds),
+    );
+
+    // OOB atomic load traps with MemoryOutOfBounds.
+    let scenario = Scenario::new(
+        "(module (memory 1 1 shared)
+           (func (export \"oob_load\") (result i32)
+             i32.const 65536 i32.atomic.load))",
+    );
+    let (mut interp, mut aot) = scenario.build();
+    assert_scenario_call(
+        "atomic_oob",
+        &mut interp,
+        &mut aot,
+        "oob_load",
+        Err(wasmtiny::runtime::TrapCode::MemoryOutOfBounds),
+    );
+
+    // RMW add returns the old value.
+    let scenario = Scenario::new(
+        "(module (memory 1 1 shared)
+           (func (export \"add\") (result i32)
+             i32.const 0 i32.const 5 i32.atomic.rmw.add))",
+    );
+    let (mut interp, mut aot) = scenario.build();
+    assert_scenario_call(
+        "atomic_rmw_add",
+        &mut interp,
+        &mut aot,
+        "add",
+        Ok(&[WasmValue::I32(0)]),
+    );
+
+    // Atomic store then load round-trips.
+    let scenario = Scenario::new(
+        "(module (memory 1 1 shared)
+           (func (export \"store_load\") (result i32)
+             i32.const 0 i32.const 0x12345678 i32.atomic.store
+             i32.const 0 i32.atomic.load))",
+    );
+    let (mut interp, mut aot) = scenario.build();
+    assert_scenario_call(
+        "atomic_store_load",
+        &mut interp,
+        &mut aot,
+        "store_load",
+        Ok(&[WasmValue::I32(0x12345678)]),
+    );
+
+    // Notify with no waiters returns 0.
+    let scenario = Scenario::new(
+        "(module (memory 1 1 shared)
+           (func (export \"notify\") (result i32)
+             i32.const 0 i32.const 1 memory.atomic.notify))",
+    );
+    let (mut interp, mut aot) = scenario.build();
+    assert_scenario_call(
+        "atomic_notify_no_waiters",
+        &mut interp,
+        &mut aot,
+        "notify",
+        Ok(&[WasmValue::I32(0)]),
+    );
+
+    // wait32 returns 1 (not-equal) without waiting.
+    let scenario = Scenario::new(
+        "(module (memory 1 1 shared)
+           (func (export \"wait\") (result i32)
+             i32.const 0 i32.const 1 i64.const 0 memory.atomic.wait32))",
+    );
+    let (mut interp, mut aot) = scenario.build();
+    assert_scenario_call(
+        "atomic_wait32_not_equal",
+        &mut interp,
+        &mut aot,
+        "wait",
+        Ok(&[WasmValue::I32(1)]),
+    );
 }
 
 /// spine_repro: bulk-memory instructions execute with the recorded result.
@@ -1528,121 +1546,81 @@ fn regression_memory_growth_persists_on_both_engines() {
     );
 }
 
-/// atomic_regression: misaligned and out-of-bounds atomics trap; RMW, load/
-/// store, notify and wait-not-equal execute with recorded results.
 #[test]
-fn regression_atomics_on_both_engines() {
-    // Misaligned atomic load traps with MemoryOutOfBounds.
-    let scenario = Scenario::new(
-        "(module (memory 1 1 shared)
-           (func (export \"misaligned_load\") (result i32)
-             i32.const 1 i32.atomic.load))",
+fn saturating_conversions() {
+    check(
+        "(module (func (export \"run\") (result i32)
+           (i32.trunc_sat_f64_s (f64.const 1.0e20))))",
+        &[],
     );
-    let (mut interp, mut aot) = scenario.build();
-    assert_scenario_call(
-        "atomic_misaligned",
-        &mut interp,
-        &mut aot,
-        "misaligned_load",
-        Err(wasmtiny::runtime::TrapCode::MemoryOutOfBounds),
-    );
-
-    // OOB atomic load traps with MemoryOutOfBounds.
-    let scenario = Scenario::new(
-        "(module (memory 1 1 shared)
-           (func (export \"oob_load\") (result i32)
-             i32.const 65536 i32.atomic.load))",
-    );
-    let (mut interp, mut aot) = scenario.build();
-    assert_scenario_call(
-        "atomic_oob",
-        &mut interp,
-        &mut aot,
-        "oob_load",
-        Err(wasmtiny::runtime::TrapCode::MemoryOutOfBounds),
-    );
-
-    // RMW add returns the old value.
-    let scenario = Scenario::new(
-        "(module (memory 1 1 shared)
-           (func (export \"add\") (result i32)
-             i32.const 0 i32.const 5 i32.atomic.rmw.add))",
-    );
-    let (mut interp, mut aot) = scenario.build();
-    assert_scenario_call(
-        "atomic_rmw_add",
-        &mut interp,
-        &mut aot,
-        "add",
-        Ok(&[WasmValue::I32(0)]),
-    );
-
-    // Atomic store then load round-trips.
-    let scenario = Scenario::new(
-        "(module (memory 1 1 shared)
-           (func (export \"store_load\") (result i32)
-             i32.const 0 i32.const 0x12345678 i32.atomic.store
-             i32.const 0 i32.atomic.load))",
-    );
-    let (mut interp, mut aot) = scenario.build();
-    assert_scenario_call(
-        "atomic_store_load",
-        &mut interp,
-        &mut aot,
-        "store_load",
-        Ok(&[WasmValue::I32(0x12345678)]),
-    );
-
-    // Notify with no waiters returns 0.
-    let scenario = Scenario::new(
-        "(module (memory 1 1 shared)
-           (func (export \"notify\") (result i32)
-             i32.const 0 i32.const 1 memory.atomic.notify))",
-    );
-    let (mut interp, mut aot) = scenario.build();
-    assert_scenario_call(
-        "atomic_notify_no_waiters",
-        &mut interp,
-        &mut aot,
-        "notify",
-        Ok(&[WasmValue::I32(0)]),
-    );
-
-    // wait32 returns 1 (not-equal) without waiting.
-    let scenario = Scenario::new(
-        "(module (memory 1 1 shared)
-           (func (export \"wait\") (result i32)
-             i32.const 0 i32.const 1 i64.const 0 memory.atomic.wait32))",
-    );
-    let (mut interp, mut aot) = scenario.build();
-    assert_scenario_call(
-        "atomic_wait32_not_equal",
-        &mut interp,
-        &mut aot,
-        "wait",
-        Ok(&[WasmValue::I32(1)]),
+    check(
+        "(module (func (export \"run\") (result i32)
+           (i32.trunc_sat_f32_u (f32.const -1.0))))",
+        &[],
     );
 }
 
-/// atomic_regression: atomics on non-shared memory are rejected — by the
-/// interpreter's validator at load time, and by the AOT compiler at compile
-/// time. Neither engine executes the module.
+/// The fixed signatures of the `spectest` host functions.
+fn spectest_function_type(name: &str) -> Result<FunctionType, String> {
+    use wasmtiny::runtime::{NumType, ValType};
+    let params = match name {
+        "print" => vec![],
+        "print_i32" => vec![ValType::Num(NumType::I32)],
+        "print_i64" => vec![ValType::Num(NumType::I64)],
+        "print_f32" => vec![ValType::Num(NumType::F32)],
+        "print_f64" => vec![ValType::Num(NumType::F64)],
+        "print_i32_f32" => vec![ValType::Num(NumType::I32), ValType::Num(NumType::F32)],
+        "print_f64_f64" => vec![ValType::Num(NumType::F64), ValType::Num(NumType::F64)],
+        other => return Err(format!("unknown spectest function {other}")),
+    };
+    Ok(FunctionType::new(params, vec![]))
+}
+
 #[test]
-fn regression_atomic_on_nonshared_rejected_by_both_engines() {
-    let wasm = wat::parse_str(
+fn trap_parity() {
+    // These must trap identically in both engines.
+    check(
         "(module (memory 1)
-           (func (export \"bad\") i32.const 0 i32.atomic.load))",
-    )
-    .expect("wat parses");
-
-    let mut app = WasmApplication::new();
-    assert!(
-        app.load_module_from_memory(&wasm).is_err(),
-        "interpreter must reject atomics on non-shared memory"
+           (func (export \"run\") (result i32)
+             (i32.load (i32.const 100000))))",
+        &[],
     );
-
-    assert!(
-        compile_artifact(&wasm, &CompilerConfig::host()).is_err(),
-        "AOT compiler must reject atomics on non-shared memory"
+    check(
+        "(module (func (export \"run\") (result i32) (unreachable)))",
+        &[],
     );
+    check(
+        "(module (table 1 funcref)
+           (func (export \"run\") (result i32)
+             (call_indirect (type 0) (i32.const 5))))",
+        &[],
+    );
+}
+
+fn wast_arg_to_value(arg: &WastArg<'_>) -> Option<WasmValue> {
+    let WastArg::Core(core) = arg else {
+        return None;
+    };
+    match core {
+        WastArgCore::I32(value) => Some(WasmValue::I32(*value)),
+        WastArgCore::I64(value) => Some(WasmValue::I64(*value)),
+        WastArgCore::F32(value) => Some(WasmValue::F32(f32::from_bits(value.bits))),
+        WastArgCore::F64(value) => Some(WasmValue::F64(f64::from_bits(value.bits))),
+        WastArgCore::RefNull(heap_type) => {
+            let reftype = match heap_type {
+                wast::core::HeapType::Abstract { ty, .. } => match ty {
+                    AbstractHeapType::Func | AbstractHeapType::NoFunc => Some(RefType::FuncRef),
+                    AbstractHeapType::Extern | AbstractHeapType::NoExtern => {
+                        Some(RefType::ExternRef)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            }?;
+            Some(WasmValue::NullRef(reftype))
+        }
+        WastArgCore::RefExtern(value) => Some(WasmValue::ExternRef(*value)),
+        WastArgCore::RefHost(value) => Some(WasmValue::ExternRef(*value)),
+        WastArgCore::V128(_) => None,
+    }
 }

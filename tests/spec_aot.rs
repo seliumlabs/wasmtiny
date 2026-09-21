@@ -6,15 +6,19 @@
 
 #![cfg(feature = "aot")]
 
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    rc::Rc,
+    sync::{Arc, Mutex},
+};
 
-use wasmtiny::aot::{AotExtern, AotInstance, AotLoader, AotStore, AotTable};
-use wasmtiny::runtime::{
-    ExportKind, FunctionType, Global, HostCaller, HostFunc, ImportKind, Limits, Memory, MemoryType,
-    NumType, RefType, TableType, ValType, WasmValue,
+use wasmtiny::{
+    aot::{AotExtern, AotInstance, AotLoader, AotStore, AotTable},
+    runtime::{
+        ExportKind, FunctionType, Global, HostCaller, HostFunc, ImportKind, Limits, Memory,
+        MemoryType, NumType, RefType, TableType, ValType, WasmValue,
+    },
 };
 use wasmtiny_aotc::{CompilerConfig, compile_artifact};
 use wast::{
@@ -32,6 +36,28 @@ struct ModuleState {
     instance: RefCell<AotInstance>,
 }
 
+struct AotSpecHarness {
+    store: Arc<Mutex<AotStore>>,
+    modules: HashMap<String, Rc<ModuleState>>,
+    current: Option<Rc<ModuleState>>,
+}
+
+enum Outcome {
+    None,
+    Passed,
+    Skipped,
+}
+
+struct NoOpHostFunc {
+    function_type: FunctionType,
+}
+
+enum TestResult {
+    Passed,
+    Failed(String),
+    Error(String),
+}
+
 impl ModuleState {
     fn export_index(&self, name: &str, want: impl Fn(&ExportKind) -> Option<u32>) -> Option<u32> {
         self.module
@@ -40,12 +66,6 @@ impl ModuleState {
             .find(|export| export.name == name)
             .and_then(|export| want(&export.kind))
     }
-}
-
-struct AotSpecHarness {
-    store: Arc<Mutex<AotStore>>,
-    modules: HashMap<String, Rc<ModuleState>>,
-    current: Option<Rc<ModuleState>>,
 }
 
 impl AotSpecHarness {
@@ -495,16 +515,6 @@ impl AotSpecHarness {
     }
 }
 
-enum Outcome {
-    None,
-    Passed,
-    Skipped,
-}
-
-struct NoOpHostFunc {
-    function_type: FunctionType,
-}
-
 impl HostFunc for NoOpHostFunc {
     fn call(
         &self,
@@ -516,6 +526,135 @@ impl HostFunc for NoOpHostFunc {
 
     fn function_type(&self) -> Option<&FunctionType> {
         Some(&self.function_type)
+    }
+}
+
+macro_rules! spec_test {
+    ($name:ident, $file:literal) => {
+        #[test]
+        fn $name() {
+            assert_spec_passes($file);
+        }
+    };
+}
+
+spec_test!(test_spec_block, "block.wast");
+
+spec_test!(test_spec_br, "br.wast");
+
+spec_test!(test_spec_br_if, "br_if.wast");
+
+spec_test!(test_spec_br_table, "br_table.wast");
+
+spec_test!(test_spec_call, "call.wast");
+
+spec_test!(test_spec_call_indirect, "call_indirect.wast");
+
+spec_test!(test_spec_const, "const.wast");
+
+spec_test!(test_spec_conversions, "conversions.wast");
+
+spec_test!(test_spec_data, "data.wast");
+
+spec_test!(test_spec_elem, "elem.wast");
+
+spec_test!(test_spec_exports, "exports.wast");
+
+spec_test!(test_spec_f32, "f32.wast");
+
+spec_test!(test_spec_f32_cmp, "f32_cmp.wast");
+
+spec_test!(test_spec_f64, "f64.wast");
+
+spec_test!(test_spec_f64_cmp, "f64_cmp.wast");
+
+spec_test!(test_spec_fac, "fac.wast");
+
+spec_test!(test_spec_float_literals, "float_literals.wast");
+
+spec_test!(test_spec_float_memory, "float_memory.wast");
+
+spec_test!(test_spec_float_misc, "float_misc.wast");
+
+spec_test!(test_spec_func, "func.wast");
+
+spec_test!(test_spec_global, "global.wast");
+
+spec_test!(test_spec_i32, "i32.wast");
+
+spec_test!(test_spec_id, "id.wast");
+
+spec_test!(test_spec_imports, "imports.wast");
+
+spec_test!(test_spec_int_literals, "int_literals.wast");
+
+spec_test!(test_spec_labels, "labels.wast");
+
+spec_test!(test_spec_load, "load.wast");
+
+spec_test!(test_spec_local_get, "local_get.wast");
+
+spec_test!(test_spec_local_set, "local_set.wast");
+
+spec_test!(test_spec_local_tee, "local_tee.wast");
+
+spec_test!(test_spec_loop, "loop.wast");
+
+spec_test!(test_spec_memory, "memory.wast");
+
+spec_test!(test_spec_memory_grow, "memory_grow.wast");
+
+spec_test!(test_spec_memory_size, "memory_size.wast");
+
+spec_test!(test_spec_memory_trap, "memory_trap.wast");
+
+spec_test!(test_spec_nop, "nop.wast");
+
+spec_test!(test_spec_ref_is_null, "ref_is_null.wast");
+
+spec_test!(test_spec_return, "return.wast");
+
+spec_test!(test_spec_select, "select.wast");
+
+spec_test!(test_spec_start, "start.wast");
+
+spec_test!(test_spec_store, "store.wast");
+
+spec_test!(test_spec_table, "table.wast");
+
+spec_test!(test_spec_table_get, "table_get.wast");
+
+spec_test!(test_spec_table_set, "table_set.wast");
+
+spec_test!(test_spec_traps, "traps.wast");
+
+spec_test!(test_spec_type, "type.wast");
+
+spec_test!(test_spec_unreachable, "unreachable.wast");
+
+spec_test!(test_spec_func_ptrs, "func_ptrs.wast");
+
+fn assert_spec_passes(name: &str) {
+    match run_spec_test(name) {
+        TestResult::Passed => {}
+        TestResult::Failed(message) => panic!("Expected pass, got failure: {message}"),
+        TestResult::Error(message) => panic!("Expected pass, got error: {message}"),
+    }
+}
+
+fn heap_type_to_ref_type(heap_type: &wast::core::HeapType<'_>) -> Result<RefType, String> {
+    match heap_type {
+        wast::core::HeapType::Abstract {
+            ty: AbstractHeapType::Func | AbstractHeapType::NoFunc,
+            ..
+        }
+        | wast::core::HeapType::Concrete(_)
+        | wast::core::HeapType::Exact(_) => Ok(RefType::FuncRef),
+        wast::core::HeapType::Abstract {
+            ty: AbstractHeapType::Extern | AbstractHeapType::NoExtern,
+            ..
+        } => Ok(RefType::ExternRef),
+        _ => Err("unsupported heap type in WAST reference".to_string()),
     }
 }
 
@@ -538,23 +677,6 @@ fn is_inapplicable(error: &wasmtiny_aotc::CompileError) -> bool {
     }
 }
 
-/// The fixed signatures of the `spectest` host functions.
-fn spectest_function_type(name: &str) -> Result<FunctionType, String> {
-    let params = match name {
-        "print" => vec![],
-        "print_i32" => vec![ValType::Num(NumType::I32)],
-        "print_i64" => vec![ValType::Num(NumType::I64)],
-        "print_f32" => vec![ValType::Num(NumType::F32)],
-        "print_f64" => vec![ValType::Num(NumType::F64)],
-        "print_i32_f32" => vec![ValType::Num(NumType::I32), ValType::Num(NumType::F32)],
-        "print_f64_f64" => vec![ValType::Num(NumType::F64), ValType::Num(NumType::F64)],
-        other => {
-            return Err(format!("unknown spectest function {other}"));
-        }
-    };
-    Ok(FunctionType::new(params, vec![]))
-}
-
 /// Whether an execution error represents a skipped (rather than failed)
 /// directive: the module it depends on was skipped for feature reasons, or it
 /// has no current module.
@@ -564,48 +686,6 @@ fn is_skip(error: &str) -> bool {
         || error.contains("unknown module id")
         || error.contains("unknown import module")
         || error.starts_with("unsupported module:")
-}
-
-// ---------------------------------------------------------------------------
-// WAST value helpers (mirrors `tests/spec.rs`).
-// ---------------------------------------------------------------------------
-
-fn heap_type_to_ref_type(heap_type: &wast::core::HeapType<'_>) -> Result<RefType, String> {
-    match heap_type {
-        wast::core::HeapType::Abstract {
-            ty: AbstractHeapType::Func | AbstractHeapType::NoFunc,
-            ..
-        }
-        | wast::core::HeapType::Concrete(_)
-        | wast::core::HeapType::Exact(_) => Ok(RefType::FuncRef),
-        wast::core::HeapType::Abstract {
-            ty: AbstractHeapType::Extern | AbstractHeapType::NoExtern,
-            ..
-        } => Ok(RefType::ExternRef),
-        _ => Err("unsupported heap type in WAST reference".to_string()),
-    }
-}
-
-fn wast_arg_to_value(arg: &WastArg<'_>) -> Result<WasmValue, String> {
-    match arg {
-        WastArg::Core(core) => wast_core_arg_to_value(core),
-        _ => Err("component-model WAST arguments are unsupported".to_string()),
-    }
-}
-
-fn wast_core_arg_to_value(arg: &WastArgCore<'_>) -> Result<WasmValue, String> {
-    match arg {
-        WastArgCore::I32(value) => Ok(WasmValue::I32(*value)),
-        WastArgCore::I64(value) => Ok(WasmValue::I64(*value)),
-        WastArgCore::F32(value) => Ok(WasmValue::F32(f32::from_bits(value.bits))),
-        WastArgCore::F64(value) => Ok(WasmValue::F64(f64::from_bits(value.bits))),
-        WastArgCore::RefNull(heap_type) => {
-            Ok(WasmValue::NullRef(heap_type_to_ref_type(heap_type)?))
-        }
-        WastArgCore::RefExtern(value) => Ok(WasmValue::ExternRef(*value)),
-        WastArgCore::RefHost(value) => Ok(WasmValue::ExternRef(*value)),
-        WastArgCore::V128(_) => Err("v128 WAST arguments are unsupported".to_string()),
-    }
 }
 
 fn matches_core_return(actual: &WasmValue, expected: &WastRetCore<'_>) -> bool {
@@ -629,13 +709,6 @@ fn matches_core_return(actual: &WasmValue, expected: &WastRetCore<'_>) -> bool {
     }
 }
 
-fn matches_return(actual: &WasmValue, expected: &WastRet<'_>) -> bool {
-    match expected {
-        WastRet::Core(expected) => matches_core_return(actual, expected),
-        _ => false,
-    }
-}
-
 fn matches_f32_pattern(actual: f32, pattern: &NanPattern<wast::token::F32>) -> bool {
     match pattern {
         NanPattern::Value(expected) => actual.to_bits() == expected.bits,
@@ -650,80 +723,11 @@ fn matches_f64_pattern(actual: f64, pattern: &NanPattern<wast::token::F64>) -> b
     }
 }
 
-// ---------------------------------------------------------------------------
-// Runner plumbing.
-// ---------------------------------------------------------------------------
-
-macro_rules! spec_test {
-    ($name:ident, $file:literal) => {
-        #[test]
-        fn $name() {
-            assert_spec_passes($file);
-        }
-    };
-}
-
-spec_test!(test_spec_block, "block.wast");
-spec_test!(test_spec_br, "br.wast");
-spec_test!(test_spec_br_if, "br_if.wast");
-spec_test!(test_spec_br_table, "br_table.wast");
-spec_test!(test_spec_call, "call.wast");
-spec_test!(test_spec_call_indirect, "call_indirect.wast");
-spec_test!(test_spec_const, "const.wast");
-spec_test!(test_spec_conversions, "conversions.wast");
-spec_test!(test_spec_data, "data.wast");
-spec_test!(test_spec_elem, "elem.wast");
-spec_test!(test_spec_exports, "exports.wast");
-spec_test!(test_spec_f32, "f32.wast");
-spec_test!(test_spec_f32_cmp, "f32_cmp.wast");
-spec_test!(test_spec_f64, "f64.wast");
-spec_test!(test_spec_f64_cmp, "f64_cmp.wast");
-spec_test!(test_spec_fac, "fac.wast");
-spec_test!(test_spec_float_literals, "float_literals.wast");
-spec_test!(test_spec_float_memory, "float_memory.wast");
-spec_test!(test_spec_float_misc, "float_misc.wast");
-spec_test!(test_spec_func, "func.wast");
-spec_test!(test_spec_global, "global.wast");
-spec_test!(test_spec_i32, "i32.wast");
-spec_test!(test_spec_id, "id.wast");
-spec_test!(test_spec_imports, "imports.wast");
-spec_test!(test_spec_int_literals, "int_literals.wast");
-spec_test!(test_spec_labels, "labels.wast");
-spec_test!(test_spec_load, "load.wast");
-spec_test!(test_spec_local_get, "local_get.wast");
-spec_test!(test_spec_local_set, "local_set.wast");
-spec_test!(test_spec_local_tee, "local_tee.wast");
-spec_test!(test_spec_loop, "loop.wast");
-spec_test!(test_spec_memory, "memory.wast");
-spec_test!(test_spec_memory_grow, "memory_grow.wast");
-spec_test!(test_spec_memory_size, "memory_size.wast");
-spec_test!(test_spec_memory_trap, "memory_trap.wast");
-spec_test!(test_spec_nop, "nop.wast");
-spec_test!(test_spec_ref_is_null, "ref_is_null.wast");
-spec_test!(test_spec_return, "return.wast");
-spec_test!(test_spec_select, "select.wast");
-spec_test!(test_spec_start, "start.wast");
-spec_test!(test_spec_store, "store.wast");
-spec_test!(test_spec_table, "table.wast");
-spec_test!(test_spec_table_get, "table_get.wast");
-spec_test!(test_spec_table_set, "table_set.wast");
-spec_test!(test_spec_traps, "traps.wast");
-spec_test!(test_spec_type, "type.wast");
-spec_test!(test_spec_unreachable, "unreachable.wast");
-spec_test!(test_spec_func_ptrs, "func_ptrs.wast");
-
-fn assert_spec_passes(name: &str) {
-    match run_spec_test(name) {
-        TestResult::Passed => {}
-        TestResult::Failed(message) => panic!("Expected pass, got failure: {message}"),
-        TestResult::Error(message) => panic!("Expected pass, got error: {message}"),
+fn matches_return(actual: &WasmValue, expected: &WastRet<'_>) -> bool {
+    match expected {
+        WastRet::Core(expected) => matches_core_return(actual, expected),
+        _ => false,
     }
-}
-
-enum TestResult {
-    Passed,
-    Failed(String),
-    Error(String),
 }
 
 fn run_spec_test(filename: &str) -> TestResult {
@@ -786,5 +790,44 @@ fn run_spec_test(filename: &str) -> TestResult {
         ))
     } else {
         TestResult::Passed
+    }
+}
+
+/// The fixed signatures of the `spectest` host functions.
+fn spectest_function_type(name: &str) -> Result<FunctionType, String> {
+    let params = match name {
+        "print" => vec![],
+        "print_i32" => vec![ValType::Num(NumType::I32)],
+        "print_i64" => vec![ValType::Num(NumType::I64)],
+        "print_f32" => vec![ValType::Num(NumType::F32)],
+        "print_f64" => vec![ValType::Num(NumType::F64)],
+        "print_i32_f32" => vec![ValType::Num(NumType::I32), ValType::Num(NumType::F32)],
+        "print_f64_f64" => vec![ValType::Num(NumType::F64), ValType::Num(NumType::F64)],
+        other => {
+            return Err(format!("unknown spectest function {other}"));
+        }
+    };
+    Ok(FunctionType::new(params, vec![]))
+}
+
+fn wast_arg_to_value(arg: &WastArg<'_>) -> Result<WasmValue, String> {
+    match arg {
+        WastArg::Core(core) => wast_core_arg_to_value(core),
+        _ => Err("component-model WAST arguments are unsupported".to_string()),
+    }
+}
+
+fn wast_core_arg_to_value(arg: &WastArgCore<'_>) -> Result<WasmValue, String> {
+    match arg {
+        WastArgCore::I32(value) => Ok(WasmValue::I32(*value)),
+        WastArgCore::I64(value) => Ok(WasmValue::I64(*value)),
+        WastArgCore::F32(value) => Ok(WasmValue::F32(f32::from_bits(value.bits))),
+        WastArgCore::F64(value) => Ok(WasmValue::F64(f64::from_bits(value.bits))),
+        WastArgCore::RefNull(heap_type) => {
+            Ok(WasmValue::NullRef(heap_type_to_ref_type(heap_type)?))
+        }
+        WastArgCore::RefExtern(value) => Ok(WasmValue::ExternRef(*value)),
+        WastArgCore::RefHost(value) => Ok(WasmValue::ExternRef(*value)),
+        WastArgCore::V128(_) => Err("v128 WAST arguments are unsupported".to_string()),
     }
 }

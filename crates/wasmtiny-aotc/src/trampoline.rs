@@ -5,57 +5,18 @@
 //! - **Host-call stub** (wasm → host): bridges an imported function's native
 //!   ABI to a fixed-signature runtime dispatcher.
 
-use cranelift_codegen::ir::immediates::Offset32;
-use cranelift_codegen::ir::{
-    self, AbiParam, GlobalValueData, InstBuilder, MemFlags, Signature, StackSlotData,
-    StackSlotKind, UserFuncName, types,
+use cranelift_codegen::{
+    ir::immediates::Offset32,
+    ir::{
+        self, AbiParam, GlobalValueData, InstBuilder, MemFlags, Signature, StackSlotData,
+        StackSlotKind, UserFuncName, types,
+    },
+    isa::CallConv,
 };
-use cranelift_codegen::isa::CallConv;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_wasm::{WasmFuncType, WasmValType};
 
 use crate::environment::{LibCallOffsets, VmCtxOffsets};
-
-/// The native CLIF type used for each wasm value type.
-fn value_clif_type(ty: &WasmValType) -> ir::Type {
-    match ty {
-        WasmValType::I32 => types::I32,
-        WasmValType::I64 => types::I64,
-        WasmValType::F32 => types::F32,
-        WasmValType::F64 => types::F64,
-        WasmValType::V128 => types::I8X16,
-        // References are raw u32 handles.
-        WasmValType::Ref(_) => types::I32,
-    }
-}
-
-/// Converts a typed CLIF value into its 64-bit array-call slot.
-fn value_to_slot(builder: &mut FunctionBuilder, value: ir::Value) -> ir::Value {
-    match builder.func.dfg.value_type(value) {
-        types::I32 => builder.ins().uextend(types::I64, value),
-        types::I64 => value,
-        types::F32 => {
-            let bits = builder.ins().bitcast(types::I32, MemFlags::new(), value);
-            builder.ins().uextend(types::I64, bits)
-        }
-        types::F64 => builder.ins().bitcast(types::I64, MemFlags::new(), value),
-        other => unreachable!("unsupported bridging value type {other:?}"),
-    }
-}
-
-/// Converts a 64-bit slot into the given typed CLIF value.
-fn slot_to_value(builder: &mut FunctionBuilder, raw: ir::Value, ty: ir::Type) -> ir::Value {
-    match ty {
-        types::I32 => builder.ins().ireduce(types::I32, raw),
-        types::I64 => raw,
-        types::F32 => {
-            let bits = builder.ins().ireduce(types::I32, raw);
-            builder.ins().bitcast(types::F32, MemFlags::new(), bits)
-        }
-        types::F64 => builder.ins().bitcast(types::F64, MemFlags::new(), raw),
-        other => unreachable!("unsupported bridging value type {other:?}"),
-    }
-}
 
 /// Builds an array-call entry trampoline for a callee with `callee_sig`
 /// (already `vmctx`-augmented) and `wasm_type`.
@@ -223,4 +184,45 @@ pub fn build_host_call_stub(
     builder.finalize();
 
     func
+}
+
+/// Converts a 64-bit slot into the given typed CLIF value.
+fn slot_to_value(builder: &mut FunctionBuilder, raw: ir::Value, ty: ir::Type) -> ir::Value {
+    match ty {
+        types::I32 => builder.ins().ireduce(types::I32, raw),
+        types::I64 => raw,
+        types::F32 => {
+            let bits = builder.ins().ireduce(types::I32, raw);
+            builder.ins().bitcast(types::F32, MemFlags::new(), bits)
+        }
+        types::F64 => builder.ins().bitcast(types::F64, MemFlags::new(), raw),
+        other => unreachable!("unsupported bridging value type {other:?}"),
+    }
+}
+
+/// The native CLIF type used for each wasm value type.
+fn value_clif_type(ty: &WasmValType) -> ir::Type {
+    match ty {
+        WasmValType::I32 => types::I32,
+        WasmValType::I64 => types::I64,
+        WasmValType::F32 => types::F32,
+        WasmValType::F64 => types::F64,
+        WasmValType::V128 => types::I8X16,
+        // References are raw u32 handles.
+        WasmValType::Ref(_) => types::I32,
+    }
+}
+
+/// Converts a typed CLIF value into its 64-bit array-call slot.
+fn value_to_slot(builder: &mut FunctionBuilder, value: ir::Value) -> ir::Value {
+    match builder.func.dfg.value_type(value) {
+        types::I32 => builder.ins().uextend(types::I64, value),
+        types::I64 => value,
+        types::F32 => {
+            let bits = builder.ins().bitcast(types::I32, MemFlags::new(), value);
+            builder.ins().uextend(types::I64, bits)
+        }
+        types::F64 => builder.ins().bitcast(types::I64, MemFlags::new(), value),
+        other => unreachable!("unsupported bridging value type {other:?}"),
+    }
 }

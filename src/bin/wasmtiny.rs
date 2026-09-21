@@ -28,36 +28,6 @@ fn main() -> Result<()> {
     }
 }
 
-fn run_interpreter(args: &Args) -> Result<()> {
-    let mut app = WasmApplication::new();
-    let module_idx = app.load_module_from_file(&args.module)?;
-    app.instantiate(module_idx)?;
-
-    println!("Loaded WASM module from {}", args.module);
-
-    match &args.function {
-        Some(func) => {
-            let wasm_args: Vec<WasmValue> = args.args.iter().map(|&i| WasmValue::I32(i)).collect();
-            match app.call_function(module_idx, func, &wasm_args) {
-                Ok(results) => println!("Function '{func}' returned: {results:?}"),
-                Err(err) => {
-                    eprintln!("Error calling function '{func}': {err}");
-                    std::process::exit(1);
-                }
-            }
-        }
-        None => match app.execute_start(module_idx) {
-            Ok(()) => println!("Module executed successfully"),
-            Err(err) => {
-                eprintln!("Error executing module: {err}");
-                std::process::exit(1);
-            }
-        },
-    }
-
-    Ok(())
-}
-
 #[cfg(feature = "aot")]
 fn run_aot(args: &Args) -> Result<()> {
     use wasmtiny::aot::{AotInstance, AotLoader};
@@ -93,4 +63,34 @@ fn run_aot(args: &Args) -> Result<()> {
 fn run_aot(args: &Args) -> Result<()> {
     let _ = args;
     anyhow::bail!("the `.aot` path requires the `aot` feature (this build has it disabled)");
+}
+
+fn run_interpreter(args: &Args) -> Result<()> {
+    let mut app = WasmApplication::new();
+    let module_idx = app.load_module_from_file(&args.module)?;
+    app.instantiate(module_idx)?;
+
+    println!("Loaded WASM module from {}", args.module);
+
+    match &args.function {
+        Some(func) => {
+            let wasm_args: Vec<WasmValue> = args.args.iter().map(|&i| WasmValue::I32(i)).collect();
+            match app.call_function(module_idx, func, &wasm_args) {
+                Ok(results) => println!("Function '{func}' returned: {results:?}"),
+                Err(err) => {
+                    eprintln!("Error calling function '{func}': {err}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        None => match app.execute_start(module_idx) {
+            Ok(()) => println!("Module executed successfully"),
+            Err(err) => {
+                eprintln!("Error executing module: {err}");
+                std::process::exit(1);
+            }
+        },
+    }
+
+    Ok(())
 }

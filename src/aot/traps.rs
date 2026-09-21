@@ -6,9 +6,11 @@
 //! [`TrapCode`] through a lock-free registry keyed on code-image ranges, then
 //! returns control to the faulting thread's `invoke_function` call.
 
-use std::cell::{Cell, RefCell};
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::{
+    cell::{Cell, RefCell},
+    sync::atomic::{AtomicBool, AtomicPtr, Ordering},
+    sync::{Arc, OnceLock},
+};
 
 use crate::runtime::{Result, TrapCode, WasmError};
 
@@ -17,65 +19,17 @@ use crate::runtime::{Result, TrapCode, WasmError};
 /// `sigsetjmp` only writes into the space it needs.
 type SigJmpBuf = [u64; 64];
 
-// `sigsetjmp`/`siglongjmp` are macros on some platforms; the linkable symbols
-// differ by OS. They are called directly (never through a wrapper): `setjmp`
-// must run in a frame that is still live when the matching `longjmp` fires.
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "tvos",
-    target_os = "watchos"
-))]
-unsafe extern "C" {
-    #[link_name = "sigsetjmp"]
-    fn platform_sigsetjmp(env: *mut SigJmpBuf, savemask: libc::c_int) -> libc::c_int;
-    #[link_name = "siglongjmp"]
-    fn platform_siglongjmp(env: *mut SigJmpBuf, val: libc::c_int) -> !;
-}
-
-#[cfg(target_os = "linux")]
-unsafe extern "C" {
-    #[link_name = "__sigsetjmp"]
-    fn platform_sigsetjmp(env: *mut SigJmpBuf, savemask: libc::c_int) -> libc::c_int;
-    #[link_name = "__siglongjmp"]
-    fn platform_siglongjmp(env: *mut SigJmpBuf, val: libc::c_int) -> !;
-}
+static HEAD: AtomicPtr<RegistryNode> = AtomicPtr::new(std::ptr::null_mut());
+static PREVIOUS_HANDLERS: OnceLock<[Option<PreviousHandler>; 3]> = OnceLock::new();
+/// The signals the trap machinery owns, in the order used by the saved
+/// previous-handler table.
+const SIGNALS: [libc::c_int; 3] = [libc::SIGILL, libc::SIGSEGV, libc::SIGBUS];
 
 /// A single catch frame on the thread-local recovery stack.
 struct CatchFrame {
     jmp: SigJmpBuf,
     trap: Cell<Option<TrapCode>>,
 }
-
-impl CatchFrame {
-    fn new() -> Self {
-        // SAFETY: an all-zero buffer is valid storage that `sigsetjmp` fully
-        // initialises before any read.
-        unsafe {
-            Self {
-                jmp: std::mem::zeroed(),
-                trap: Cell::new(None),
-            }
-        }
-    }
-}
-
-thread_local! {
-    /// The per-thread stack of active recovery frames. Initialised by the
-    /// first `catch_traps` call on a thread (before any native code runs).
-    static CATCHES: RefCell<Vec<CatchFrame>> = const { RefCell::new(Vec::new()) };
-}
-
-/// A registered code range and its trap sites, sorted by offset.
-struct RegistryNode {
-    start: usize,
-    end: usize,
-    alive: AtomicBool,
-    trap_offsets: Arc<Vec<(u32, TrapCode)>>,
-    next: AtomicPtr<RegistryNode>,
-}
-
-static HEAD: AtomicPtr<RegistryNode> = AtomicPtr::new(std::ptr::null_mut());
 
 /// The faulting program counter's classification.
 enum FaultKind {
@@ -90,6 +44,39 @@ enum FaultKind {
 /// A handle that keeps a code range registered for its lifetime.
 pub struct RegisteredCode {
     node: *mut RegistryNode,
+}
+
+/// A registered code range and its trap sites, sorted by offset.
+struct RegistryNode {
+    start: usize,
+    end: usize,
+    alive: AtomicBool,
+    trap_offsets: Arc<Vec<(u32, TrapCode)>>,
+    next: AtomicPtr<RegistryNode>,
+}
+
+/// The handler the embedder (or a sanitizer, or the Rust runtime) had
+/// installed before us, so faults outside our code can be forwarded rather
+/// than silently destroying process-wide handlers.
+#[derive(Clone, Copy)]
+struct PreviousHandler {
+    /// `sa_sigaction` as a raw address (`SIG_DFL`/`SIG_IGN` preserved).
+    handler: usize,
+    /// The saved `sa_flags` (to know whether `SA_SIGINFO` applies).
+    flags: libc::c_int,
+}
+
+impl CatchFrame {
+    fn new() -> Self {
+        // SAFETY: an all-zero buffer is valid storage that `sigsetjmp` fully
+        // initialises before any read.
+        unsafe {
+            Self {
+                jmp: std::mem::zeroed(),
+                trap: Cell::new(None),
+            }
+        }
+    }
 }
 
 impl RegisteredCode {
@@ -133,24 +120,41 @@ impl Drop for RegisteredCode {
     }
 }
 
-/// Classifies the given program counter.
-fn classify(pc: usize) -> FaultKind {
-    let mut node = HEAD.load(Ordering::Acquire);
-    while !node.is_null() {
-        // SAFETY: nodes are never freed; the pointer came from `Box::into_raw`.
-        let current = unsafe { &*node };
-        if current.alive.load(Ordering::Acquire) && pc >= current.start && pc < current.end {
-            match current
-                .trap_offsets
-                .binary_search_by_key(&((pc - current.start) as u32), |(offset, _)| *offset)
-            {
-                Ok(index) => return FaultKind::Trap(current.trap_offsets[index].1),
-                Err(_) => return FaultKind::InCode,
-            }
-        }
-        node = current.next.load(Ordering::Acquire);
-    }
-    FaultKind::NotOurs
+// `sigsetjmp`/`siglongjmp` are macros on some platforms; the linkable symbols
+// differ by OS. They are called directly (never through a wrapper): `setjmp`
+// must run in a frame that is still live when the matching `longjmp` fires.
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos"
+))]
+unsafe extern "C" {
+    #[link_name = "sigsetjmp"]
+    fn platform_sigsetjmp(env: *mut SigJmpBuf, savemask: libc::c_int) -> libc::c_int;
+    #[link_name = "siglongjmp"]
+    fn platform_siglongjmp(env: *mut SigJmpBuf, val: libc::c_int) -> !;
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    #[link_name = "__sigsetjmp"]
+    fn platform_sigsetjmp(env: *mut SigJmpBuf, savemask: libc::c_int) -> libc::c_int;
+    #[link_name = "__siglongjmp"]
+    fn platform_siglongjmp(env: *mut SigJmpBuf, val: libc::c_int) -> !;
+}
+
+thread_local! {
+    /// The per-thread stack of active recovery frames. Initialised by the
+    /// first `catch_traps` call on a thread (before any native code runs).
+    static CATCHES: RefCell<Vec<CatchFrame>> = const { RefCell::new(Vec::new()) };
+}
+
+thread_local! {
+    /// Whether this thread has a signal alt-stack registered. `sigaltstack`
+    /// is per-thread while `sigaction` is process-wide, so every thread that
+    /// enters native code must register its own.
+    static ALTSTACK_READY: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Runs `body` with a recovery boundary: if native code faults, the signal
@@ -190,6 +194,18 @@ pub fn catch_traps<F: FnOnce()>(body: F) -> Result<()> {
         });
         Err(WasmError::Trap(trap.unwrap_or(TrapCode::HostTrap)))
     }
+}
+
+/// Installs the trap machinery: the process-wide signal handlers (once) and
+/// the invoking thread's dedicated alt-stack.
+///
+/// Fails closed: if the OS cannot provide the machinery, instantiation and
+/// invocation return an error instead of proceeding without trap recovery —
+/// traps would otherwise take down the host process.
+pub fn ensure_installed() -> std::result::Result<(), String> {
+    static HANDLERS: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+    HANDLERS.get_or_init(install_handlers).clone()?;
+    ensure_thread_altstack()
 }
 
 /// Returns the lowest stack address native code may use on this thread.
@@ -243,85 +259,43 @@ pub fn thread_stack_limit(margin: usize) -> usize {
     }
 }
 
-/// Fallback: approximate the least-safe stack address from a fresh stack
-/// probe. Only used where the platform offers no thread-stack introspection;
-/// cross-module instances are set at their own instantiation, close enough
-/// for single-threaded invocations.
-#[cfg(not(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "tvos",
-    target_os = "watchos"
-)))]
-fn stack_limit_from_probe(margin: usize) -> usize {
-    let mut marker: usize = 0;
-    let probe = core::ptr::addr_of_mut!(marker) as usize;
-    probe.saturating_sub(margin)
-}
-
-/// The signals the trap machinery owns, in the order used by the saved
-/// previous-handler table.
-const SIGNALS: [libc::c_int; 3] = [libc::SIGILL, libc::SIGSEGV, libc::SIGBUS];
-
-/// The handler the embedder (or a sanitizer, or the Rust runtime) had
-/// installed before us, so faults outside our code can be forwarded rather
-/// than silently destroying process-wide handlers.
-#[derive(Clone, Copy)]
-struct PreviousHandler {
-    /// `sa_sigaction` as a raw address (`SIG_DFL`/`SIG_IGN` preserved).
-    handler: usize,
-    /// The saved `sa_flags` (to know whether `SA_SIGINFO` applies).
-    flags: libc::c_int,
-}
-
-static PREVIOUS_HANDLERS: OnceLock<[Option<PreviousHandler>; 3]> = OnceLock::new();
-
-thread_local! {
-    /// Whether this thread has a signal alt-stack registered. `sigaltstack`
-    /// is per-thread while `sigaction` is process-wide, so every thread that
-    /// enters native code must register its own.
-    static ALTSTACK_READY: Cell<bool> = const { Cell::new(false) };
-}
-
-/// Installs the trap machinery: the process-wide signal handlers (once) and
-/// the invoking thread's dedicated alt-stack.
-///
-/// Fails closed: if the OS cannot provide the machinery, instantiation and
-/// invocation return an error instead of proceeding without trap recovery —
-/// traps would otherwise take down the host process.
-pub fn ensure_installed() -> std::result::Result<(), String> {
-    static HANDLERS: OnceLock<std::result::Result<(), String>> = OnceLock::new();
-    HANDLERS.get_or_init(install_handlers).clone()?;
-    ensure_thread_altstack()
-}
-
-/// Installs the process-wide handlers once per process.
-fn install_handlers() -> std::result::Result<(), String> {
-    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-    action.sa_sigaction = handle_signal as *const () as usize;
-    action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
-
-    let mut previous: [Option<PreviousHandler>; 3] = [None; 3];
-    for (position, signal) in SIGNALS.iter().enumerate() {
-        // SAFETY: `action` is fully initialised; `sigemptyset` clears the mask.
-        unsafe {
-            libc::sigemptyset(&mut action.sa_mask);
+/// Classifies the given program counter.
+fn classify(pc: usize) -> FaultKind {
+    let mut node = HEAD.load(Ordering::Acquire);
+    while !node.is_null() {
+        // SAFETY: nodes are never freed; the pointer came from `Box::into_raw`.
+        let current = unsafe { &*node };
+        if current.alive.load(Ordering::Acquire) && pc >= current.start && pc < current.end {
+            match current
+                .trap_offsets
+                .binary_search_by_key(&((pc - current.start) as u32), |(offset, _)| *offset)
+            {
+                Ok(index) => return FaultKind::Trap(current.trap_offsets[index].1),
+                Err(_) => return FaultKind::InCode,
+            }
         }
-        let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
-        // SAFETY: `old` is a valid out-pointer.
-        if unsafe { libc::sigaction(*signal, &action, &mut old) } != 0 {
-            return Err(format!(
-                "sigaction for signal {signal} failed: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        previous[position] = Some(PreviousHandler {
-            handler: old.sa_sigaction,
-            flags: old.sa_flags,
-        });
+        node = current.next.load(Ordering::Acquire);
     }
-    let _ = PREVIOUS_HANDLERS.set(previous);
-    Ok(())
+    FaultKind::NotOurs
+}
+
+/// Delivers `code` to the currently armed recovery frame on this thread.
+fn deliver(code: TrapCode) -> ! {
+    let jmp_ptr = CATCHES.with(|c| {
+        c.try_borrow().ok().and_then(|frames| {
+            frames.last().map(|frame| {
+                frame.trap.set(Some(code));
+                core::ptr::addr_of!(frame.jmp).cast_mut()
+            })
+        })
+    });
+
+    match jmp_ptr {
+        Some(jmp) => unsafe {
+            platform_siglongjmp(jmp, 1);
+        },
+        None => std::process::abort(),
+    }
 }
 
 /// Registers a dedicated signal stack for the current thread.
@@ -365,20 +339,6 @@ fn ensure_thread_altstack() -> std::result::Result<(), String> {
     }
     ALTSTACK_READY.set(true);
     Ok(())
-}
-
-/// The process-global signal handler.
-unsafe extern "C" fn handle_signal(
-    signal: libc::c_int,
-    info: *mut libc::siginfo_t,
-    context: *mut core::ffi::c_void,
-) {
-    let pc = unsafe { pc_from_context(context) };
-    match classify(pc) {
-        FaultKind::NotOurs => unsafe { forward_to_previous(signal, info, context) },
-        FaultKind::Trap(code) => deliver(code),
-        FaultKind::InCode => deliver(TrapCode::MemoryOutOfBounds),
-    }
 }
 
 /// Forwards a fault outside registered wasm code to whatever handled the
@@ -432,28 +392,48 @@ unsafe fn forward_to_previous(
     }
 }
 
-/// Delivers `code` to the currently armed recovery frame on this thread.
-fn deliver(code: TrapCode) -> ! {
-    let jmp_ptr = CATCHES.with(|c| {
-        c.try_borrow().ok().and_then(|frames| {
-            frames.last().map(|frame| {
-                frame.trap.set(Some(code));
-                core::ptr::addr_of!(frame.jmp).cast_mut()
-            })
-        })
-    });
-
-    match jmp_ptr {
-        Some(jmp) => unsafe {
-            platform_siglongjmp(jmp, 1);
-        },
-        None => std::process::abort(),
+/// The process-global signal handler.
+unsafe extern "C" fn handle_signal(
+    signal: libc::c_int,
+    info: *mut libc::siginfo_t,
+    context: *mut core::ffi::c_void,
+) {
+    let pc = unsafe { pc_from_context(context) };
+    match classify(pc) {
+        FaultKind::NotOurs => unsafe { forward_to_previous(signal, info, context) },
+        FaultKind::Trap(code) => deliver(code),
+        FaultKind::InCode => deliver(TrapCode::MemoryOutOfBounds),
     }
 }
 
-// ---------------------------------------------------------------------------
-// Per-target program-counter recovery from a `ucontext_t`.
-// ---------------------------------------------------------------------------
+/// Installs the process-wide handlers once per process.
+fn install_handlers() -> std::result::Result<(), String> {
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = handle_signal as *const () as usize;
+    action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+
+    let mut previous: [Option<PreviousHandler>; 3] = [None; 3];
+    for (position, signal) in SIGNALS.iter().enumerate() {
+        // SAFETY: `action` is fully initialised; `sigemptyset` clears the mask.
+        unsafe {
+            libc::sigemptyset(&mut action.sa_mask);
+        }
+        let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: `old` is a valid out-pointer.
+        if unsafe { libc::sigaction(*signal, &action, &mut old) } != 0 {
+            return Err(format!(
+                "sigaction for signal {signal} failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        previous[position] = Some(PreviousHandler {
+            handler: old.sa_sigaction,
+            flags: old.sa_flags,
+        });
+    }
+    let _ = PREVIOUS_HANDLERS.set(previous);
+    Ok(())
+}
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 unsafe fn pc_from_context(context: *mut core::ffi::c_void) -> usize {
@@ -496,4 +476,20 @@ unsafe fn pc_from_context(context: *mut core::ffi::c_void) -> usize {
 unsafe fn pc_from_context(_context: *mut core::ffi::c_void) -> usize {
     // Unsupported target: faults are never classified as ours and re-raise.
     usize::MAX
+}
+
+/// Fallback: approximate the least-safe stack address from a fresh stack
+/// probe. Only used where the platform offers no thread-stack introspection;
+/// cross-module instances are set at their own instantiation, close enough
+/// for single-threaded invocations.
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos"
+)))]
+fn stack_limit_from_probe(margin: usize) -> usize {
+    let mut marker: usize = 0;
+    let probe = core::ptr::addr_of_mut!(marker) as usize;
+    probe.saturating_sub(margin)
 }

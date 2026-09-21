@@ -4,12 +4,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::runtime::{
-    DataKind, ElemKind, ExportKind, ExportType, FunctionType, Global, GlobalType, HostCaller,
-    HostFunc, ImportKind, Memory, NumType, RefType, Result, Store, TrapCode, ValType, WasmError,
-    WasmValue, evaluate_const_expr,
-};
-
 use super::{
     code::ExecutableCode,
     context::{FuncDesc, MemoryDesc, TableCells, VmCtx},
@@ -18,13 +12,47 @@ use super::{
     traps,
 };
 
-/// Budget of host stack (in bytes) granted to wasm recursion before the
-/// entry-time stack check traps.
-const MAX_WASM_STACK: usize = 256 * 1024;
+use crate::runtime::{
+    DataKind, ElemKind, ExportKind, ExportType, FunctionType, Global, GlobalType, HostCaller,
+    HostFunc, ImportKind, Memory, NumType, RefType, Result, Store, TrapCode, ValType, WasmError,
+    WasmValue, evaluate_const_expr,
+};
 
 /// The fixed shape of an array-call entry trampoline:
 /// `(vmctx, callee, args: *const u64, results: *mut u64) -> ()`.
 type ArrayCall = unsafe extern "C" fn(*const VmCtx, *const u8, *const u64, *mut u64);
+type SharedTableTag = Arc<Mutex<AotTable>>;
+
+/// Packed trap sentinel shifted into the high word of a libcall result.
+const LIBCALL_TRAP: u64 = 1 << 32;
+/// Budget of host stack (in bytes) granted to wasm recursion before the
+/// entry-time stack check traps.
+const MAX_WASM_STACK: usize = 256 * 1024;
+
+/// A loaded, instantiated artifact ready for native invocation.
+pub struct AotInstance {
+    image: Arc<ExecutableCode>,
+    functions: Vec<AotFunction>,
+    types: Vec<FunctionType>,
+    /// The module's export directory, for name-based lookup.
+    exports: Vec<ExportType>,
+    ctx: Box<VmCtx>,
+    _funcs: Vec<FuncDesc>,
+    _type_ids: Vec<u32>,
+    _refs: Vec<u32>,
+    _globals: Vec<u8>,
+    _global_types: Vec<GlobalType>,
+    _tables: Vec<SharedTableTag>,
+    /// Per-instance table slots (pointers into the shared holders owned by
+    /// the tables in `_tables`); must outlive every native call.
+    _table_slots: Vec<*const TableCells>,
+    _memories: Vec<Arc<Mutex<Memory>>>,
+    _memory_descs: Vec<MemoryDesc>,
+    _libcalls: Box<LibcallTable>,
+    _dispatch: Box<AotDispatchState>,
+    _store: SharedAotStore,
+    _registered: traps::RegisteredCode,
+}
 
 /// The runtime libcall table, reached by compiled code through `vmctx.libcalls`.
 #[repr(C)]
@@ -64,725 +92,6 @@ struct AotDispatchState {
     /// Whether each element segment is still available to `table.init`.
     elem_available: Vec<bool>,
 }
-
-impl LibcallTable {
-    fn new() -> Box<Self> {
-        Box::new(Self {
-            host_call,
-            atomic_notify,
-            atomic_wait32,
-            atomic_wait64,
-            memory_size,
-            memory_grow,
-            memory_copy,
-            memory_fill,
-            memory_init,
-            data_drop,
-            table_size,
-            table_grow,
-            table_copy,
-            table_fill,
-            table_init,
-            elem_drop,
-        })
-    }
-}
-
-/// Borrows the per-instance dispatch state out of a vmctx pointer.
-///
-/// # Safety
-/// `ctx` must point at a live [`VmCtx`] whose `dispatch` references a live
-/// [`AotDispatchState`] for the duration of the native call.
-unsafe fn dispatch<'a>(ctx: *const u8) -> Option<&'a AotDispatchState> {
-    let vmctx = unsafe { &*(ctx as *const VmCtx) };
-    if vmctx.dispatch.is_null() {
-        None
-    } else {
-        Some(unsafe { &*(vmctx.dispatch as *const AotDispatchState) })
-    }
-}
-
-/// Borrows the per-instance dispatch state mutably.
-///
-/// # Safety
-/// `ctx` must point at a live [`VmCtx`] whose `dispatch` references a live
-/// [`AotDispatchState`] for the duration of the native call, and no other
-/// reference to that state may be alive during the borrow.
-unsafe fn dispatch_mut<'a>(ctx: *const u8) -> Option<&'a mut AotDispatchState> {
-    let vmctx = unsafe { &*(ctx as *const VmCtx) };
-    if vmctx.dispatch.is_null() {
-        None
-    } else {
-        Some(unsafe { &mut *(vmctx.dispatch as *mut AotDispatchState) })
-    }
-}
-
-/// Dispatches an imported host-function call on behalf of a compiled stub.
-unsafe extern "C" fn host_call(
-    ctx: *const u8,
-    ordinal: u64,
-    args: *mut u64,
-    results: *mut u64,
-) -> u64 {
-    // SAFETY: `ctx` is a live `VmCtx` whose `dispatch` points to a live
-    // `AotDispatchState` for the duration of the call.
-    unsafe {
-        let vmctx = &*(ctx as *const VmCtx);
-        if vmctx.dispatch.is_null() {
-            return 1;
-        }
-        let dispatch = &*(vmctx.dispatch as *const AotDispatchState);
-
-        let Some(func) = dispatch.host_funcs.get(ordinal as usize) else {
-            return 1;
-        };
-        let func_type = &dispatch.host_types[ordinal as usize];
-
-        let wasm_args: Vec<WasmValue> = func_type
-            .params
-            .iter()
-            .enumerate()
-            .map(|(index, param)| slot_to_value(*args.add(index), param))
-            .collect();
-
-        let result = {
-            let Ok(mut store) = dispatch.store.lock() else {
-                return 1;
-            };
-            let mut caller = HostCaller::new(&mut store, &dispatch.memories);
-            func.call(&mut caller, &wasm_args)
-        };
-
-        match result {
-            Ok(values) => {
-                if values.len() != func_type.results.len() {
-                    return 1;
-                }
-                for (index, value) in values.iter().enumerate() {
-                    *results.add(index) = value_to_slot(value);
-                }
-                0
-            }
-            Err(_) => 1,
-        }
-    }
-}
-
-fn slot_to_value(slot: u64, ty: &ValType) -> WasmValue {
-    match ty {
-        ValType::Num(NumType::I32) => WasmValue::I32(slot as u32 as i32),
-        ValType::Num(NumType::I64) => WasmValue::I64(slot as i64),
-        ValType::Num(NumType::F32) => WasmValue::F32(f32::from_bits(slot as u32)),
-        ValType::Num(NumType::F64) => WasmValue::F64(f64::from_bits(slot)),
-        ValType::Ref(RefType::FuncRef) if slot == 0 => WasmValue::NullRef(RefType::FuncRef),
-        ValType::Ref(RefType::FuncRef) => WasmValue::FuncRef(slot as u32),
-        ValType::Ref(RefType::ExternRef) if slot == 0 => WasmValue::NullRef(RefType::ExternRef),
-        // Externref slots are host index + 1 (slot 0 is the null sentinel), so
-        // a genuine host externref with index 0 round-trips as slot 1.
-        ValType::Ref(RefType::ExternRef) => WasmValue::ExternRef((slot - 1) as u32),
-    }
-}
-
-fn value_to_slot(value: &WasmValue) -> u64 {
-    match value {
-        WasmValue::I32(v) => (*v as u32) as u64,
-        WasmValue::I64(v) => *v as u64,
-        WasmValue::F32(v) => v.to_bits() as u64,
-        WasmValue::F64(v) => v.to_bits(),
-        WasmValue::FuncRef(h) => (*h) as u64,
-        // See `slot_to_value`: externref slots reserve 0 for null.
-        WasmValue::ExternRef(h) => (*h) as u64 + 1,
-        WasmValue::NullRef(_) => 0,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Memory-atomic libcalls.
-//
-// Each returns a packed `u64`: the high word is a non-zero trap flag (always
-// `MemoryOutOfBounds` in practice) and the low word is the result. Compiled
-// code traps on a non-zero high word and otherwise sign-extends the low word.
-// ---------------------------------------------------------------------------
-
-/// Packed trap sentinel shifted into the high word of a libcall result.
-const LIBCALL_TRAP: u64 = 1 << 32;
-
-/// `memory.atomic.notify`: wakes waiters at `addr` in memory `mem_idx`.
-unsafe extern "C" fn atomic_notify(ctx: *const u8, mem_idx: u64, addr: u64, count: u64) -> u64 {
-    match memory_notify(ctx, mem_idx, addr, count) {
-        Ok(woken) => u64::from(woken),
-        Err(_) => LIBCALL_TRAP,
-    }
-}
-
-/// `memory.atomic.wait32`: compares, then parks until notified or timed out.
-unsafe extern "C" fn atomic_wait32(
-    ctx: *const u8,
-    mem_idx: u64,
-    addr: u64,
-    expected: u64,
-    timeout: u64,
-) -> u64 {
-    match memory_wait(ctx, mem_idx, addr, expected, timeout, false) {
-        Ok(status) => status as u32 as u64,
-        Err(_) => LIBCALL_TRAP,
-    }
-}
-
-/// `memory.atomic.wait64`: compares, then parks until notified or timed out.
-unsafe extern "C" fn atomic_wait64(
-    ctx: *const u8,
-    mem_idx: u64,
-    addr: u64,
-    expected: u64,
-    timeout: u64,
-) -> u64 {
-    match memory_wait(ctx, mem_idx, addr, expected, timeout, true) {
-        Ok(status) => status as u32 as u64,
-        Err(_) => LIBCALL_TRAP,
-    }
-}
-
-/// Resolves an instance memory by index from the dispatch state.
-fn dispatch_memory(ctx: *const u8, mem_idx: u64) -> Result<Arc<Mutex<Memory>>> {
-    // SAFETY: `ctx` is a live `VmCtx` for the native call's duration.
-    let dispatch = unsafe { dispatch(ctx) }
-        .ok_or_else(|| WasmError::Runtime("AOT dispatch state missing".to_string()))?;
-    dispatch
-        .memories
-        .get(mem_idx as usize)
-        .cloned()
-        .ok_or_else(|| WasmError::Runtime(format!("memory {mem_idx} not found")))
-}
-
-/// Resolves an instance table by index from the dispatch state.
-fn dispatch_table(ctx: *const u8, table_idx: u64) -> Result<Arc<Mutex<AotTable>>> {
-    // SAFETY: `ctx` is a live `VmCtx` for the native call's duration.
-    let dispatch = unsafe { dispatch(ctx) }
-        .ok_or_else(|| WasmError::Runtime("AOT dispatch state missing".to_string()))?;
-    dispatch
-        .tables
-        .get(table_idx as usize)
-        .cloned()
-        .ok_or_else(|| WasmError::Runtime(format!("table {table_idx} not found")))
-}
-
-fn memory_notify(ctx: *const u8, mem_idx: u64, addr: u64, count: u64) -> Result<u32> {
-    let addr = u32::try_from(addr).map_err(|_| oob_trap())?;
-    // Natural alignment for a 4-byte notify, matching interpreter semantics.
-    if addr % 4 != 0 {
-        return Err(oob_trap());
-    }
-    let memory = dispatch_memory(ctx, mem_idx)?;
-    // `Memory::notify` performs the owned/shared bounds check itself.
-    memory
-        .lock()
-        .map_err(|_| poisoned_lock())?
-        .notify(addr, count as u32)
-}
-
-fn memory_wait(
-    ctx: *const u8,
-    mem_idx: u64,
-    addr: u64,
-    expected: u64,
-    timeout: u64,
-    is_64: bool,
-) -> Result<i32> {
-    let addr = u32::try_from(addr).map_err(|_| oob_trap())?;
-    let access_width = if is_64 { 8u32 } else { 4u32 };
-    if addr % access_width != 0 {
-        return Err(oob_trap());
-    }
-    let memory = dispatch_memory(ctx, mem_idx)?;
-
-    {
-        let memory = memory.lock().map_err(|_| poisoned_lock())?;
-        // Mirrors the interpreter's `do_wait`: bounds-checked read, compare,
-        // then register a waiter before dropping the lock to sleep.
-        let actual = if is_64 {
-            memory.read_i64(addr)? as i64
-        } else {
-            memory.read_i32(addr)? as i64
-        };
-        if actual != expected as i64 {
-            return Ok(1);
-        }
-        memory.get_waiter(addr);
-    }
-
-    // Nanosecond timeout: negative means wait forever.
-    let timeout_ns = if (timeout as i64) < 0 {
-        u64::MAX
-    } else {
-        timeout
-    };
-
-    let woken = memory
-        .lock()
-        .map_err(|_| poisoned_lock())?
-        .wait_on(addr, timeout_ns);
-    Ok(if woken { 0 } else { 2 })
-}
-
-fn oob_trap() -> WasmError {
-    WasmError::Trap(TrapCode::MemoryOutOfBounds)
-}
-
-fn table_trap() -> WasmError {
-    WasmError::Trap(TrapCode::TableOutOfBounds)
-}
-
-// ---------------------------------------------------------------------------
-// Memory / table runtime-op libcalls (memory.size, memory.grow, bulk memory,
-// table size/grow/copy/fill/init). Packed return: high word non-zero = trap,
-// low word = signed i32 result.
-// ---------------------------------------------------------------------------
-
-/// `memory.size`: returns the memory's owned size in pages.
-unsafe extern "C" fn memory_size(ctx: *const u8, mem_idx: u64) -> u64 {
-    let Ok(memory) = dispatch_memory(ctx, mem_idx) else {
-        return LIBCALL_TRAP;
-    };
-    match memory.lock() {
-        Ok(memory) => u64::from(memory.size()),
-        Err(_) => LIBCALL_TRAP,
-    }
-}
-
-/// `memory.grow`: grows by `delta` pages; returns the old size or `-1`.
-unsafe extern "C" fn memory_grow(ctx: *const u8, mem_idx: u64, delta: u64) -> u64 {
-    let Ok(memory) = dispatch_memory(ctx, mem_idx) else {
-        return u64::from(u32::MAX);
-    };
-    match memory.lock() {
-        Ok(mut memory) => match memory.grow(delta as u32) {
-            Ok(old) => u64::from(old),
-            Err(_) => u64::from(u32::MAX),
-        },
-        Err(_) => u64::from(u32::MAX),
-    }
-}
-
-/// `memory.copy`: memmove semantics across (possibly the same) memory.
-unsafe extern "C" fn memory_copy(
-    ctx: *const u8,
-    dst_idx: u64,
-    src_idx: u64,
-    dst: u64,
-    src: u64,
-    len: u64,
-) -> u64 {
-    match memory_copy_impl(ctx, dst_idx, src_idx, dst, src, len) {
-        Ok(()) => 0,
-        Err(_) => LIBCALL_TRAP,
-    }
-}
-
-/// `memory.fill`: fills `len` bytes at `dst` with `val & 0xFF`.
-unsafe extern "C" fn memory_fill(
-    ctx: *const u8,
-    mem_idx: u64,
-    dst: u64,
-    val: u64,
-    len: u64,
-) -> u64 {
-    match memory_fill_impl(ctx, mem_idx, dst, val, len) {
-        Ok(()) => 0,
-        Err(_) => LIBCALL_TRAP,
-    }
-}
-
-/// `memory.init`: copies `len` bytes from data segment `seg_idx` into memory.
-unsafe extern "C" fn memory_init(
-    ctx: *const u8,
-    mem_idx: u64,
-    seg_idx: u64,
-    dst: u64,
-    src: u64,
-    len: u64,
-) -> u64 {
-    match memory_init_impl(ctx, mem_idx, seg_idx, dst, src, len) {
-        Ok(()) => 0,
-        Err(_) => LIBCALL_TRAP,
-    }
-}
-
-/// `data.drop`: marks data segment `seg_idx` no longer available.
-unsafe extern "C" fn data_drop(ctx: *const u8, seg_idx: u64) -> u64 {
-    // SAFETY: the dispatch state outlives the native call.
-    let Some(dispatch) = (unsafe { dispatch_mut(ctx) }) else {
-        return LIBCALL_TRAP;
-    };
-    match dispatch.data_available.get_mut(seg_idx as usize) {
-        Some(flag) => {
-            *flag = false;
-            0
-        }
-        None => LIBCALL_TRAP,
-    }
-}
-
-/// `table.size`: returns the table's element count.
-unsafe extern "C" fn table_size(ctx: *const u8, table_idx: u64) -> u64 {
-    let Ok(table) = dispatch_table(ctx, table_idx) else {
-        return LIBCALL_TRAP;
-    };
-    match table.lock() {
-        Ok(table) => u64::from(table.cells.len() as u32),
-        Err(_) => LIBCALL_TRAP,
-    }
-}
-
-/// `table.grow`: appends `delta` copies of `init`; returns old size or `-1`.
-///
-/// The cell storage is capacity-reserved at table creation, so growth within
-/// the reservation never reallocates and the `base` published to compiled
-/// code stays valid. The new length is published to the shared holder *after*
-/// the new cells are initialised; see [`TableCells`] for the concurrency
-/// contract. Growth beyond the reservation fails with `-1`, which the
-/// specification permits.
-unsafe extern "C" fn table_grow(ctx: *const u8, table_idx: u64, delta: u64, init: u64) -> u64 {
-    let Ok(table) = dispatch_table(ctx, table_idx) else {
-        return u64::from(u32::MAX);
-    };
-    let mut table = match table.lock() {
-        Ok(table) => table,
-        Err(_) => return u64::from(u32::MAX),
-    };
-    let old = table.cells.len() as u32;
-    let Some(new) = old.checked_add(delta as u32) else {
-        return u64::from(u32::MAX);
-    };
-    if let Some(max) = table.type_.limits.max()
-        && new > max
-    {
-        return u64::from(u32::MAX);
-    }
-    if new as usize > table.cells.capacity() {
-        // Beyond the reserved capacity: fail rather than reallocate, which
-        // would invalidate the base pointer already published to compiled
-        // code in every instance that can reach this table.
-        return u64::from(u32::MAX);
-    }
-    table.cells.resize(new as usize, init as u32);
-    table.holder.len = new;
-    u64::from(old)
-}
-
-/// `table.copy`: copies `len` handles between tables (memmove within one).
-unsafe extern "C" fn table_copy(
-    ctx: *const u8,
-    dst_idx: u64,
-    src_idx: u64,
-    dst: u64,
-    src: u64,
-    len: u64,
-) -> u64 {
-    match table_copy_impl(ctx, dst_idx, src_idx, dst, src, len) {
-        Ok(()) => 0,
-        Err(_) => LIBCALL_TRAP,
-    }
-}
-
-/// `table.fill`: sets `len` entries at `dst` to `val`.
-unsafe extern "C" fn table_fill(
-    ctx: *const u8,
-    table_idx: u64,
-    dst: u64,
-    val: u64,
-    len: u64,
-) -> u64 {
-    match table_fill_impl(ctx, table_idx, dst, val, len) {
-        Ok(()) => 0,
-        Err(_) => LIBCALL_TRAP,
-    }
-}
-
-/// `table.init`: copies `len` handles from element segment `seg_idx`.
-unsafe extern "C" fn table_init(
-    ctx: *const u8,
-    seg_idx: u64,
-    table_idx: u64,
-    dst: u64,
-    src: u64,
-    len: u64,
-) -> u64 {
-    match table_init_impl(ctx, seg_idx, table_idx, dst, src, len) {
-        Ok(()) => 0,
-        Err(_) => LIBCALL_TRAP,
-    }
-}
-
-/// `elem.drop`: marks element segment `seg_idx` no longer available.
-unsafe extern "C" fn elem_drop(ctx: *const u8, seg_idx: u64) -> u64 {
-    // SAFETY: the dispatch state outlives the native call.
-    let Some(dispatch) = (unsafe { dispatch_mut(ctx) }) else {
-        return LIBCALL_TRAP;
-    };
-    match dispatch.elem_available.get_mut(seg_idx as usize) {
-        Some(flag) => {
-            *flag = false;
-            0
-        }
-        None => LIBCALL_TRAP,
-    }
-}
-
-/// Bounds-checks owned/shared access for a bulk-memory range.
-fn check_memory_range(memory: &Memory, addr: u32, len: u32) -> Result<()> {
-    let end = addr.checked_add(len).ok_or_else(oob_trap)?;
-    if !memory.is_valid_access(addr, len as usize)? {
-        return Err(oob_trap());
-    }
-    // `is_valid_access` only checks readable; bulk writes must also be
-    // writable (read-only shared domains trap like the interpreter).
-    memory.check_writable(addr, len as usize)?;
-    let _ = end;
-    Ok(())
-}
-
-fn memory_copy_impl(
-    ctx: *const u8,
-    dst_idx: u64,
-    src_idx: u64,
-    dst: u64,
-    src: u64,
-    len: u64,
-) -> Result<()> {
-    let dst = u32::try_from(dst).map_err(|_| oob_trap())?;
-    let src = u32::try_from(src).map_err(|_| oob_trap())?;
-    let len = u32::try_from(len).map_err(|_| oob_trap())?;
-    let dst_mem = dispatch_memory(ctx, dst_idx)?;
-    let src_mem = dispatch_memory(ctx, src_idx)?;
-
-    const CHUNK: usize = 4096;
-    let mut buf = vec![0u8; CHUNK.min(len as usize)];
-
-    if Arc::ptr_eq(&dst_mem, &src_mem) {
-        let mut memory = dst_mem.lock().map_err(|_| poisoned_lock())?;
-        check_memory_range(&memory, dst, len)?;
-        check_memory_range(&memory, src, len)?;
-        if src < dst {
-            let mut remaining = len;
-            while remaining > 0 {
-                let chunk = CHUNK.min(remaining as usize);
-                let off = remaining - chunk as u32;
-                memory.read(src + off, &mut buf[..chunk])?;
-                memory.write(dst + off, &buf[..chunk])?;
-                remaining -= chunk as u32;
-            }
-        } else {
-            let mut offset = 0u32;
-            while offset < len {
-                let chunk = CHUNK.min((len - offset) as usize);
-                memory.read(src + offset, &mut buf[..chunk])?;
-                memory.write(dst + offset, &buf[..chunk])?;
-                offset += chunk as u32;
-            }
-        }
-    } else {
-        let mut dst_lock = dst_mem.lock().map_err(|_| poisoned_lock())?;
-        let src_lock = src_mem.lock().map_err(|_| poisoned_lock())?;
-        if !src_lock.is_valid_access(src, len as usize)?
-            || !dst_lock.is_valid_access(dst, len as usize)?
-        {
-            return Err(oob_trap());
-        }
-        dst_lock.check_writable(dst, len as usize)?;
-        let mut offset = 0u32;
-        while offset < len {
-            let chunk = CHUNK.min((len - offset) as usize);
-            src_lock.read(src + offset, &mut buf[..chunk])?;
-            dst_lock.write(dst + offset, &buf[..chunk])?;
-            offset += chunk as u32;
-        }
-    }
-    Ok(())
-}
-
-fn memory_fill_impl(ctx: *const u8, mem_idx: u64, dst: u64, val: u64, len: u64) -> Result<()> {
-    let dst = u32::try_from(dst).map_err(|_| oob_trap())?;
-    let len = u32::try_from(len).map_err(|_| oob_trap())?;
-    let memory = dispatch_memory(ctx, mem_idx)?;
-    let mut memory = memory.lock().map_err(|_| poisoned_lock())?;
-    check_memory_range(&memory, dst, len)?;
-
-    const CHUNK: usize = 4096;
-    let chunk_buf = vec![val as u8; CHUNK.min(len as usize)];
-    let mut offset = 0u32;
-    while offset < len {
-        let chunk = CHUNK.min((len - offset) as usize);
-        memory.write(dst + offset, &chunk_buf[..chunk])?;
-        offset += chunk as u32;
-    }
-    Ok(())
-}
-
-fn memory_init_impl(
-    ctx: *const u8,
-    mem_idx: u64,
-    seg_idx: u64,
-    dst: u64,
-    src: u64,
-    len: u64,
-) -> Result<()> {
-    let dst = u32::try_from(dst).map_err(|_| oob_trap())?;
-    let src = u32::try_from(src).map_err(|_| oob_trap())?;
-    let len = u32::try_from(len).map_err(|_| oob_trap())?;
-
-    // SAFETY: the dispatch state outlives the native call.
-    let Some(dispatch) = (unsafe { dispatch(ctx) }) else {
-        return Err(WasmError::Runtime("AOT dispatch state missing".to_string()));
-    };
-    let segment = dispatch
-        .data_segments
-        .get(seg_idx as usize)
-        .ok_or_else(|| WasmError::Runtime(format!("data segment {seg_idx} not found")))?;
-    let available = dispatch.data_available.get(seg_idx as usize) == Some(&true);
-    let segment_len = if available { segment.len() as u32 } else { 0 };
-    let src_end = src.checked_add(len).ok_or_else(oob_trap)?;
-    if src_end > segment_len {
-        return Err(oob_trap());
-    }
-    let bytes = if available && len > 0 {
-        segment[src as usize..src_end as usize].to_vec()
-    } else {
-        Vec::new()
-    };
-    let memory = dispatch_memory(ctx, mem_idx)?;
-    memory
-        .lock()
-        .map_err(|_| poisoned_lock())?
-        .write(dst, &bytes)
-}
-
-fn table_copy_impl(
-    ctx: *const u8,
-    dst_idx: u64,
-    src_idx: u64,
-    dst: u64,
-    src: u64,
-    len: u64,
-) -> Result<()> {
-    let dst = u32::try_from(dst).map_err(|_| table_trap())?;
-    let src = u32::try_from(src).map_err(|_| table_trap())?;
-    let len = u32::try_from(len).map_err(|_| table_trap())?;
-    let dst_end = dst.checked_add(len).ok_or_else(table_trap)?;
-    let src_end = src.checked_add(len).ok_or_else(table_trap)?;
-
-    let dst_tbl = dispatch_table(ctx, dst_idx)?;
-    let src_tbl = dispatch_table(ctx, src_idx)?;
-
-    if Arc::ptr_eq(&dst_tbl, &src_tbl) {
-        let mut table = dst_tbl.lock().map_err(|_| poisoned_table())?;
-        if src_end as usize > table.cells.len() || dst_end as usize > table.cells.len() {
-            return Err(table_trap());
-        }
-        if len > 0 {
-            table
-                .cells
-                .copy_within(src as usize..src_end as usize, dst as usize);
-        }
-    } else {
-        let mut dst_cells = dst_tbl.lock().map_err(|_| poisoned_table())?;
-        let src_cells = src_tbl.lock().map_err(|_| poisoned_table())?;
-        if src_end as usize > src_cells.cells.len() || dst_end as usize > dst_cells.cells.len() {
-            return Err(table_trap());
-        }
-        if len > 0 {
-            dst_cells.cells[dst as usize..dst_end as usize]
-                .copy_from_slice(&src_cells.cells[src as usize..src_end as usize]);
-        }
-    }
-    Ok(())
-}
-
-fn table_fill_impl(ctx: *const u8, table_idx: u64, dst: u64, val: u64, len: u64) -> Result<()> {
-    let dst = u32::try_from(dst).map_err(|_| table_trap())?;
-    let len = u32::try_from(len).map_err(|_| table_trap())?;
-    let end = dst.checked_add(len).ok_or_else(table_trap)?;
-    let table = dispatch_table(ctx, table_idx)?;
-    let mut table = table.lock().map_err(|_| poisoned_table())?;
-    if end as usize > table.cells.len() {
-        return Err(table_trap());
-    }
-    if len > 0 {
-        table.cells[dst as usize..end as usize].fill(val as u32);
-    }
-    Ok(())
-}
-
-fn table_init_impl(
-    ctx: *const u8,
-    seg_idx: u64,
-    table_idx: u64,
-    dst: u64,
-    src: u64,
-    len: u64,
-) -> Result<()> {
-    let dst = u32::try_from(dst).map_err(|_| table_trap())?;
-    let src = u32::try_from(src).map_err(|_| table_trap())?;
-    let len = u32::try_from(len).map_err(|_| table_trap())?;
-    let dst_end = dst.checked_add(len).ok_or_else(table_trap)?;
-    let src_end = src.checked_add(len).ok_or_else(table_trap)?;
-
-    // SAFETY: the dispatch state outlives the native call.
-    let Some(dispatch) = (unsafe { dispatch(ctx) }) else {
-        return Err(WasmError::Runtime("AOT dispatch state missing".to_string()));
-    };
-    let segment = dispatch
-        .elem_segments
-        .get(seg_idx as usize)
-        .ok_or_else(|| WasmError::Runtime(format!("element segment {seg_idx} not found")))?;
-    let available = dispatch.elem_available.get(seg_idx as usize) == Some(&true);
-    let segment_len = if available { segment.len() as u32 } else { 0 };
-    if src_end > segment_len {
-        return Err(table_trap());
-    }
-
-    let table = dispatch_table(ctx, table_idx)?;
-    let mut table = table.lock().map_err(|_| poisoned_table())?;
-    if dst_end as usize > table.cells.len() {
-        return Err(table_trap());
-    }
-    if len > 0 {
-        table.cells[dst as usize..dst_end as usize]
-            .copy_from_slice(&segment[src as usize..src_end as usize]);
-    }
-    Ok(())
-}
-
-fn poisoned_table() -> WasmError {
-    WasmError::Runtime("AOT table lock poisoned".to_string())
-}
-
-/// A loaded, instantiated artifact ready for native invocation.
-pub struct AotInstance {
-    image: Arc<ExecutableCode>,
-    functions: Vec<AotFunction>,
-    types: Vec<FunctionType>,
-    /// The module's export directory, for name-based lookup.
-    exports: Vec<ExportType>,
-    ctx: Box<VmCtx>,
-    _funcs: Vec<FuncDesc>,
-    _type_ids: Vec<u32>,
-    _refs: Vec<u32>,
-    _globals: Vec<u8>,
-    _global_types: Vec<GlobalType>,
-    _tables: Vec<SharedTableTag>,
-    /// Per-instance table slots (pointers into the shared holders owned by
-    /// the tables in `_tables`); must outlive every native call.
-    _table_slots: Vec<*const TableCells>,
-    _memories: Vec<Arc<Mutex<Memory>>>,
-    _memory_descs: Vec<MemoryDesc>,
-    _libcalls: Box<LibcallTable>,
-    _dispatch: Box<AotDispatchState>,
-    _store: SharedAotStore,
-    _registered: traps::RegisteredCode,
-}
-
-type SharedTableTag = Arc<Mutex<AotTable>>;
 
 impl AotInstance {
     /// Prepares a loaded artifact for execution with no imports.
@@ -1364,6 +673,169 @@ impl AotInstance {
     }
 }
 
+impl LibcallTable {
+    fn new() -> Box<Self> {
+        Box::new(Self {
+            host_call,
+            atomic_notify,
+            atomic_wait32,
+            atomic_wait64,
+            memory_size,
+            memory_grow,
+            memory_copy,
+            memory_fill,
+            memory_init,
+            data_drop,
+            table_size,
+            table_grow,
+            table_copy,
+            table_fill,
+            table_init,
+            elem_drop,
+        })
+    }
+}
+
+/// `memory.atomic.notify`: wakes waiters at `addr` in memory `mem_idx`.
+unsafe extern "C" fn atomic_notify(ctx: *const u8, mem_idx: u64, addr: u64, count: u64) -> u64 {
+    match memory_notify(ctx, mem_idx, addr, count) {
+        Ok(woken) => u64::from(woken),
+        Err(_) => LIBCALL_TRAP,
+    }
+}
+
+/// `memory.atomic.wait32`: compares, then parks until notified or timed out.
+unsafe extern "C" fn atomic_wait32(
+    ctx: *const u8,
+    mem_idx: u64,
+    addr: u64,
+    expected: u64,
+    timeout: u64,
+) -> u64 {
+    match memory_wait(ctx, mem_idx, addr, expected, timeout, false) {
+        Ok(status) => status as u32 as u64,
+        Err(_) => LIBCALL_TRAP,
+    }
+}
+
+/// `memory.atomic.wait64`: compares, then parks until notified or timed out.
+unsafe extern "C" fn atomic_wait64(
+    ctx: *const u8,
+    mem_idx: u64,
+    addr: u64,
+    expected: u64,
+    timeout: u64,
+) -> u64 {
+    match memory_wait(ctx, mem_idx, addr, expected, timeout, true) {
+        Ok(status) => status as u32 as u64,
+        Err(_) => LIBCALL_TRAP,
+    }
+}
+
+/// Bounds-checks owned/shared access for a bulk-memory range.
+fn check_memory_range(memory: &Memory, addr: u32, len: u32) -> Result<()> {
+    let end = addr.checked_add(len).ok_or_else(oob_trap)?;
+    if !memory.is_valid_access(addr, len as usize)? {
+        return Err(oob_trap());
+    }
+    // `is_valid_access` only checks readable; bulk writes must also be
+    // writable (read-only shared domains trap like the interpreter).
+    memory.check_writable(addr, len as usize)?;
+    let _ = end;
+    Ok(())
+}
+
+/// `data.drop`: marks data segment `seg_idx` no longer available.
+unsafe extern "C" fn data_drop(ctx: *const u8, seg_idx: u64) -> u64 {
+    // SAFETY: the dispatch state outlives the native call.
+    let Some(dispatch) = (unsafe { dispatch_mut(ctx) }) else {
+        return LIBCALL_TRAP;
+    };
+    match dispatch.data_available.get_mut(seg_idx as usize) {
+        Some(flag) => {
+            *flag = false;
+            0
+        }
+        None => LIBCALL_TRAP,
+    }
+}
+
+fn decode_results(slots: &[u64], func_type: &FunctionType) -> Result<Vec<WasmValue>> {
+    slots
+        .iter()
+        .zip(func_type.results.iter())
+        .map(|(slot, result)| Ok(slot_to_value(*slot, result)))
+        .collect()
+}
+
+/// Borrows the per-instance dispatch state out of a vmctx pointer.
+///
+/// # Safety
+/// `ctx` must point at a live [`VmCtx`] whose `dispatch` references a live
+/// [`AotDispatchState`] for the duration of the native call.
+unsafe fn dispatch<'a>(ctx: *const u8) -> Option<&'a AotDispatchState> {
+    let vmctx = unsafe { &*(ctx as *const VmCtx) };
+    if vmctx.dispatch.is_null() {
+        None
+    } else {
+        Some(unsafe { &*(vmctx.dispatch as *const AotDispatchState) })
+    }
+}
+
+/// Resolves an instance memory by index from the dispatch state.
+fn dispatch_memory(ctx: *const u8, mem_idx: u64) -> Result<Arc<Mutex<Memory>>> {
+    // SAFETY: `ctx` is a live `VmCtx` for the native call's duration.
+    let dispatch = unsafe { dispatch(ctx) }
+        .ok_or_else(|| WasmError::Runtime("AOT dispatch state missing".to_string()))?;
+    dispatch
+        .memories
+        .get(mem_idx as usize)
+        .cloned()
+        .ok_or_else(|| WasmError::Runtime(format!("memory {mem_idx} not found")))
+}
+
+/// Borrows the per-instance dispatch state mutably.
+///
+/// # Safety
+/// `ctx` must point at a live [`VmCtx`] whose `dispatch` references a live
+/// [`AotDispatchState`] for the duration of the native call, and no other
+/// reference to that state may be alive during the borrow.
+unsafe fn dispatch_mut<'a>(ctx: *const u8) -> Option<&'a mut AotDispatchState> {
+    let vmctx = unsafe { &*(ctx as *const VmCtx) };
+    if vmctx.dispatch.is_null() {
+        None
+    } else {
+        Some(unsafe { &mut *(vmctx.dispatch as *mut AotDispatchState) })
+    }
+}
+
+/// Resolves an instance table by index from the dispatch state.
+fn dispatch_table(ctx: *const u8, table_idx: u64) -> Result<Arc<Mutex<AotTable>>> {
+    // SAFETY: `ctx` is a live `VmCtx` for the native call's duration.
+    let dispatch = unsafe { dispatch(ctx) }
+        .ok_or_else(|| WasmError::Runtime("AOT dispatch state missing".to_string()))?;
+    dispatch
+        .tables
+        .get(table_idx as usize)
+        .cloned()
+        .ok_or_else(|| WasmError::Runtime(format!("table {table_idx} not found")))
+}
+
+/// `elem.drop`: marks element segment `seg_idx` no longer available.
+unsafe extern "C" fn elem_drop(ctx: *const u8, seg_idx: u64) -> u64 {
+    // SAFETY: the dispatch state outlives the native call.
+    let Some(dispatch) = (unsafe { dispatch_mut(ctx) }) else {
+        return LIBCALL_TRAP;
+    };
+    match dispatch.elem_available.get_mut(seg_idx as usize) {
+        Some(flag) => {
+            *flag = false;
+            0
+        }
+        None => LIBCALL_TRAP,
+    }
+}
+
 /// Evaluates an active-segment offset constant expression (`i32.const` or a
 /// `global.get` of an imported immutable global) to a byte offset.
 fn eval_offset(expr: &[u8], globals: &[Option<Arc<Mutex<Global>>>], refs: &[u32]) -> Result<u32> {
@@ -1376,6 +848,230 @@ fn eval_offset(expr: &[u8], globals: &[Option<Arc<Mutex<Global>>>], refs: &[u32]
     }
 }
 
+/// Dispatches an imported host-function call on behalf of a compiled stub.
+unsafe extern "C" fn host_call(
+    ctx: *const u8,
+    ordinal: u64,
+    args: *mut u64,
+    results: *mut u64,
+) -> u64 {
+    // SAFETY: `ctx` is a live `VmCtx` whose `dispatch` points to a live
+    // `AotDispatchState` for the duration of the call.
+    unsafe {
+        let vmctx = &*(ctx as *const VmCtx);
+        if vmctx.dispatch.is_null() {
+            return 1;
+        }
+        let dispatch = &*(vmctx.dispatch as *const AotDispatchState);
+
+        let Some(func) = dispatch.host_funcs.get(ordinal as usize) else {
+            return 1;
+        };
+        let func_type = &dispatch.host_types[ordinal as usize];
+
+        let wasm_args: Vec<WasmValue> = func_type
+            .params
+            .iter()
+            .enumerate()
+            .map(|(index, param)| slot_to_value(*args.add(index), param))
+            .collect();
+
+        let result = {
+            let Ok(mut store) = dispatch.store.lock() else {
+                return 1;
+            };
+            let mut caller = HostCaller::new(&mut store, &dispatch.memories);
+            func.call(&mut caller, &wasm_args)
+        };
+
+        match result {
+            Ok(values) => {
+                if values.len() != func_type.results.len() {
+                    return 1;
+                }
+                for (index, value) in values.iter().enumerate() {
+                    *results.add(index) = value_to_slot(value);
+                }
+                0
+            }
+            Err(_) => 1,
+        }
+    }
+}
+
+/// `memory.copy`: memmove semantics across (possibly the same) memory.
+unsafe extern "C" fn memory_copy(
+    ctx: *const u8,
+    dst_idx: u64,
+    src_idx: u64,
+    dst: u64,
+    src: u64,
+    len: u64,
+) -> u64 {
+    match memory_copy_impl(ctx, dst_idx, src_idx, dst, src, len) {
+        Ok(()) => 0,
+        Err(_) => LIBCALL_TRAP,
+    }
+}
+
+fn memory_copy_impl(
+    ctx: *const u8,
+    dst_idx: u64,
+    src_idx: u64,
+    dst: u64,
+    src: u64,
+    len: u64,
+) -> Result<()> {
+    let dst = u32::try_from(dst).map_err(|_| oob_trap())?;
+    let src = u32::try_from(src).map_err(|_| oob_trap())?;
+    let len = u32::try_from(len).map_err(|_| oob_trap())?;
+    let dst_mem = dispatch_memory(ctx, dst_idx)?;
+    let src_mem = dispatch_memory(ctx, src_idx)?;
+
+    const CHUNK: usize = 4096;
+    let mut buf = vec![0u8; CHUNK.min(len as usize)];
+
+    if Arc::ptr_eq(&dst_mem, &src_mem) {
+        let mut memory = dst_mem.lock().map_err(|_| poisoned_lock())?;
+        check_memory_range(&memory, dst, len)?;
+        check_memory_range(&memory, src, len)?;
+        if src < dst {
+            let mut remaining = len;
+            while remaining > 0 {
+                let chunk = CHUNK.min(remaining as usize);
+                let off = remaining - chunk as u32;
+                memory.read(src + off, &mut buf[..chunk])?;
+                memory.write(dst + off, &buf[..chunk])?;
+                remaining -= chunk as u32;
+            }
+        } else {
+            let mut offset = 0u32;
+            while offset < len {
+                let chunk = CHUNK.min((len - offset) as usize);
+                memory.read(src + offset, &mut buf[..chunk])?;
+                memory.write(dst + offset, &buf[..chunk])?;
+                offset += chunk as u32;
+            }
+        }
+    } else {
+        let mut dst_lock = dst_mem.lock().map_err(|_| poisoned_lock())?;
+        let src_lock = src_mem.lock().map_err(|_| poisoned_lock())?;
+        if !src_lock.is_valid_access(src, len as usize)?
+            || !dst_lock.is_valid_access(dst, len as usize)?
+        {
+            return Err(oob_trap());
+        }
+        dst_lock.check_writable(dst, len as usize)?;
+        let mut offset = 0u32;
+        while offset < len {
+            let chunk = CHUNK.min((len - offset) as usize);
+            src_lock.read(src + offset, &mut buf[..chunk])?;
+            dst_lock.write(dst + offset, &buf[..chunk])?;
+            offset += chunk as u32;
+        }
+    }
+    Ok(())
+}
+
+/// `memory.fill`: fills `len` bytes at `dst` with `val & 0xFF`.
+unsafe extern "C" fn memory_fill(
+    ctx: *const u8,
+    mem_idx: u64,
+    dst: u64,
+    val: u64,
+    len: u64,
+) -> u64 {
+    match memory_fill_impl(ctx, mem_idx, dst, val, len) {
+        Ok(()) => 0,
+        Err(_) => LIBCALL_TRAP,
+    }
+}
+
+fn memory_fill_impl(ctx: *const u8, mem_idx: u64, dst: u64, val: u64, len: u64) -> Result<()> {
+    let dst = u32::try_from(dst).map_err(|_| oob_trap())?;
+    let len = u32::try_from(len).map_err(|_| oob_trap())?;
+    let memory = dispatch_memory(ctx, mem_idx)?;
+    let mut memory = memory.lock().map_err(|_| poisoned_lock())?;
+    check_memory_range(&memory, dst, len)?;
+
+    const CHUNK: usize = 4096;
+    let chunk_buf = vec![val as u8; CHUNK.min(len as usize)];
+    let mut offset = 0u32;
+    while offset < len {
+        let chunk = CHUNK.min((len - offset) as usize);
+        memory.write(dst + offset, &chunk_buf[..chunk])?;
+        offset += chunk as u32;
+    }
+    Ok(())
+}
+
+/// `memory.grow`: grows by `delta` pages; returns the old size or `-1`.
+unsafe extern "C" fn memory_grow(ctx: *const u8, mem_idx: u64, delta: u64) -> u64 {
+    let Ok(memory) = dispatch_memory(ctx, mem_idx) else {
+        return u64::from(u32::MAX);
+    };
+    match memory.lock() {
+        Ok(mut memory) => match memory.grow(delta as u32) {
+            Ok(old) => u64::from(old),
+            Err(_) => u64::from(u32::MAX),
+        },
+        Err(_) => u64::from(u32::MAX),
+    }
+}
+
+/// `memory.init`: copies `len` bytes from data segment `seg_idx` into memory.
+unsafe extern "C" fn memory_init(
+    ctx: *const u8,
+    mem_idx: u64,
+    seg_idx: u64,
+    dst: u64,
+    src: u64,
+    len: u64,
+) -> u64 {
+    match memory_init_impl(ctx, mem_idx, seg_idx, dst, src, len) {
+        Ok(()) => 0,
+        Err(_) => LIBCALL_TRAP,
+    }
+}
+
+fn memory_init_impl(
+    ctx: *const u8,
+    mem_idx: u64,
+    seg_idx: u64,
+    dst: u64,
+    src: u64,
+    len: u64,
+) -> Result<()> {
+    let dst = u32::try_from(dst).map_err(|_| oob_trap())?;
+    let src = u32::try_from(src).map_err(|_| oob_trap())?;
+    let len = u32::try_from(len).map_err(|_| oob_trap())?;
+
+    // SAFETY: the dispatch state outlives the native call.
+    let Some(dispatch) = (unsafe { dispatch(ctx) }) else {
+        return Err(WasmError::Runtime("AOT dispatch state missing".to_string()));
+    };
+    let segment = dispatch
+        .data_segments
+        .get(seg_idx as usize)
+        .ok_or_else(|| WasmError::Runtime(format!("data segment {seg_idx} not found")))?;
+    let available = dispatch.data_available.get(seg_idx as usize) == Some(&true);
+    let segment_len = if available { segment.len() as u32 } else { 0 };
+    let src_end = src.checked_add(len).ok_or_else(oob_trap)?;
+    if src_end > segment_len {
+        return Err(oob_trap());
+    }
+    let bytes = if available && len > 0 {
+        segment[src as usize..src_end as usize].to_vec()
+    } else {
+        Vec::new()
+    };
+    let memory = dispatch_memory(ctx, mem_idx)?;
+    memory
+        .lock()
+        .map_err(|_| poisoned_lock())?
+        .write(dst, &bytes)
+}
+
 /// Limits subtyping for an imported memory, mirroring the interpreter's
 /// `memory_matches_required`.
 fn memory_matches_required(actual: &Memory, required: &crate::runtime::MemoryType) -> bool {
@@ -1386,6 +1082,282 @@ fn memory_matches_required(actual: &Memory, required: &crate::runtime::MemoryTyp
             (Some(actual_max), Some(required_max)) => actual_max <= required_max,
             (None, Some(_)) => false,
         }
+}
+
+fn memory_notify(ctx: *const u8, mem_idx: u64, addr: u64, count: u64) -> Result<u32> {
+    let addr = u32::try_from(addr).map_err(|_| oob_trap())?;
+    // Natural alignment for a 4-byte notify, matching interpreter semantics.
+    if addr % 4 != 0 {
+        return Err(oob_trap());
+    }
+    let memory = dispatch_memory(ctx, mem_idx)?;
+    // `Memory::notify` performs the owned/shared bounds check itself.
+    memory
+        .lock()
+        .map_err(|_| poisoned_lock())?
+        .notify(addr, count as u32)
+}
+
+/// `memory.size`: returns the memory's owned size in pages.
+unsafe extern "C" fn memory_size(ctx: *const u8, mem_idx: u64) -> u64 {
+    let Ok(memory) = dispatch_memory(ctx, mem_idx) else {
+        return LIBCALL_TRAP;
+    };
+    match memory.lock() {
+        Ok(memory) => u64::from(memory.size()),
+        Err(_) => LIBCALL_TRAP,
+    }
+}
+
+fn memory_wait(
+    ctx: *const u8,
+    mem_idx: u64,
+    addr: u64,
+    expected: u64,
+    timeout: u64,
+    is_64: bool,
+) -> Result<i32> {
+    let addr = u32::try_from(addr).map_err(|_| oob_trap())?;
+    let access_width = if is_64 { 8u32 } else { 4u32 };
+    if addr % access_width != 0 {
+        return Err(oob_trap());
+    }
+    let memory = dispatch_memory(ctx, mem_idx)?;
+
+    {
+        let memory = memory.lock().map_err(|_| poisoned_lock())?;
+        // Mirrors the interpreter's `do_wait`: bounds-checked read, compare,
+        // then register a waiter before dropping the lock to sleep.
+        let actual = if is_64 {
+            memory.read_i64(addr)? as i64
+        } else {
+            memory.read_i32(addr)? as i64
+        };
+        if actual != expected as i64 {
+            return Ok(1);
+        }
+        memory.get_waiter(addr);
+    }
+
+    // Nanosecond timeout: negative means wait forever.
+    let timeout_ns = if (timeout as i64) < 0 {
+        u64::MAX
+    } else {
+        timeout
+    };
+
+    let woken = memory
+        .lock()
+        .map_err(|_| poisoned_lock())?
+        .wait_on(addr, timeout_ns);
+    Ok(if woken { 0 } else { 2 })
+}
+
+fn oob_trap() -> WasmError {
+    WasmError::Trap(TrapCode::MemoryOutOfBounds)
+}
+
+fn poisoned_case() -> WasmError {
+    WasmError::Runtime("AOT store lock poisoned".to_string())
+}
+
+fn poisoned_lock() -> WasmError {
+    WasmError::Runtime("table lock poisoned".to_string())
+}
+
+fn poisoned_table() -> WasmError {
+    WasmError::Runtime("AOT table lock poisoned".to_string())
+}
+
+fn slot_to_value(slot: u64, ty: &ValType) -> WasmValue {
+    match ty {
+        ValType::Num(NumType::I32) => WasmValue::I32(slot as u32 as i32),
+        ValType::Num(NumType::I64) => WasmValue::I64(slot as i64),
+        ValType::Num(NumType::F32) => WasmValue::F32(f32::from_bits(slot as u32)),
+        ValType::Num(NumType::F64) => WasmValue::F64(f64::from_bits(slot)),
+        ValType::Ref(RefType::FuncRef) if slot == 0 => WasmValue::NullRef(RefType::FuncRef),
+        ValType::Ref(RefType::FuncRef) => WasmValue::FuncRef(slot as u32),
+        ValType::Ref(RefType::ExternRef) if slot == 0 => WasmValue::NullRef(RefType::ExternRef),
+        // Externref slots are host index + 1 (slot 0 is the null sentinel), so
+        // a genuine host externref with index 0 round-trips as slot 1.
+        ValType::Ref(RefType::ExternRef) => WasmValue::ExternRef((slot - 1) as u32),
+    }
+}
+
+/// `table.copy`: copies `len` handles between tables (memmove within one).
+unsafe extern "C" fn table_copy(
+    ctx: *const u8,
+    dst_idx: u64,
+    src_idx: u64,
+    dst: u64,
+    src: u64,
+    len: u64,
+) -> u64 {
+    match table_copy_impl(ctx, dst_idx, src_idx, dst, src, len) {
+        Ok(()) => 0,
+        Err(_) => LIBCALL_TRAP,
+    }
+}
+
+fn table_copy_impl(
+    ctx: *const u8,
+    dst_idx: u64,
+    src_idx: u64,
+    dst: u64,
+    src: u64,
+    len: u64,
+) -> Result<()> {
+    let dst = u32::try_from(dst).map_err(|_| table_trap())?;
+    let src = u32::try_from(src).map_err(|_| table_trap())?;
+    let len = u32::try_from(len).map_err(|_| table_trap())?;
+    let dst_end = dst.checked_add(len).ok_or_else(table_trap)?;
+    let src_end = src.checked_add(len).ok_or_else(table_trap)?;
+
+    let dst_tbl = dispatch_table(ctx, dst_idx)?;
+    let src_tbl = dispatch_table(ctx, src_idx)?;
+
+    if Arc::ptr_eq(&dst_tbl, &src_tbl) {
+        let mut table = dst_tbl.lock().map_err(|_| poisoned_table())?;
+        if src_end as usize > table.cells.len() || dst_end as usize > table.cells.len() {
+            return Err(table_trap());
+        }
+        if len > 0 {
+            table
+                .cells
+                .copy_within(src as usize..src_end as usize, dst as usize);
+        }
+    } else {
+        let mut dst_cells = dst_tbl.lock().map_err(|_| poisoned_table())?;
+        let src_cells = src_tbl.lock().map_err(|_| poisoned_table())?;
+        if src_end as usize > src_cells.cells.len() || dst_end as usize > dst_cells.cells.len() {
+            return Err(table_trap());
+        }
+        if len > 0 {
+            dst_cells.cells[dst as usize..dst_end as usize]
+                .copy_from_slice(&src_cells.cells[src as usize..src_end as usize]);
+        }
+    }
+    Ok(())
+}
+
+/// `table.fill`: sets `len` entries at `dst` to `val`.
+unsafe extern "C" fn table_fill(
+    ctx: *const u8,
+    table_idx: u64,
+    dst: u64,
+    val: u64,
+    len: u64,
+) -> u64 {
+    match table_fill_impl(ctx, table_idx, dst, val, len) {
+        Ok(()) => 0,
+        Err(_) => LIBCALL_TRAP,
+    }
+}
+
+fn table_fill_impl(ctx: *const u8, table_idx: u64, dst: u64, val: u64, len: u64) -> Result<()> {
+    let dst = u32::try_from(dst).map_err(|_| table_trap())?;
+    let len = u32::try_from(len).map_err(|_| table_trap())?;
+    let end = dst.checked_add(len).ok_or_else(table_trap)?;
+    let table = dispatch_table(ctx, table_idx)?;
+    let mut table = table.lock().map_err(|_| poisoned_table())?;
+    if end as usize > table.cells.len() {
+        return Err(table_trap());
+    }
+    if len > 0 {
+        table.cells[dst as usize..end as usize].fill(val as u32);
+    }
+    Ok(())
+}
+
+/// `table.grow`: appends `delta` copies of `init`; returns old size or `-1`.
+///
+/// The cell storage is capacity-reserved at table creation, so growth within
+/// the reservation never reallocates and the `base` published to compiled
+/// code stays valid. The new length is published to the shared holder *after*
+/// the new cells are initialised; see [`TableCells`] for the concurrency
+/// contract. Growth beyond the reservation fails with `-1`, which the
+/// specification permits.
+unsafe extern "C" fn table_grow(ctx: *const u8, table_idx: u64, delta: u64, init: u64) -> u64 {
+    let Ok(table) = dispatch_table(ctx, table_idx) else {
+        return u64::from(u32::MAX);
+    };
+    let mut table = match table.lock() {
+        Ok(table) => table,
+        Err(_) => return u64::from(u32::MAX),
+    };
+    let old = table.cells.len() as u32;
+    let Some(new) = old.checked_add(delta as u32) else {
+        return u64::from(u32::MAX);
+    };
+    if let Some(max) = table.type_.limits.max()
+        && new > max
+    {
+        return u64::from(u32::MAX);
+    }
+    if new as usize > table.cells.capacity() {
+        // Beyond the reserved capacity: fail rather than reallocate, which
+        // would invalidate the base pointer already published to compiled
+        // code in every instance that can reach this table.
+        return u64::from(u32::MAX);
+    }
+    table.cells.resize(new as usize, init as u32);
+    table.holder.len = new;
+    u64::from(old)
+}
+
+/// `table.init`: copies `len` handles from element segment `seg_idx`.
+unsafe extern "C" fn table_init(
+    ctx: *const u8,
+    seg_idx: u64,
+    table_idx: u64,
+    dst: u64,
+    src: u64,
+    len: u64,
+) -> u64 {
+    match table_init_impl(ctx, seg_idx, table_idx, dst, src, len) {
+        Ok(()) => 0,
+        Err(_) => LIBCALL_TRAP,
+    }
+}
+
+fn table_init_impl(
+    ctx: *const u8,
+    seg_idx: u64,
+    table_idx: u64,
+    dst: u64,
+    src: u64,
+    len: u64,
+) -> Result<()> {
+    let dst = u32::try_from(dst).map_err(|_| table_trap())?;
+    let src = u32::try_from(src).map_err(|_| table_trap())?;
+    let len = u32::try_from(len).map_err(|_| table_trap())?;
+    let dst_end = dst.checked_add(len).ok_or_else(table_trap)?;
+    let src_end = src.checked_add(len).ok_or_else(table_trap)?;
+
+    // SAFETY: the dispatch state outlives the native call.
+    let Some(dispatch) = (unsafe { dispatch(ctx) }) else {
+        return Err(WasmError::Runtime("AOT dispatch state missing".to_string()));
+    };
+    let segment = dispatch
+        .elem_segments
+        .get(seg_idx as usize)
+        .ok_or_else(|| WasmError::Runtime(format!("element segment {seg_idx} not found")))?;
+    let available = dispatch.elem_available.get(seg_idx as usize) == Some(&true);
+    let segment_len = if available { segment.len() as u32 } else { 0 };
+    if src_end > segment_len {
+        return Err(table_trap());
+    }
+
+    let table = dispatch_table(ctx, table_idx)?;
+    let mut table = table.lock().map_err(|_| poisoned_table())?;
+    if dst_end as usize > table.cells.len() {
+        return Err(table_trap());
+    }
+    if len > 0 {
+        table.cells[dst as usize..dst_end as usize]
+            .copy_from_slice(&segment[src as usize..src_end as usize]);
+    }
+    Ok(())
 }
 
 /// Table type subtyping for an imported table, mirroring the interpreter.
@@ -1401,12 +1373,19 @@ fn table_matches_required(actual: &AotTable, required: &crate::runtime::TableTyp
         }
 }
 
-fn poisoned_lock() -> WasmError {
-    WasmError::Runtime("table lock poisoned".to_string())
+/// `table.size`: returns the table's element count.
+unsafe extern "C" fn table_size(ctx: *const u8, table_idx: u64) -> u64 {
+    let Ok(table) = dispatch_table(ctx, table_idx) else {
+        return LIBCALL_TRAP;
+    };
+    match table.lock() {
+        Ok(table) => u64::from(table.cells.len() as u32),
+        Err(_) => LIBCALL_TRAP,
+    }
 }
 
-fn poisoned_case() -> WasmError {
-    WasmError::Runtime("AOT store lock poisoned".to_string())
+fn table_trap() -> WasmError {
+    WasmError::Trap(TrapCode::TableOutOfBounds)
 }
 
 fn validate_args(args: &[WasmValue], func_type: &FunctionType) -> Result<()> {
@@ -1428,10 +1407,15 @@ fn validate_args(args: &[WasmValue], func_type: &FunctionType) -> Result<()> {
     Ok(())
 }
 
-fn decode_results(slots: &[u64], func_type: &FunctionType) -> Result<Vec<WasmValue>> {
-    slots
-        .iter()
-        .zip(func_type.results.iter())
-        .map(|(slot, result)| Ok(slot_to_value(*slot, result)))
-        .collect()
+fn value_to_slot(value: &WasmValue) -> u64 {
+    match value {
+        WasmValue::I32(v) => (*v as u32) as u64,
+        WasmValue::I64(v) => *v as u64,
+        WasmValue::F32(v) => v.to_bits() as u64,
+        WasmValue::F64(v) => v.to_bits(),
+        WasmValue::FuncRef(h) => (*h) as u64,
+        // See `slot_to_value`: externref slots reserve 0 for null.
+        WasmValue::ExternRef(h) => (*h) as u64 + 1,
+        WasmValue::NullRef(_) => 0,
+    }
 }

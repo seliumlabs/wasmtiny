@@ -9,14 +9,6 @@ pub struct CompilerConfig {
     pub target: Triple,
 }
 
-impl Default for CompilerConfig {
-    fn default() -> Self {
-        Self {
-            target: Triple::host(),
-        }
-    }
-}
-
 impl CompilerConfig {
     /// Creates a new configuration targeting the current host.
     pub fn host() -> Self {
@@ -31,5 +23,13 @@ impl CompilerConfig {
                 crate::error::CompileError::Isa(format!("invalid target triple: {err}"))
             })?;
         Ok(Self { target: triple })
+    }
+}
+
+impl Default for CompilerConfig {
+    fn default() -> Self {
+        Self {
+            target: Triple::host(),
+        }
     }
 }

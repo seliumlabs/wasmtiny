@@ -12,11 +12,6 @@ pub struct ExecutableCode {
     len: usize,
 }
 
-// SAFETY: the mapping owns its own reserved address range; the pointer is
-// never aliased. Mapped memory is not moved, so it is also `Send`+`Sync`.
-unsafe impl Send for ExecutableCode {}
-unsafe impl Sync for ExecutableCode {}
-
 impl ExecutableCode {
     /// Maps the provided machine-code bytes read-execute.
     pub fn from_bytes(code: &[u8]) -> Result<Self> {
@@ -80,6 +75,12 @@ impl ExecutableCode {
     }
 }
 
+// SAFETY: the mapping owns its own reserved address range; the pointer is
+// never aliased. Mapped memory is not moved, so it is also `Send`+`Sync`.
+unsafe impl Send for ExecutableCode {}
+
+unsafe impl Sync for ExecutableCode {}
+
 impl Drop for ExecutableCode {
     fn drop(&mut self) {
         if !self.base.is_null() && self.len > 0 {
@@ -89,13 +90,6 @@ impl Drop for ExecutableCode {
             }
         }
     }
-}
-
-fn map_error(operation: &str) -> WasmError {
-    WasmError::Load(format!(
-        "{operation} failed: {}",
-        std::io::Error::last_os_error()
-    ))
 }
 
 /// Flushes the instruction cache for newly written code, as required by each
@@ -145,6 +139,13 @@ fn flush_icache(base: *mut u8, len: usize) {
 /// Not-yet-supported architecture for code caching.
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
 fn flush_icache(_base: *mut u8, _len: usize) {}
+
+fn map_error(operation: &str) -> WasmError {
+    WasmError::Load(format!(
+        "{operation} failed: {}",
+        std::io::Error::last_os_error()
+    ))
+}
 
 #[cfg(test)]
 mod tests {

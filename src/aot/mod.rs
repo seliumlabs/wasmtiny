@@ -4,6 +4,11 @@
 //! maps their machine code executable, and (in later stages) executes it.
 //! It mirrors — but never links — the `wasmtiny-aotc` compiler crate.
 
+pub use code::ExecutableCode;
+pub use exec::AotInstance;
+pub use loader::{AotFunction, AotLoader, AotModule};
+pub use store::{AotExtern, AotStore, AotTable};
+
 pub mod code;
 mod context;
 pub mod exec;
@@ -13,8 +18,3 @@ mod reader;
 pub mod store;
 mod traps;
 pub mod verifier;
-
-pub use code::ExecutableCode;
-pub use exec::AotInstance;
-pub use loader::{AotFunction, AotLoader, AotModule};
-pub use store::{AotExtern, AotStore, AotTable};

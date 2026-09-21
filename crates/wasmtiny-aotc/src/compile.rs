@@ -21,6 +21,14 @@ use crate::{
     error::{CompileError, CompileResult},
 };
 
+/// The raw per-function machine-code compilation result.
+type CompiledClif = (
+    Vec<u8>,
+    Vec<(u32, TrapCode)>,
+    Vec<(u32, Reloc, Addend, FinalizedRelocTarget)>,
+    Vec<UserExternalName>,
+);
+
 /// A single finish-linked machine-code blob plus its trap records.
 #[derive(Debug)]
 pub struct FunctionCode {
@@ -63,6 +71,30 @@ pub struct CompiledModule {
 pub enum ArtifactEndianness {
     /// Little-endian.
     Little,
+}
+
+/// A raw, not-yet-linked compilation result for one function.
+struct RawFunction {
+    func_index: u32,
+    buffer: Vec<u8>,
+    traps: Vec<(u32, TrapCode)>,
+    relocs: Vec<(u32, Reloc, Addend, FinalizedRelocTarget)>,
+    /// The function's user external-name table, used to resolve call-target
+    /// relocations back to defined-function ordinals.
+    user_funcs: Vec<UserExternalName>,
+}
+
+/// A compiled entry trampoline, deduplicated by signature type index.
+struct TrampolineUnit {
+    type_idx: u32,
+    buffer: Vec<u8>,
+    traps: Vec<(u32, TrapCode)>,
+}
+
+/// A compiled host-call stub for one function import.
+struct StubUnit {
+    buffer: Vec<u8>,
+    traps: Vec<(u32, TrapCode)>,
 }
 
 /// Creates the target ISA described by `config`.
@@ -118,209 +150,6 @@ pub fn build_isa(config: &CompilerConfig) -> CompileResult<Arc<dyn TargetIsa>> {
         .finish(flags)
         .map_err(|err| CompileError::Isa(err.to_string()))?;
     Ok(isa)
-}
-
-/// Runs validation and translation, producing a [`Translator`] whose
-/// `function_bodies` hold CLIF for every defined function.
-fn translate(
-    wasm: &[u8],
-    config: &CompilerConfig,
-    isa: &dyn TargetIsa,
-) -> CompileResult<Translator> {
-    gate_unsupported_features(wasm)?;
-
-    let mut translator = Translator::new(isa.frontend_config(), isa.default_call_conv());
-    translate_module(wasm, &mut translator).map_err(wasm_error_to_compile)?;
-
-    // Table initialiser expressions (`(table funcref (elem $f))`) are dropped
-    // by `cranelift-wasm`'s table-section parser; recover them here as
-    // synthetic active element segments appended after the module's own
-    // segments so they replay at instantiation without disturbing the
-    // `table.init`/`elem.drop` index space.
-    let inits = collect_table_inits(wasm, translator.info.imported_table_count() as u32)?;
-    for (table_index, elements) in inits {
-        translator.info.elem_segments.push(ElemSegRecord {
-            kind: ElemSegKind::Active {
-                table_index: TableIndex::from_u32(table_index),
-                base: None,
-                offset: 0,
-            },
-            elements,
-        });
-    }
-
-    let _ = config;
-    Ok(translator)
-}
-
-/// Recovers defined-table initialiser expressions from the raw wasm.
-///
-/// Returns `(table_index, elements)` pairs for tables whose initialiser is
-/// `ref.func` (repeated across the table's minimum size). `ref.null`
-/// initialisers are elided: a freshly allocated table already starts null.
-fn collect_table_inits(
-    wasm: &[u8],
-    imported_tables: u32,
-) -> CompileResult<Vec<(u32, Vec<FuncIndex>)>> {
-    let mut inits = Vec::new();
-    for payload in Parser::new(0).parse_all(wasm) {
-        let Payload::TableSection(tables) =
-            payload.map_err(|err| CompileError::Validation(err.to_string()))?
-        else {
-            continue;
-        };
-        for (offset, entry) in tables.into_iter().enumerate() {
-            let table = entry.map_err(|err| CompileError::Validation(err.to_string()))?;
-            let TableInit::Expr(expr) = &table.init else {
-                continue;
-            };
-            let mut reader = expr.get_binary_reader();
-            let opcode = reader
-                .read_u8()
-                .map_err(|err| CompileError::Validation(err.to_string()))?;
-            if opcode == 0xD0 {
-                // `ref.null`: keep the table's natural null initialisation.
-                continue;
-            }
-            if opcode != 0xD2 {
-                return Err(CompileError::Unsupported(format!(
-                    "unsupported table initialiser expression (opcode {opcode:#04x})"
-                )));
-            }
-            let func = reader
-                .read_var_u32()
-                .map_err(|err| CompileError::Validation(err.to_string()))?;
-            let min = table.ty.initial as u32;
-            inits.push((
-                imported_tables + offset as u32,
-                vec![FuncIndex::from_u32(func); min as usize],
-            ));
-        }
-    }
-    Ok(inits)
-}
-
-/// Rejects modules using proposals outside the v1 feature set with an explicit
-/// `Unsupported` error.
-///
-/// The authoritative gate is the curated feature set in
-/// [`wasm_features`](crate::environment::wasm_features); this pre-validation
-/// runs it first so the failure surfaces as a typed unsupported-feature error
-/// rather than an opaque parse error. Structural checks that do not depend on
-/// wasmparser's message wording (multi-memory) run first; feature-gated
-/// rejections are then distinguished from structural errors by wasmparser's
-/// stable messages.
-fn gate_unsupported_features(wasm: &[u8]) -> CompileResult<()> {
-    // Multi-memory: counted structurally rather than matched on wasmparser's
-    // message, which does not contain a stable feature-gate phrasing.
-    let mut memories = 0u32;
-    for payload in Parser::new(0).parse_all(wasm) {
-        match payload.map_err(|err| CompileError::Validation(err.to_string()))? {
-            Payload::MemorySection(section) => {
-                memories = memories.saturating_add(section.count());
-            }
-            Payload::ImportSection(section) => {
-                for import in section {
-                    let import = import.map_err(|err| CompileError::Validation(err.to_string()))?;
-                    if matches!(import.ty, wasmparser::TypeRef::Memory(_)) {
-                        memories = memories.saturating_add(1);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    if memories > 1 {
-        return Err(CompileError::Unsupported(
-            "multiple memories are outside the supported feature set".to_string(),
-        ));
-    }
-
-    let mut validator =
-        wasmparser::Validator::new_with_features(crate::environment::wasm_features());
-    if let Err(err) = validator.validate_all(wasm) {
-        let message = err.to_string();
-        let lower = message.to_ascii_lowercase();
-        if lower.contains("not enabled")
-            || lower.contains("must be enabled")
-            || lower.contains("without the gc feature")
-            || lower.contains("gc feature")
-            || lower.contains("requires the")
-            || lower.contains("multiple memories")
-            || lower.contains("function references")
-        {
-            return Err(CompileError::Unsupported(message));
-        }
-        return Err(CompileError::Validation(message));
-    }
-    Ok(())
-}
-
-/// A raw, not-yet-linked compilation result for one function.
-struct RawFunction {
-    func_index: u32,
-    buffer: Vec<u8>,
-    traps: Vec<(u32, TrapCode)>,
-    relocs: Vec<(u32, Reloc, Addend, FinalizedRelocTarget)>,
-    /// The function's user external-name table, used to resolve call-target
-    /// relocations back to defined-function ordinals.
-    user_funcs: Vec<UserExternalName>,
-}
-
-/// A compiled entry trampoline, deduplicated by signature type index.
-struct TrampolineUnit {
-    type_idx: u32,
-    buffer: Vec<u8>,
-    traps: Vec<(u32, TrapCode)>,
-}
-
-/// A compiled host-call stub for one function import.
-struct StubUnit {
-    buffer: Vec<u8>,
-    traps: Vec<(u32, TrapCode)>,
-}
-
-/// The raw per-function machine-code compilation result.
-type CompiledClif = (
-    Vec<u8>,
-    Vec<(u32, TrapCode)>,
-    Vec<(u32, Reloc, Addend, FinalizedRelocTarget)>,
-    Vec<UserExternalName>,
-);
-
-/// Compiles a CLIF function to machine code, returning its buffer, traps, and
-/// external relocations.
-fn compile_clif(
-    func: &cranelift_codegen::ir::Function,
-    isa: &dyn TargetIsa,
-) -> CompileResult<CompiledClif> {
-    let user_funcs = func
-        .params
-        .user_named_funcs()
-        .iter()
-        .map(|(_, uname)| uname.clone())
-        .collect::<Vec<_>>();
-    let context = cranelift_codegen::Context::for_function(func.clone());
-    let mut context = context;
-    let mut control_plane = cranelift_codegen::control::ControlPlane::default();
-    let code = context
-        .compile(isa, &mut control_plane)
-        .map_err(|err| CompileError::Codegen(format!("{err:?}")))?;
-
-    let buffer = code.code_buffer().to_vec();
-    let traps = code
-        .buffer
-        .traps()
-        .iter()
-        .map(|trap| (trap.offset, trap.code))
-        .collect();
-    let relocs = code
-        .buffer
-        .relocs()
-        .iter()
-        .map(|reloc| (reloc.offset, reloc.kind, reloc.addend, reloc.target.clone()))
-        .collect();
-    Ok((buffer, traps, relocs, user_funcs))
 }
 
 /// Compiles a `.wasm` binary into a finish-linked [`CompiledModule`].
@@ -600,6 +429,149 @@ fn apply_reloc(
     Ok(())
 }
 
+/// Recovers defined-table initialiser expressions from the raw wasm.
+///
+/// Returns `(table_index, elements)` pairs for tables whose initialiser is
+/// `ref.func` (repeated across the table's minimum size). `ref.null`
+/// initialisers are elided: a freshly allocated table already starts null.
+fn collect_table_inits(
+    wasm: &[u8],
+    imported_tables: u32,
+) -> CompileResult<Vec<(u32, Vec<FuncIndex>)>> {
+    let mut inits = Vec::new();
+    for payload in Parser::new(0).parse_all(wasm) {
+        let Payload::TableSection(tables) =
+            payload.map_err(|err| CompileError::Validation(err.to_string()))?
+        else {
+            continue;
+        };
+        for (offset, entry) in tables.into_iter().enumerate() {
+            let table = entry.map_err(|err| CompileError::Validation(err.to_string()))?;
+            let TableInit::Expr(expr) = &table.init else {
+                continue;
+            };
+            let mut reader = expr.get_binary_reader();
+            let opcode = reader
+                .read_u8()
+                .map_err(|err| CompileError::Validation(err.to_string()))?;
+            if opcode == 0xD0 {
+                // `ref.null`: keep the table's natural null initialisation.
+                continue;
+            }
+            if opcode != 0xD2 {
+                return Err(CompileError::Unsupported(format!(
+                    "unsupported table initialiser expression (opcode {opcode:#04x})"
+                )));
+            }
+            let func = reader
+                .read_var_u32()
+                .map_err(|err| CompileError::Validation(err.to_string()))?;
+            let min = table.ty.initial as u32;
+            inits.push((
+                imported_tables + offset as u32,
+                vec![FuncIndex::from_u32(func); min as usize],
+            ));
+        }
+    }
+    Ok(inits)
+}
+
+/// Compiles a CLIF function to machine code, returning its buffer, traps, and
+/// external relocations.
+fn compile_clif(
+    func: &cranelift_codegen::ir::Function,
+    isa: &dyn TargetIsa,
+) -> CompileResult<CompiledClif> {
+    let user_funcs = func
+        .params
+        .user_named_funcs()
+        .iter()
+        .map(|(_, uname)| uname.clone())
+        .collect::<Vec<_>>();
+    let context = cranelift_codegen::Context::for_function(func.clone());
+    let mut context = context;
+    let mut control_plane = cranelift_codegen::control::ControlPlane::default();
+    let code = context
+        .compile(isa, &mut control_plane)
+        .map_err(|err| CompileError::Codegen(format!("{err:?}")))?;
+
+    let buffer = code.code_buffer().to_vec();
+    let traps = code
+        .buffer
+        .traps()
+        .iter()
+        .map(|trap| (trap.offset, trap.code))
+        .collect();
+    let relocs = code
+        .buffer
+        .relocs()
+        .iter()
+        .map(|reloc| (reloc.offset, reloc.kind, reloc.addend, reloc.target.clone()))
+        .collect();
+    Ok((buffer, traps, relocs, user_funcs))
+}
+
+/// Rejects modules using proposals outside the v1 feature set with an explicit
+/// `Unsupported` error.
+///
+/// The authoritative gate is the curated feature set in
+/// [`wasm_features`](crate::environment::wasm_features); this pre-validation
+/// runs it first so the failure surfaces as a typed unsupported-feature error
+/// rather than an opaque parse error. Structural checks that do not depend on
+/// wasmparser's message wording (multi-memory) run first; feature-gated
+/// rejections are then distinguished from structural errors by wasmparser's
+/// stable messages.
+fn gate_unsupported_features(wasm: &[u8]) -> CompileResult<()> {
+    // Multi-memory: counted structurally rather than matched on wasmparser's
+    // message, which does not contain a stable feature-gate phrasing.
+    let mut memories = 0u32;
+    for payload in Parser::new(0).parse_all(wasm) {
+        match payload.map_err(|err| CompileError::Validation(err.to_string()))? {
+            Payload::MemorySection(section) => {
+                memories = memories.saturating_add(section.count());
+            }
+            Payload::ImportSection(section) => {
+                for import in section {
+                    let import = import.map_err(|err| CompileError::Validation(err.to_string()))?;
+                    if matches!(import.ty, wasmparser::TypeRef::Memory(_)) {
+                        memories = memories.saturating_add(1);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if memories > 1 {
+        return Err(CompileError::Unsupported(
+            "multiple memories are outside the supported feature set".to_string(),
+        ));
+    }
+
+    let mut validator =
+        wasmparser::Validator::new_with_features(crate::environment::wasm_features());
+    if let Err(err) = validator.validate_all(wasm) {
+        let message = err.to_string();
+        let lower = message.to_ascii_lowercase();
+        if lower.contains("not enabled")
+            || lower.contains("must be enabled")
+            || lower.contains("without the gc feature")
+            || lower.contains("gc feature")
+            || lower.contains("requires the")
+            || lower.contains("multiple memories")
+            || lower.contains("function references")
+        {
+            return Err(CompileError::Unsupported(message));
+        }
+        return Err(CompileError::Validation(message));
+    }
+    Ok(())
+}
+
+fn patch(buffer: &mut [u8], offset: u32, bytes: &[u8]) {
+    let start = offset as usize;
+    buffer[start..start + bytes.len()].copy_from_slice(bytes);
+}
+
 fn read_u32(buffer: &[u8], offset: u32) -> u32 {
     let start = offset as usize;
     u32::from_le_bytes([
@@ -610,7 +582,35 @@ fn read_u32(buffer: &[u8], offset: u32) -> u32 {
     ])
 }
 
-fn patch(buffer: &mut [u8], offset: u32, bytes: &[u8]) {
-    let start = offset as usize;
-    buffer[start..start + bytes.len()].copy_from_slice(bytes);
+/// Runs validation and translation, producing a [`Translator`] whose
+/// `function_bodies` hold CLIF for every defined function.
+fn translate(
+    wasm: &[u8],
+    config: &CompilerConfig,
+    isa: &dyn TargetIsa,
+) -> CompileResult<Translator> {
+    gate_unsupported_features(wasm)?;
+
+    let mut translator = Translator::new(isa.frontend_config(), isa.default_call_conv());
+    translate_module(wasm, &mut translator).map_err(wasm_error_to_compile)?;
+
+    // Table initialiser expressions (`(table funcref (elem $f))`) are dropped
+    // by `cranelift-wasm`'s table-section parser; recover them here as
+    // synthetic active element segments appended after the module's own
+    // segments so they replay at instantiation without disturbing the
+    // `table.init`/`elem.drop` index space.
+    let inits = collect_table_inits(wasm, translator.info.imported_table_count() as u32)?;
+    for (table_index, elements) in inits {
+        translator.info.elem_segments.push(ElemSegRecord {
+            kind: ElemSegKind::Active {
+                table_index: TableIndex::from_u32(table_index),
+                base: None,
+                offset: 0,
+            },
+            elements,
+        });
+    }
+
+    let _ = config;
+    Ok(translator)
 }

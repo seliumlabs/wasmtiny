@@ -2,16 +2,21 @@
 
 use std::sync::{Arc, Mutex};
 
-use wasmtiny::aot::{AotExtern, AotInstance, AotLoader, AotStore};
-use wasmtiny::runtime::{
-    Global, GlobalType, Limits, Memory, MemoryType, NumType, ValType, WasmValue,
+use wasmtiny::{
+    aot::{AotExtern, AotInstance, AotLoader, AotStore},
+    runtime::{Global, GlobalType, Limits, Memory, MemoryType, NumType, ValType, WasmValue},
 };
 use wasmtiny_aotc::{CompilerConfig, compile_artifact};
 
-fn load(source: &str) -> wasmtiny::aot::AotModule {
-    let wasm = wat::parse_str(source).expect("wat parses");
-    let bytes = compile_artifact(&wasm, &CompilerConfig::host()).expect("compilation succeeds");
-    AotLoader::new().load(&bytes).expect("artifact loads")
+#[test]
+fn defined_immutable_global_is_readable() {
+    let module = load(
+        "(module
+           (global $g i32 (i32.const 7))
+           (func (export \"get\") (result i32) (global.get $g)))",
+    );
+    let mut instance = AotInstance::new(&module).expect("instantiation succeeds");
+    assert_eq!(instance.invoke(0, &[]).unwrap(), vec![WasmValue::I32(7)]);
 }
 
 #[test]
@@ -26,17 +31,6 @@ fn defined_mutable_global_get_and_set() {
     assert_eq!(instance.invoke(0, &[]).unwrap(), vec![WasmValue::I32(42)]);
     instance.invoke(1, &[WasmValue::I32(9)]).unwrap();
     assert_eq!(instance.invoke(0, &[]).unwrap(), vec![WasmValue::I32(9)]);
-}
-
-#[test]
-fn defined_immutable_global_is_readable() {
-    let module = load(
-        "(module
-           (global $g i32 (i32.const 7))
-           (func (export \"get\") (result i32) (global.get $g)))",
-    );
-    let mut instance = AotInstance::new(&module).expect("instantiation succeeds");
-    assert_eq!(instance.invoke(0, &[]).unwrap(), vec![WasmValue::I32(7)]);
 }
 
 #[test]
@@ -90,6 +84,12 @@ fn imported_memory_is_shared_with_host_data() {
     // The memory is genuinely shared: the host can observe the guest write.
     let memory = shared.lock().unwrap();
     assert_eq!(memory.read_i32(0).unwrap(), 123);
+}
+
+fn load(source: &str) -> wasmtiny::aot::AotModule {
+    let wasm = wat::parse_str(source).expect("wat parses");
+    let bytes = compile_artifact(&wasm, &CompilerConfig::host()).expect("compilation succeeds");
+    AotLoader::new().load(&bytes).expect("artifact loads")
 }
 
 #[test]

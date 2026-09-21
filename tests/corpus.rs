@@ -227,6 +227,19 @@ fn clean_module_bytes() -> Vec<u8> {
         .expect("clean smoke module")
 }
 
+/// Compiles a resolved fixture `.wasm` into a `.aot` artifact for the
+/// AOT corpus pass. The runner binary itself never links the compiler —
+/// it only loads the finished artifact.
+#[cfg(feature = "aot")]
+fn compile_aot(wasm: &Path, name: &str) -> Result<PathBuf, String> {
+    let bytes = fs::read(wasm).map_err(|e| format!("read {}: {e}", wasm.display()))?;
+    let artifact = wasmtiny_aotc::compile_artifact(&bytes, &wasmtiny_aotc::CompilerConfig::host())
+        .map_err(|e| format!("AOT compile failed: {e}"))?;
+    let out = build_dir().join(format!("{name}.aot"));
+    fs::write(&out, artifact).map_err(|e| format!("write {}: {e}", out.display()))?;
+    Ok(out)
+}
+
 fn corpus_dir() -> PathBuf {
     std::env::var("WASMTINY_CORPUS_DIR")
         .map(PathBuf::from)
@@ -571,19 +584,6 @@ fn run_corpus(dir: &Path) -> Vec<Failure> {
     }
 
     failures
-}
-
-/// Compiles a resolved fixture `.wasm` into a `.aot` artifact for the
-/// AOT corpus pass. The runner binary itself never links the compiler —
-/// it only loads the finished artifact.
-#[cfg(feature = "aot")]
-fn compile_aot(wasm: &Path, name: &str) -> Result<PathBuf, String> {
-    let bytes = fs::read(wasm).map_err(|e| format!("read {}: {e}", wasm.display()))?;
-    let artifact = wasmtiny_aotc::compile_artifact(&bytes, &wasmtiny_aotc::CompilerConfig::host())
-        .map_err(|e| format!("AOT compile failed: {e}"))?;
-    let out = build_dir().join(format!("{name}.aot"));
-    fs::write(&out, artifact).map_err(|e| format!("write {}: {e}", out.display()))?;
-    Ok(out)
 }
 
 /// Spawns the runner in a new process group, enforces the harness

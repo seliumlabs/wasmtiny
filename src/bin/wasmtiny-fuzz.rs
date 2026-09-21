@@ -15,7 +15,6 @@
 use std::{path::PathBuf, process::exit};
 
 use wasmtiny::security_test::{Prng, fuzz_execute, fuzz_load, fuzz_shared_region, mutate};
-
 #[cfg(feature = "aot")]
 use wasmtiny::security_test::{fuzz_execute_aot, fuzz_load_aot};
 

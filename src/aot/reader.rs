@@ -87,11 +87,11 @@ impl<'a> Reader<'a> {
     }
 }
 
-fn truncated() -> WasmError {
-    load_error("unexpected end of artifact".to_string())
-}
-
 /// A structured load error.
 pub(crate) fn load_error(message: String) -> WasmError {
     WasmError::Load(message)
+}
+
+fn truncated() -> WasmError {
+    load_error("unexpected end of artifact".to_string())
 }

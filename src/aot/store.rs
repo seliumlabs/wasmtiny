@@ -4,9 +4,15 @@
 
 use std::sync::{Arc, Mutex};
 
+use super::context::{FuncDesc, TableCells};
+
 use crate::runtime::{FunctionType, Global, HostFunc, Memory, Result, TableType, WasmError};
 
-use super::context::{FuncDesc, TableCells};
+/// A shared AOT store reference — modules instantiated against the same store
+/// can alias tables and dispatch `call_indirect` across module boundaries.
+pub type SharedAotStore = Arc<Mutex<AotStore>>;
+/// A shared AOT table reference, used to alias a table across modules.
+pub type SharedAotTable = Arc<Mutex<AotTable>>;
 
 /// Implementation reservation cap for tables without a declared maximum
 /// (or with a maximum above this): `table.grow` beyond the reservation fails
@@ -29,14 +35,25 @@ pub struct AotTable {
     pub type_: crate::runtime::TableType,
 }
 
-// SAFETY: the only raw pointer in `AotTable` is `holder.base`, which points
-// at `cells`' own backing buffer for the table's whole lifetime (never
-// reallocated; see `with_initial`). The `Arc<Mutex<AotTable>>` sharing
-// pattern is exactly the designed cross-instance contract: compiled code
-// on any thread reads `holder` (see the `TableCells` concurrency contract),
-// and every mutation path holds the table's mutex.
-unsafe impl Send for AotTable {}
-unsafe impl Sync for AotTable {}
+/// A value an AOT instantiation can bind to an import.
+pub enum AotExtern {
+    /// A host-provided function.
+    HostFunc(Arc<dyn HostFunc>),
+    /// A guest function, referenced by its store-wide native handle.
+    Func(u32),
+    /// A shared AOT table.
+    Table(SharedAotTable),
+    /// A shared linear memory.
+    Memory(Arc<Mutex<Memory>>),
+    /// A global value.
+    Global(Global),
+}
+
+/// The store-wide state shared by all modules instantiated against it.
+pub struct AotStore {
+    store_funcs: Vec<FuncDesc>,
+    type_registry: Vec<FunctionType>,
+}
 
 impl AotTable {
     /// Creates a table with `initial` null entries, reserving storage up to
@@ -72,38 +89,15 @@ impl AotTable {
     }
 }
 
-/// A shared AOT table reference, used to alias a table across modules.
-pub type SharedAotTable = Arc<Mutex<AotTable>>;
+// SAFETY: the only raw pointer in `AotTable` is `holder.base`, which points
+// at `cells`' own backing buffer for the table's whole lifetime (never
+// reallocated; see `with_initial`). The `Arc<Mutex<AotTable>>` sharing
+// pattern is exactly the designed cross-instance contract: compiled code
+// on any thread reads `holder` (see the `TableCells` concurrency contract),
+// and every mutation path holds the table's mutex.
+unsafe impl Send for AotTable {}
 
-/// A value an AOT instantiation can bind to an import.
-pub enum AotExtern {
-    /// A host-provided function.
-    HostFunc(Arc<dyn HostFunc>),
-    /// A guest function, referenced by its store-wide native handle.
-    Func(u32),
-    /// A shared AOT table.
-    Table(SharedAotTable),
-    /// A shared linear memory.
-    Memory(Arc<Mutex<Memory>>),
-    /// A global value.
-    Global(Global),
-}
-
-/// A shared AOT store reference — modules instantiated against the same store
-/// can alias tables and dispatch `call_indirect` across module boundaries.
-pub type SharedAotStore = Arc<Mutex<AotStore>>;
-
-/// The store-wide state shared by all modules instantiated against it.
-pub struct AotStore {
-    store_funcs: Vec<FuncDesc>,
-    type_registry: Vec<FunctionType>,
-}
-
-impl Default for AotStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+unsafe impl Sync for AotTable {}
 
 impl AotStore {
     /// Creates an empty store.
@@ -156,5 +150,11 @@ impl AotStore {
         } else {
             self.store_funcs.as_ptr()
         }
+    }
+}
+
+impl Default for AotStore {
+    fn default() -> Self {
+        Self::new()
     }
 }

@@ -14,19 +14,18 @@
 //! 3. `cranelift-codegen` machine-code generation.
 //! 4. Finish-linking of intra-module calls against the final code image.
 
-pub mod artifact;
-pub mod compile;
-pub mod config;
-pub mod environment;
-pub mod error;
-
-mod trampoline;
-
 pub use artifact::write_artifact;
 pub use compile::CompiledModule;
 pub use compile::compile_module;
 pub use config::CompilerConfig;
 pub use error::{CompileError, CompileResult};
+
+pub mod artifact;
+pub mod compile;
+pub mod config;
+pub mod environment;
+pub mod error;
+mod trampoline;
 
 /// Compiles a WebAssembly binary into a finish-linked module.
 ///

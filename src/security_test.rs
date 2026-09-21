@@ -27,7 +27,6 @@ use crate::{
     RegionProt, WasmApplication, WasmValue, runtime::FunctionType, runtime::HostCaller,
     runtime::HostFunc, runtime::NumType, runtime::ValType,
 };
-
 #[cfg(feature = "aot")]
 use crate::{
     aot::{AotInstance, AotLoader},
@@ -263,14 +262,6 @@ pub fn fuzz_execute(bytes: &[u8]) {
     let _ = app.execute_start(idx);
 }
 
-/// Fuzz target: module loader + validator (TM-07). Any `Ok`/`Err`
-/// outcome is acceptable; a panic, abort, or non-termination is a
-/// finding.
-pub fn fuzz_load(bytes: &[u8]) {
-    let mut app = WasmApplication::new();
-    let _ = app.load_module_from_memory(bytes);
-}
-
 /// Fuzz target: AOT artifact load + native dispatch on mutated artifacts
 /// and adversarial argument values. Traps and errors are acceptable
 /// outcomes; runtime panics are findings.
@@ -307,6 +298,14 @@ pub fn fuzz_execute_aot(bytes: &[u8]) {
     if let Some(idx) = func_index("main") {
         let _ = instance.invoke(idx, &[arg(8)]);
     }
+}
+
+/// Fuzz target: module loader + validator (TM-07). Any `Ok`/`Err`
+/// outcome is acceptable; a panic, abort, or non-termination is a
+/// finding.
+pub fn fuzz_load(bytes: &[u8]) {
+    let mut app = WasmApplication::new();
+    let _ = app.load_module_from_memory(bytes);
 }
 
 /// Fuzz target: AOT artifact loader + verifier. Any `Ok`/`Err` outcome is

@@ -16,23 +16,23 @@
 
 use std::env;
 
-use crate::runtime::{
-    DataKind, DataSegment, ElemKind, ElemSegment, ExportKind, ExportType, FunctionType, GlobalType,
-    Import, ImportKind, Limits, MemoryType, NumType, RefType, Result, TableType, TrapCode, ValType,
-    WasmError,
-};
-
 use super::{
     format,
     reader::{Reader, load_error},
     verifier::verify_integrity,
 };
 
+use crate::runtime::{
+    DataKind, DataSegment, ElemKind, ElemSegment, ExportKind, ExportType, FunctionType, GlobalType,
+    Import, ImportKind, Limits, MemoryType, NumType, RefType, Result, TableType, TrapCode, ValType,
+    WasmError,
+};
+
+/// Upper bound on a single memory's declared capacity in bytes (4 GiB).
+const MAX_MEMORY_BYTES: u64 = 1 << 32;
 /// Upper bound on a declared string field, so crafted artifacts cannot drive
 /// unbounded allocation.
 const MAX_STRING: usize = 1 << 20;
-/// Upper bound on a single memory's declared capacity in bytes (4 GiB).
-const MAX_MEMORY_BYTES: u64 = 1 << 32;
 
 /// A defined function's code and trap records, extracted from the artifact.
 #[derive(Debug, Clone)]
@@ -95,6 +95,16 @@ pub struct AotModule {
     pub code_image: Vec<u8>,
 }
 
+/// Ahead-of-time module loader.
+pub struct AotLoader;
+
+struct Header {
+    format_version: u32,
+    abi_version: u32,
+    target: String,
+    feature_flags: u32,
+}
+
 impl AotModule {
     /// Builds a runtime [`Module`](crate::runtime::Module) from this artifact,
     /// without any wasm parsing. Defined-function bodies are empty: execution
@@ -122,15 +132,6 @@ impl AotModule {
             })
             .collect();
         module
-    }
-}
-
-/// Ahead-of-time module loader.
-pub struct AotLoader;
-
-impl Default for AotLoader {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -219,11 +220,38 @@ impl AotLoader {
     }
 }
 
-struct Header {
-    format_version: u32,
-    abi_version: u32,
-    target: String,
-    feature_flags: u32,
+impl Default for AotLoader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Returns whether the artifact's target triple names the host ISA.
+/// The comparison is prefix-based (ISA component only) — the code executes if
+/// the ISA matches, which is what matters for native dispatch.
+pub(crate) fn target_matches_host(target: &str) -> bool {
+    let isa = target.split('-').next().unwrap_or("");
+    isa == env::consts::ARCH
+}
+
+fn decode_triple(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+/// Encodes a stored element (function index, or the null sentinel) as the
+/// wasm constant-expression bytes the runtime's expression evaluator replays.
+fn elem_init_expr(func_index: u32) -> Vec<u8> {
+    if func_index == u32::MAX {
+        // ref.null func
+        vec![0xD0, 0x70, 0x0B]
+    } else {
+        // ref.func $func_index
+        let mut bytes = vec![0xD2];
+        push_uleb128(&mut bytes, u64::from(func_index));
+        bytes.push(0x0B);
+        bytes
+    }
 }
 
 fn parse_header(reader: &mut Reader<'_>) -> Result<Header> {
@@ -286,11 +314,6 @@ fn parse_header(reader: &mut Reader<'_>) -> Result<Header> {
         target,
         feature_flags,
     })
-}
-
-fn decode_triple(bytes: &[u8]) -> String {
-    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
 /// Parses one section payload into the module.
@@ -514,15 +537,16 @@ fn parse_section(id: u32, payload: &[u8], module: &mut AotModule) -> Result<()> 
     Ok(())
 }
 
-fn valtype_from_byte(byte: u8) -> Result<ValType> {
-    match byte {
-        0x7F => Ok(ValType::Num(NumType::I32)),
-        0x7E => Ok(ValType::Num(NumType::I64)),
-        0x7D => Ok(ValType::Num(NumType::F32)),
-        0x7C => Ok(ValType::Num(NumType::F64)),
-        0x70 => Ok(ValType::Ref(RefType::FuncRef)),
-        0x6F => Ok(ValType::Ref(RefType::ExternRef)),
-        other => Err(load_error(format!("unknown value type {other:#04x}"))),
+fn push_uleb128(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let byte = (value as u8) & 0x7F;
+        value >>= 7;
+        if value != 0 {
+            out.push(byte | 0x80);
+        } else {
+            out.push(byte);
+            break;
+        }
     }
 }
 
@@ -579,32 +603,13 @@ fn read_table_type(reader: &mut Reader<'_>) -> Result<TableType> {
     })
 }
 
-/// Encodes a stored element (function index, or the null sentinel) as the
-/// wasm constant-expression bytes the runtime's expression evaluator replays.
-fn elem_init_expr(func_index: u32) -> Vec<u8> {
-    if func_index == u32::MAX {
-        // ref.null func
-        vec![0xD0, 0x70, 0x0B]
-    } else {
-        // ref.func $func_index
-        let mut bytes = vec![0xD2];
-        push_uleb128(&mut bytes, u64::from(func_index));
-        bytes.push(0x0B);
-        bytes
-    }
-}
-
-fn push_uleb128(out: &mut Vec<u8>, mut value: u64) {
-    loop {
-        let byte = (value as u8) & 0x7F;
-        value >>= 7;
-        if value != 0 {
-            out.push(byte | 0x80);
-        } else {
-            out.push(byte);
-            break;
-        }
-    }
+/// Number of imported tables in the artifact.
+fn table_import_count(module: &AotModule) -> usize {
+    module
+        .imports
+        .iter()
+        .filter(|import| matches!(import.kind, ImportKind::Table(_)))
+        .count()
 }
 
 /// Ensures every declared function's code range lies within the code image.
@@ -703,19 +708,14 @@ fn validate_indices(module: &AotModule) -> Result<()> {
     Ok(())
 }
 
-/// Number of imported tables in the artifact.
-fn table_import_count(module: &AotModule) -> usize {
-    module
-        .imports
-        .iter()
-        .filter(|import| matches!(import.kind, ImportKind::Table(_)))
-        .count()
-}
-
-/// Returns whether the artifact's target triple names the host ISA.
-/// The comparison is prefix-based (ISA component only) — the code executes if
-/// the ISA matches, which is what matters for native dispatch.
-pub(crate) fn target_matches_host(target: &str) -> bool {
-    let isa = target.split('-').next().unwrap_or("");
-    isa == env::consts::ARCH
+fn valtype_from_byte(byte: u8) -> Result<ValType> {
+    match byte {
+        0x7F => Ok(ValType::Num(NumType::I32)),
+        0x7E => Ok(ValType::Num(NumType::I64)),
+        0x7D => Ok(ValType::Num(NumType::F32)),
+        0x7C => Ok(ValType::Num(NumType::F64)),
+        0x70 => Ok(ValType::Ref(RefType::FuncRef)),
+        0x6F => Ok(ValType::Ref(RefType::ExternRef)),
+        other => Err(load_error(format!("unknown value type {other:#04x}"))),
+    }
 }

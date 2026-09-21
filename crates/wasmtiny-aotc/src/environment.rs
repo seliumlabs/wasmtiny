@@ -17,12 +17,12 @@
 //! compiler, so the offsets are deliberately duplicated (and documented) on
 //! the runtime side rather than shared as a type.
 
-use cranelift_codegen::cursor::FuncCursor;
-use cranelift_codegen::ir::immediates::Offset32;
-use cranelift_codegen::ir::{
-    self, AbiParam, InstBuilder, MemFlags, Signature, UserFuncName, Value, types,
+use cranelift_codegen::{
+    cursor::FuncCursor,
+    ir::immediates::Offset32,
+    ir::{self, AbiParam, InstBuilder, MemFlags, Signature, UserFuncName, Value, types},
+    isa::{CallConv, TargetFrontendConfig},
 };
-use cranelift_codegen::isa::{CallConv, TargetFrontendConfig};
 use cranelift_entity::{EntityRef, PrimaryMap, SecondaryMap};
 use cranelift_wasm::{
     ConstExpr, DataIndex, DefinedFuncIndex, ElemIndex, EngineOrModuleTypeIndex, FuncIndex,
@@ -34,6 +34,9 @@ use cranelift_wasm::{
 use wasmparser::{FuncValidator, FunctionBody, UnpackedIndex, ValidatorResources, WasmFeatures};
 
 use crate::error::CompileError;
+
+/// Size in bytes of a single global cell.
+pub const GLOBAL_CELL_SIZE: i32 = 8;
 
 /// Offset of the shared-memory base pointer inside the hidden context.
 ///
@@ -57,66 +60,8 @@ use crate::error::CompileError;
 /// ```
 pub struct VmCtxOffsets;
 
-impl VmCtxOffsets {
-    /// Pointer to the memories array.
-    pub const MEMORIES: i32 = 0;
-    /// Pointer to the tables array.
-    pub const TABLES: i32 = 8;
-    /// Pointer to the globals array.
-    pub const GLOBALS: i32 = 16;
-    /// Pointer to the module-local function-descriptor array.
-    pub const FUNCS: i32 = 24;
-    /// Pointer to the store-wide function-descriptor array.
-    pub const STORE_FUNCS: i32 = 32;
-    /// Pointer to the canonical signature-id array.
-    pub const TYPE_IDS: i32 = 40;
-    /// Pointer to the runtime libcall table.
-    pub const LIBCALLS: i32 = 48;
-    /// Stack limit (a `usize`).
-    pub const STACK_LIMIT: i32 = 56;
-    /// Opaque per-instance dispatch state (runtime-owned).
-    pub const DISPATCH: i32 = 64;
-    /// Pointer to the store-native funcref-handle array (u32 per func index).
-    pub const REFS: i32 = 72;
-}
-
 /// Slots in the runtime libcall table (all plain `extern "C"` fn pointers).
 pub struct LibCallOffsets;
-
-impl LibCallOffsets {
-    /// Called by import stubs: `(vmctx, ordinal, args: *mut u64, results: *mut u64) -> status u64`.
-    pub const HOST_CALL: i32 = 0;
-    /// `memory.atomic.notify`: `(vmctx, mem_idx, addr, count) -> packed u64`.
-    pub const ATOMIC_NOTIFY: i32 = 8;
-    /// `memory.atomic.wait32`: `(vmctx, mem_idx, addr, expected, timeout) -> packed u64`.
-    pub const ATOMIC_WAIT32: i32 = 16;
-    /// `memory.atomic.wait64`: `(vmctx, mem_idx, addr, expected, timeout) -> packed u64`.
-    pub const ATOMIC_WAIT64: i32 = 24;
-    /// `memory.size`: `(vmctx, mem_idx) -> pages`.
-    pub const MEMORY_SIZE: i32 = 32;
-    /// `memory.grow`: `(vmctx, mem_idx, delta) -> old pages | -1`.
-    pub const MEMORY_GROW: i32 = 40;
-    /// `memory.copy`: `(vmctx, dst, src, dst_addr, src_addr, len) -> status`.
-    pub const MEMORY_COPY: i32 = 48;
-    /// `memory.fill`: `(vmctx, mem_idx, dst, val, len) -> status`.
-    pub const MEMORY_FILL: i32 = 56;
-    /// `memory.init`: `(vmctx, mem_idx, seg_idx, dst, src, len) -> status`.
-    pub const MEMORY_INIT: i32 = 64;
-    /// `data.drop`: `(vmctx, seg_idx) -> status`.
-    pub const DATA_DROP: i32 = 72;
-    /// `table.size`: `(vmctx, table_idx) -> elem count`.
-    pub const TABLE_SIZE: i32 = 80;
-    /// `table.grow`: `(vmctx, table_idx, delta, init) -> old len | -1`.
-    pub const TABLE_GROW: i32 = 88;
-    /// `table.copy`: `(vmctx, dst, src, dst_idx, src_idx, len) -> status`.
-    pub const TABLE_COPY: i32 = 96;
-    /// `table.fill`: `(vmctx, table_idx, dst, val, len) -> status`.
-    pub const TABLE_FILL: i32 = 104;
-    /// `table.init`: `(vmctx, seg_idx, table_idx, dst, src, len) -> status`.
-    pub const TABLE_INIT: i32 = 112;
-    /// `elem.drop`: `(vmctx, seg_idx) -> status`.
-    pub const ELEM_DROP: i32 = 120;
-}
 
 /// Layout of a single function descriptor (`FuncDesc`, size 24 bytes), a
 /// "fat call target" carrying the callee's own vmctx so cross-module and
@@ -129,17 +74,6 @@ impl LibCallOffsets {
 /// ```
 pub struct FuncDescOffsets;
 
-impl FuncDescOffsets {
-    /// Byte size of one function descriptor.
-    pub const SIZE: i32 = 24;
-    /// Native entry pointer.
-    pub const ENTRY: i32 = 0;
-    /// Callee context pointer.
-    pub const VMCTX: i32 = 8;
-    /// Canonical signature id (u32).
-    pub const TYPE_ID: i32 = 16;
-}
-
 /// Layout of a single memory descriptor (size 24 bytes).
 ///
 /// ```text
@@ -149,28 +83,12 @@ impl FuncDescOffsets {
 /// ```
 pub struct MemoryDescOffsets;
 
-impl MemoryDescOffsets {
-    /// Byte size of one memory descriptor.
-    pub const SIZE: i32 = 24;
-    /// Start of the memory's data.
-    pub const BASE: i32 = 0;
-    /// Current accessible length in bytes.
-    pub const LEN: i32 = 8;
-    /// Reserved capacity in bytes.
-    pub const CAPACITY: i32 = 16;
-}
-
 /// Layout of one slot in the vmctx `tables` array (size 8 bytes): a pointer
 /// to the shared [`TableCells`](crate::environment) holder for that table
 /// index. All instances that can reach a table (defined or imported) share a
 /// single holder, so a `table.grow` performed by any instance is observed by
 /// every compiled caller.
 pub struct TableSlotOffsets;
-
-impl TableSlotOffsets {
-    /// Byte size of one slot.
-    pub const SIZE: i32 = 8;
-}
 
 /// Layout of a shared table-cells holder (`TableCells`, size 16 bytes).
 ///
@@ -183,58 +101,6 @@ impl TableSlotOffsets {
 /// creation and never reallocated; only `len` mutates. Loads of `len` must
 /// not be marked readonly: `table.grow` can change it mid-function.
 pub struct TableCellsOffsets;
-
-impl TableCellsOffsets {
-    /// Start of the element array.
-    pub const BASE: i32 = 0;
-    /// Current element count (u32).
-    pub const LEN: i32 = 8;
-}
-
-/// Size in bytes of a single global cell.
-pub const GLOBAL_CELL_SIZE: i32 = 8;
-
-fn wasm_type_to_clif(ty: &WasmValType) -> ir::Type {
-    match ty {
-        WasmValType::I32 => types::I32,
-        WasmValType::I64 => types::I64,
-        WasmValType::F32 => types::F32,
-        WasmValType::F64 => types::F64,
-        WasmValType::V128 => types::I8X16,
-        // Reference values are represented as raw `u32` handles in wasmtiny.
-        WasmValType::Ref(_) => types::I32,
-    }
-}
-
-/// The WebAssembly features enabled for this compiler.
-///
-/// This is the v1 feature gate: core spec plus bulk memory, reference types,
-/// multi-value, sign extension, saturating float-to-int, mutable globals,
-/// floats, and threads. SIMD, relaxed SIMD, GC, exception handling, tail
-/// calls, extended-const, multi-memory, memory64, **typed function
-/// references** and the component model are disabled, so modules using them
-/// are rejected by validation with an explicit unsupported-feature error.
-///
-/// `function_references` is deliberately disabled: it matches the
-/// interpreter's coverage (whose parser accepts only the shorthand
-/// `funcref`/`externref` reference types) and keeps typed references out of
-/// the artifact's type section — typed and untyped funcref signatures would
-/// otherwise serialise identically and `call_indirect`'s dynamic signature
-/// check could not tell them apart. `extended_const` remains disabled
-/// because the pinned `cranelift-wasm` cannot lower those const-expr
-/// operators.
-pub fn wasm_features() -> WasmFeatures {
-    let mut features = WasmFeatures::empty();
-    features.set(WasmFeatures::MUTABLE_GLOBAL, true);
-    features.set(WasmFeatures::SATURATING_FLOAT_TO_INT, true);
-    features.set(WasmFeatures::SIGN_EXTENSION, true);
-    features.set(WasmFeatures::REFERENCE_TYPES, true);
-    features.set(WasmFeatures::MULTI_VALUE, true);
-    features.set(WasmFeatures::BULK_MEMORY, true);
-    features.set(WasmFeatures::THREADS, true);
-    features.set(WasmFeatures::FLOATS, true);
-    features
-}
 
 /// A function import declaration.
 pub struct FuncImport {
@@ -274,6 +140,54 @@ pub struct GlobalImport {
     pub field: String,
     /// Global type.
     pub global: Global,
+}
+
+/// Placement mode for a data segment.
+pub enum DataSegKind {
+    /// Active segment initialising `memory_index` at instantiation.
+    Active {
+        /// Target memory index.
+        memory_index: MemoryIndex,
+        /// Offset base global, if any.
+        base: Option<GlobalIndex>,
+        /// Constant offset.
+        offset: u64,
+    },
+    /// Passive segment (for `memory.init`).
+    Passive,
+}
+
+/// A data segment, in its position within the unified segment index space.
+pub struct DataSegRecord {
+    /// Placement mode.
+    pub kind: DataSegKind,
+    /// Segment bytes.
+    pub data: Vec<u8>,
+}
+
+/// Placement mode for an element segment.
+pub enum ElemSegKind {
+    /// Active segment initialising `table_index` at instantiation.
+    Active {
+        /// Target table index.
+        table_index: TableIndex,
+        /// Offset base global, if any.
+        base: Option<GlobalIndex>,
+        /// Constant offset.
+        offset: u32,
+    },
+    /// Passive segment (for `table.init`).
+    Passive,
+    /// Declarative segment (validation-only).
+    Declarative,
+}
+
+/// An element segment, in its position within the unified segment index space.
+pub struct ElemSegRecord {
+    /// Placement mode.
+    pub kind: ElemSegKind,
+    /// Function indices (or `reserved` for null) stored in the segment.
+    pub elements: Vec<FuncIndex>,
 }
 
 /// The module-level state gathered during translation.
@@ -322,52 +236,113 @@ pub struct ModuleInfo {
     pub elem_segments: Vec<ElemSegRecord>,
 }
 
-/// A data segment, in its position within the unified segment index space.
-pub struct DataSegRecord {
-    /// Placement mode.
-    pub kind: DataSegKind,
-    /// Segment bytes.
-    pub data: Vec<u8>,
+/// The compiler-side `ModuleEnvironment`, driving module-level translation and
+/// accumulating everything needed to emit an artifact.
+pub struct Translator {
+    /// Module information gathered from declarations.
+    pub info: ModuleInfo,
+    /// Function body translator.
+    pub trans: FuncTranslator,
 }
 
-/// Placement mode for a data segment.
-pub enum DataSegKind {
-    /// Active segment initialising `memory_index` at instantiation.
-    Active {
-        /// Target memory index.
-        memory_index: MemoryIndex,
-        /// Offset base global, if any.
-        base: Option<GlobalIndex>,
-        /// Constant offset.
-        offset: u64,
-    },
-    /// Passive segment (for `memory.init`).
-    Passive,
+/// Per-function translation environment, borrowing immutable module info while
+/// accumulating function-local state (heaps, tables maps).
+pub struct FuncEnv<'info> {
+    mod_info: &'info ModuleInfo,
+    heaps: PrimaryMap<Heap, HeapData>,
+    tables: SecondaryMap<TableIndex, Option<TableData>>,
 }
 
-/// An element segment, in its position within the unified segment index space.
-pub struct ElemSegRecord {
-    /// Placement mode.
-    pub kind: ElemSegKind,
-    /// Function indices (or `reserved` for null) stored in the segment.
-    pub elements: Vec<FuncIndex>,
+impl VmCtxOffsets {
+    /// Pointer to the memories array.
+    pub const MEMORIES: i32 = 0;
+    /// Pointer to the tables array.
+    pub const TABLES: i32 = 8;
+    /// Pointer to the globals array.
+    pub const GLOBALS: i32 = 16;
+    /// Pointer to the module-local function-descriptor array.
+    pub const FUNCS: i32 = 24;
+    /// Pointer to the store-wide function-descriptor array.
+    pub const STORE_FUNCS: i32 = 32;
+    /// Pointer to the canonical signature-id array.
+    pub const TYPE_IDS: i32 = 40;
+    /// Pointer to the runtime libcall table.
+    pub const LIBCALLS: i32 = 48;
+    /// Stack limit (a `usize`).
+    pub const STACK_LIMIT: i32 = 56;
+    /// Opaque per-instance dispatch state (runtime-owned).
+    pub const DISPATCH: i32 = 64;
+    /// Pointer to the store-native funcref-handle array (u32 per func index).
+    pub const REFS: i32 = 72;
 }
 
-/// Placement mode for an element segment.
-pub enum ElemSegKind {
-    /// Active segment initialising `table_index` at instantiation.
-    Active {
-        /// Target table index.
-        table_index: TableIndex,
-        /// Offset base global, if any.
-        base: Option<GlobalIndex>,
-        /// Constant offset.
-        offset: u32,
-    },
-    /// Passive segment (for `table.init`).
-    Passive,
-    /// Declarative segment (validation-only).
-    Declarative,
+impl LibCallOffsets {
+    /// Called by import stubs: `(vmctx, ordinal, args: *mut u64, results: *mut u64) -> status u64`.
+    pub const HOST_CALL: i32 = 0;
+    /// `memory.atomic.notify`: `(vmctx, mem_idx, addr, count) -> packed u64`.
+    pub const ATOMIC_NOTIFY: i32 = 8;
+    /// `memory.atomic.wait32`: `(vmctx, mem_idx, addr, expected, timeout) -> packed u64`.
+    pub const ATOMIC_WAIT32: i32 = 16;
+    /// `memory.atomic.wait64`: `(vmctx, mem_idx, addr, expected, timeout) -> packed u64`.
+    pub const ATOMIC_WAIT64: i32 = 24;
+    /// `memory.size`: `(vmctx, mem_idx) -> pages`.
+    pub const MEMORY_SIZE: i32 = 32;
+    /// `memory.grow`: `(vmctx, mem_idx, delta) -> old pages | -1`.
+    pub const MEMORY_GROW: i32 = 40;
+    /// `memory.copy`: `(vmctx, dst, src, dst_addr, src_addr, len) -> status`.
+    pub const MEMORY_COPY: i32 = 48;
+    /// `memory.fill`: `(vmctx, mem_idx, dst, val, len) -> status`.
+    pub const MEMORY_FILL: i32 = 56;
+    /// `memory.init`: `(vmctx, mem_idx, seg_idx, dst, src, len) -> status`.
+    pub const MEMORY_INIT: i32 = 64;
+    /// `data.drop`: `(vmctx, seg_idx) -> status`.
+    pub const DATA_DROP: i32 = 72;
+    /// `table.size`: `(vmctx, table_idx) -> elem count`.
+    pub const TABLE_SIZE: i32 = 80;
+    /// `table.grow`: `(vmctx, table_idx, delta, init) -> old len | -1`.
+    pub const TABLE_GROW: i32 = 88;
+    /// `table.copy`: `(vmctx, dst, src, dst_idx, src_idx, len) -> status`.
+    pub const TABLE_COPY: i32 = 96;
+    /// `table.fill`: `(vmctx, table_idx, dst, val, len) -> status`.
+    pub const TABLE_FILL: i32 = 104;
+    /// `table.init`: `(vmctx, seg_idx, table_idx, dst, src, len) -> status`.
+    pub const TABLE_INIT: i32 = 112;
+    /// `elem.drop`: `(vmctx, seg_idx) -> status`.
+    pub const ELEM_DROP: i32 = 120;
+}
+
+impl FuncDescOffsets {
+    /// Byte size of one function descriptor.
+    pub const SIZE: i32 = 24;
+    /// Native entry pointer.
+    pub const ENTRY: i32 = 0;
+    /// Callee context pointer.
+    pub const VMCTX: i32 = 8;
+    /// Canonical signature id (u32).
+    pub const TYPE_ID: i32 = 16;
+}
+
+impl MemoryDescOffsets {
+    /// Byte size of one memory descriptor.
+    pub const SIZE: i32 = 24;
+    /// Start of the memory's data.
+    pub const BASE: i32 = 0;
+    /// Current accessible length in bytes.
+    pub const LEN: i32 = 8;
+    /// Reserved capacity in bytes.
+    pub const CAPACITY: i32 = 16;
+}
+
+impl TableSlotOffsets {
+    /// Byte size of one slot.
+    pub const SIZE: i32 = 8;
+}
+
+impl TableCellsOffsets {
+    /// Start of the element array.
+    pub const BASE: i32 = 0;
+    /// Current element count (u32).
+    pub const LEN: i32 = 8;
 }
 
 impl ModuleInfo {
@@ -416,15 +391,6 @@ impl ModuleInfo {
     pub fn imported_global_count(&self) -> usize {
         self.imported_globals.len()
     }
-}
-
-/// The compiler-side `ModuleEnvironment`, driving module-level translation and
-/// accumulating everything needed to emit an artifact.
-pub struct Translator {
-    /// Module information gathered from declarations.
-    pub info: ModuleInfo,
-    /// Function body translator.
-    pub trans: FuncTranslator,
 }
 
 impl Translator {
@@ -708,14 +674,6 @@ impl<'data> ModuleEnvironment<'data> for Translator {
     fn wasm_features(&self) -> WasmFeatures {
         wasm_features()
     }
-}
-
-/// Per-function translation environment, borrowing immutable module info while
-/// accumulating function-local state (heaps, tables maps).
-pub struct FuncEnv<'info> {
-    mod_info: &'info ModuleInfo,
-    heaps: PrimaryMap<Heap, HeapData>,
-    tables: SecondaryMap<TableIndex, Option<TableData>>,
 }
 
 impl<'info> FuncEnv<'info> {
@@ -1660,10 +1618,42 @@ impl cranelift_wasm::FuncEnvironment for FuncEnv<'_> {
     }
 }
 
-fn unsupported_runtime_op(name: &str) -> WasmError {
-    WasmError::Unsupported(format!(
-        "{name} lowering is not yet implemented in the AOT compiler"
-    ))
+/// Convert a cranelift-wasm translation failure into a compiler error.
+pub fn wasm_error_to_compile(err: WasmError) -> CompileError {
+    match err {
+        WasmError::Unsupported(msg) => CompileError::Unsupported(msg),
+        other => CompileError::Translate(other.to_string()),
+    }
+}
+
+/// The WebAssembly features enabled for this compiler.
+///
+/// This is the v1 feature gate: core spec plus bulk memory, reference types,
+/// multi-value, sign extension, saturating float-to-int, mutable globals,
+/// floats, and threads. SIMD, relaxed SIMD, GC, exception handling, tail
+/// calls, extended-const, multi-memory, memory64, **typed function
+/// references** and the component model are disabled, so modules using them
+/// are rejected by validation with an explicit unsupported-feature error.
+///
+/// `function_references` is deliberately disabled: it matches the
+/// interpreter's coverage (whose parser accepts only the shorthand
+/// `funcref`/`externref` reference types) and keeps typed references out of
+/// the artifact's type section — typed and untyped funcref signatures would
+/// otherwise serialise identically and `call_indirect`'s dynamic signature
+/// check could not tell them apart. `extended_const` remains disabled
+/// because the pinned `cranelift-wasm` cannot lower those const-expr
+/// operators.
+pub fn wasm_features() -> WasmFeatures {
+    let mut features = WasmFeatures::empty();
+    features.set(WasmFeatures::MUTABLE_GLOBAL, true);
+    features.set(WasmFeatures::SATURATING_FLOAT_TO_INT, true);
+    features.set(WasmFeatures::SIGN_EXTENSION, true);
+    features.set(WasmFeatures::REFERENCE_TYPES, true);
+    features.set(WasmFeatures::MULTI_VALUE, true);
+    features.set(WasmFeatures::BULK_MEMORY, true);
+    features.set(WasmFeatures::THREADS, true);
+    features.set(WasmFeatures::FLOATS, true);
+    features
 }
 
 /// Loads a runtime libcall `(vmctx: ptr, ...u64) -> u64` from the context's
@@ -1723,19 +1713,29 @@ fn unpack_plain_result(pos: &mut FuncCursor, raw: Value) -> Value {
     pos.ins().ireduce(types::I32, raw)
 }
 
+fn unsupported_runtime_op(name: &str) -> WasmError {
+    WasmError::Unsupported(format!(
+        "{name} lowering is not yet implemented in the AOT compiler"
+    ))
+}
+
+fn wasm_type_to_clif(ty: &WasmValType) -> ir::Type {
+    match ty {
+        WasmValType::I32 => types::I32,
+        WasmValType::I64 => types::I64,
+        WasmValType::F32 => types::F32,
+        WasmValType::F64 => types::F64,
+        WasmValType::V128 => types::I8X16,
+        // Reference values are represented as raw `u32` handles in wasmtiny.
+        WasmValType::Ref(_) => types::I32,
+    }
+}
+
 /// Widens an `i32` operand to the pointer width for a libcall argument.
 fn widen_u32(pos: &mut FuncCursor, value: Value, pointer_type: ir::Type) -> Value {
     if pos.func.dfg.value_type(value) == types::I32 {
         pos.ins().uextend(pointer_type, value)
     } else {
         value
-    }
-}
-
-/// Convert a cranelift-wasm translation failure into a compiler error.
-pub fn wasm_error_to_compile(err: WasmError) -> CompileError {
-    match err {
-        WasmError::Unsupported(msg) => CompileError::Unsupported(msg),
-        other => CompileError::Translate(other.to_string()),
     }
 }

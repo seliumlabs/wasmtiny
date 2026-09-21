@@ -62,13 +62,6 @@ pub struct FuncDesc {
     pub _pad: u32,
 }
 
-// SAFETY: `FuncDesc` stores raw pointers into instance-owned code/images that
-// live for the store's lifetime and are never mutated after the store exists;
-// they are only dereferenced by compiled code during a call on the invoking
-// thread.
-unsafe impl Send for FuncDesc {}
-unsafe impl Sync for FuncDesc {}
-
 /// The hidden per-instance context. Pointer-sized fields for 64-bit targets.
 #[repr(C)]
 pub struct VmCtx {
@@ -95,6 +88,14 @@ pub struct VmCtx {
     /// Array of store-native funcref handles (u32 per function index).
     pub refs: *const u32,
 }
+
+// SAFETY: `FuncDesc` stores raw pointers into instance-owned code/images that
+// live for the store's lifetime and are never mutated after the store exists;
+// they are only dereferenced by compiled code during a call on the invoking
+// thread.
+unsafe impl Send for FuncDesc {}
+
+unsafe impl Sync for FuncDesc {}
 
 impl VmCtx {
     /// A context whose every region is empty/null — safe as long as no field

@@ -4,83 +4,13 @@
 
 use std::sync::{Arc, OnceLock};
 
-use wasmtiny::aot::AotLoader;
-use wasmtiny::runtime::{
-    FunctionType, HostCaller, HostFunc, Result, TrapCode, ValType, WasmError, WasmValue,
+use wasmtiny::{
+    aot::AotLoader,
+    runtime::{
+        FunctionType, HostCaller, HostFunc, Result, TrapCode, ValType, WasmError, WasmValue,
+    },
 };
 use wasmtiny_aotc::{CompilerConfig, compile_artifact};
-
-fn instantiate(source: &str) -> wasmtiny::aot::AotInstance {
-    let wasm = wat::parse_str(source).expect("wat parses");
-    let bytes = compile_artifact(&wasm, &CompilerConfig::host()).expect("compilation succeeds");
-    let module = AotLoader::new().load(&bytes).expect("artifact loads");
-    wasmtiny::aot::AotInstance::new(&module).expect("instantiation succeeds")
-}
-
-fn trap(source: &str, func_idx: u32, args: &[WasmValue]) -> TrapCode {
-    let mut instance = instantiate(source);
-    match instance.invoke(func_idx, args) {
-        Err(WasmError::Trap(code)) => code,
-        Err(other) => panic!("expected a trap, got error {other}"),
-        Ok(values) => panic!("expected a trap, got {values:?}"),
-    }
-}
-
-#[test]
-fn unreachable_traps() {
-    let code = trap("(module (func (export \"trap\") (unreachable)))", 0, &[]);
-    assert_eq!(code, TrapCode::Unreachable);
-}
-
-#[test]
-fn out_of_bounds_read_traps() {
-    let code = trap(
-        "(module
-           (memory 1)
-           (func (export \"load\") (param i32) (result i32)
-             (i32.load (local.get 0))))",
-        0,
-        &[WasmValue::I32(100_000)],
-    );
-    assert_eq!(code, TrapCode::MemoryOutOfBounds);
-}
-
-#[test]
-fn out_of_bounds_write_traps() {
-    let code = trap(
-        "(module
-           (memory 1)
-           (func (export \"store\") (param i32)
-             (i32.store (local.get 0) (i32.const 7))))",
-        0,
-        &[WasmValue::I32(100_000)],
-    );
-    assert_eq!(code, TrapCode::MemoryOutOfBounds);
-}
-
-#[test]
-fn stack_overflow_traps_without_crashing() {
-    let code = trap("(module (func $f (export \"recurse\") (call $f)))", 0, &[]);
-    assert_eq!(code, TrapCode::StackOverflow);
-}
-
-#[test]
-fn in_bounds_memory_access_still_works_after_trap() {
-    // The recovery boundary must leave the instance healthy: after a trap,
-    // a second invocation succeeds.
-    let mut instance = instantiate(
-        "(module
-           (memory 1)
-           (func (export \"load\") (param i32) (result i32)
-             (i32.load (local.get 0))))",
-    );
-    assert!(matches!(
-        instance.invoke(0, &[WasmValue::I32(100_000)]),
-        Err(WasmError::Trap(TrapCode::MemoryOutOfBounds))
-    ));
-    let results = instance.invoke(0, &[WasmValue::I32(0)]).expect("recovers");
-    assert_eq!(results, vec![WasmValue::I32(0)]);
-}
 
 struct FailingHost;
 
@@ -97,34 +27,6 @@ impl HostFunc for FailingHost {
                 vec![ValType::Num(wasmtiny::runtime::NumType::I32)],
             )
         }))
-    }
-}
-
-#[test]
-fn host_error_propagates_as_a_trap() {
-    let wasm = wat::parse_str(
-        "(module
-           (import \"env\" \"f\" (func $f (result i32)))
-           (func (export \"main\") (result i32) (call $f)))",
-    )
-    .unwrap();
-    let bytes = compile_artifact(&wasm, &CompilerConfig::host()).unwrap();
-    let module = AotLoader::new().load(&bytes).unwrap();
-    let imports = [(
-        "env".to_string(),
-        "f".to_string(),
-        wasmtiny::aot::AotExtern::HostFunc(Arc::new(FailingHost)),
-    )];
-    let mut instance = wasmtiny::aot::AotInstance::instantiate(
-        &wasmtiny::aot::AotStore::shared(),
-        &module,
-        &imports,
-    )
-    .unwrap();
-
-    match instance.invoke(1, &[]) {
-        Err(WasmError::Trap(TrapCode::HostTrap)) => {}
-        other => panic!("expected HostTrap, got {other:?}"),
     }
 }
 
@@ -157,6 +59,85 @@ fn call_indirect_type_mismatch_traps() {
         &[WasmValue::I32(3)],
     );
     assert_eq!(code, TrapCode::IndirectCallTypeMismatch);
+}
+
+#[test]
+fn host_error_propagates_as_a_trap() {
+    let wasm = wat::parse_str(
+        "(module
+           (import \"env\" \"f\" (func $f (result i32)))
+           (func (export \"main\") (result i32) (call $f)))",
+    )
+    .unwrap();
+    let bytes = compile_artifact(&wasm, &CompilerConfig::host()).unwrap();
+    let module = AotLoader::new().load(&bytes).unwrap();
+    let imports = [(
+        "env".to_string(),
+        "f".to_string(),
+        wasmtiny::aot::AotExtern::HostFunc(Arc::new(FailingHost)),
+    )];
+    let mut instance = wasmtiny::aot::AotInstance::instantiate(
+        &wasmtiny::aot::AotStore::shared(),
+        &module,
+        &imports,
+    )
+    .unwrap();
+
+    match instance.invoke(1, &[]) {
+        Err(WasmError::Trap(TrapCode::HostTrap)) => {}
+        other => panic!("expected HostTrap, got {other:?}"),
+    }
+}
+
+#[test]
+fn in_bounds_memory_access_still_works_after_trap() {
+    // The recovery boundary must leave the instance healthy: after a trap,
+    // a second invocation succeeds.
+    let mut instance = instantiate(
+        "(module
+           (memory 1)
+           (func (export \"load\") (param i32) (result i32)
+             (i32.load (local.get 0))))",
+    );
+    assert!(matches!(
+        instance.invoke(0, &[WasmValue::I32(100_000)]),
+        Err(WasmError::Trap(TrapCode::MemoryOutOfBounds))
+    ));
+    let results = instance.invoke(0, &[WasmValue::I32(0)]).expect("recovers");
+    assert_eq!(results, vec![WasmValue::I32(0)]);
+}
+
+fn instantiate(source: &str) -> wasmtiny::aot::AotInstance {
+    let wasm = wat::parse_str(source).expect("wat parses");
+    let bytes = compile_artifact(&wasm, &CompilerConfig::host()).expect("compilation succeeds");
+    let module = AotLoader::new().load(&bytes).expect("artifact loads");
+    wasmtiny::aot::AotInstance::new(&module).expect("instantiation succeeds")
+}
+
+#[test]
+fn out_of_bounds_read_traps() {
+    let code = trap(
+        "(module
+           (memory 1)
+           (func (export \"load\") (param i32) (result i32)
+             (i32.load (local.get 0))))",
+        0,
+        &[WasmValue::I32(100_000)],
+    );
+    assert_eq!(code, TrapCode::MemoryOutOfBounds);
+}
+
+#[test]
+fn out_of_bounds_write_traps() {
+    let code = trap(
+        "(module
+           (memory 1)
+           (func (export \"store\") (param i32)
+             (i32.store (local.get 0) (i32.const 7))))",
+        0,
+        &[WasmValue::I32(100_000)],
+    );
+    assert_eq!(code, TrapCode::MemoryOutOfBounds);
 }
 
 /// Regression: trap containment must hold on a thread that never
@@ -200,4 +181,25 @@ fn stack_overflow_traps_on_a_secondary_thread() {
         Some(WasmError::Trap(TrapCode::StackOverflow)) => {}
         other => panic!("expected StackOverflow on the secondary thread, got {other:?}"),
     }
+}
+
+#[test]
+fn stack_overflow_traps_without_crashing() {
+    let code = trap("(module (func $f (export \"recurse\") (call $f)))", 0, &[]);
+    assert_eq!(code, TrapCode::StackOverflow);
+}
+
+fn trap(source: &str, func_idx: u32, args: &[WasmValue]) -> TrapCode {
+    let mut instance = instantiate(source);
+    match instance.invoke(func_idx, args) {
+        Err(WasmError::Trap(code)) => code,
+        Err(other) => panic!("expected a trap, got error {other}"),
+        Ok(values) => panic!("expected a trap, got {values:?}"),
+    }
+}
+
+#[test]
+fn unreachable_traps() {
+    let code = trap("(module (func (export \"trap\") (unreachable)))", 0, &[]);
+    assert_eq!(code, TrapCode::Unreachable);
 }

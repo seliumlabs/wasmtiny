@@ -1,8 +1,8 @@
 //! Integrity verification: scheme dispatch for the mandatory integrity section.
 
-use crate::runtime::{Result, WasmError};
-
 use super::format::{INTEGRITY_SHA512, SHA512_LEN};
+
+use crate::runtime::{Result, WasmError};
 
 /// Verifies an integrity-section payload against the bytes it covers.
 ///

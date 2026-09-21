@@ -2,9 +2,10 @@
 //! registry and a per-call `sigsetjmp`/`siglongjmp` recovery boundary.
 //!
 //! Compiled webassembly lowers traps to `ud2`/`udf` (and guard-page faults to
-//! SIGSEGV/SIGBUS). The handler installed here maps the faulting PC to a typed
-//! [`TrapCode`] through a lock-free registry keyed on code-image ranges, then
-//! returns control to the faulting thread's `invoke_function` call.
+//! SIGSEGV/SIGBUS; x86 signed-division overflow to SIGFPE). The handler
+//! installed here maps the faulting PC to a typed [`TrapCode`] through a
+//! lock-free registry keyed on code-image ranges, then returns control to the
+//! faulting thread's `invoke_function` call.
 
 use std::{
     cell::{Cell, RefCell},
@@ -20,10 +21,11 @@ use crate::runtime::{Result, TrapCode, WasmError};
 type SigJmpBuf = [u64; 64];
 
 static HEAD: AtomicPtr<RegistryNode> = AtomicPtr::new(std::ptr::null_mut());
-static PREVIOUS_HANDLERS: OnceLock<[Option<PreviousHandler>; 3]> = OnceLock::new();
+static PREVIOUS_HANDLERS: OnceLock<[Option<PreviousHandler>; 4]> = OnceLock::new();
 /// The signals the trap machinery owns, in the order used by the saved
-/// previous-handler table.
-const SIGNALS: [libc::c_int; 3] = [libc::SIGILL, libc::SIGSEGV, libc::SIGBUS];
+/// previous-handler table. `SIGFPE` covers x86 `idiv` overflow (`INT_MIN / -1`),
+/// which Cranelift lowers to a hardware `#DE` rather than an explicit trap.
+const SIGNALS: [libc::c_int; 4] = [libc::SIGILL, libc::SIGSEGV, libc::SIGBUS, libc::SIGFPE];
 
 /// A single catch frame on the thread-local recovery stack.
 struct CatchFrame {
@@ -412,7 +414,7 @@ fn install_handlers() -> std::result::Result<(), String> {
     action.sa_sigaction = handle_signal as *const () as usize;
     action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
 
-    let mut previous: [Option<PreviousHandler>; 3] = [None; 3];
+    let mut previous: [Option<PreviousHandler>; 4] = [None; 4];
     for (position, signal) in SIGNALS.iter().enumerate() {
         // SAFETY: `action` is fully initialised; `sigemptyset` clears the mask.
         unsafe {

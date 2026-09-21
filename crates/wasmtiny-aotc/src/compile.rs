@@ -128,8 +128,19 @@ pub fn build_isa(config: &CompilerConfig) -> CompileResult<Arc<dyn TargetIsa>> {
         }
     }
 
-    let builder = cranelift_codegen::isa::lookup(config.target.clone())
+    let mut builder = cranelift_codegen::isa::lookup(config.target.clone())
         .map_err(|err| CompileError::Isa(err.to_string()))?;
+
+    // On x86_64, float rounding (`ceil`/`floor`/`trunc`/`nearest`) lowers to
+    // libcall relocations without SSE4.1, and the finish-linker below can only
+    // patch intra-module user functions — a `LibCall(…)` external name is a
+    // hard link failure. `roundss`/`roundsd` make those ops native; SSE4.1 is
+    // the de facto x86_64-v2 baseline, so it is enabled unconditionally.
+    if config.target.architecture == target_lexicon::Architecture::X86_64 {
+        builder
+            .enable("has_sse41")
+            .map_err(|err| CompileError::Isa(err.to_string()))?;
+    }
 
     let mut flag_builder = settings::builder();
     flag_builder
@@ -396,9 +407,11 @@ fn apply_reloc(
             ));
         }
         Reloc::X86PCRel4 | Reloc::X86CallPCRel4 | Reloc::X86CallPLTRel4 | Reloc::X86GOTPCRel4 => {
-            // S + A - P, where P is the address of the end of the relocation
-            // field (offset + 4).
-            let disp = value.wrapping_sub(here + 4) as i64;
+            // S + A - P, where P is the address of the relocation field start
+            // (`here`). Cranelift already encodes the "measure from the end of
+            // the instruction" adjustment as a -4 addend, so the field start,
+            // not `here + 4`, is the subtraction base.
+            let disp = value.wrapping_sub(here) as i64;
             if !(i32::MIN as i64..=i32::MAX as i64).contains(&disp) {
                 return Err(CompileError::Link(
                     "x86 PC-relative relocation out of range".to_string(),

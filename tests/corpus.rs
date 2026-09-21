@@ -35,10 +35,11 @@ use wasmtiny::security_test::open_fd_count;
 /// harness rather than silently overrunning.
 const DEADLINE_GRACE_MS: u64 = 3000;
 const PAGE_BYTES: u32 = 64 * 1024;
-/// Serializes the fd-sensitive tests in this file: cargo runs test
-/// functions on parallel threads in one process, and concurrently
-/// spawning watchdog children (pipe fds) would race the corpus fd
-/// canary windows.
+/// Serializes the tests in this file: cargo runs test functions on
+/// parallel threads in one process, and the fd canary reads the
+/// process-wide open-fd count. Concurrently spawning watchdog children
+/// (pipe fds) or allocating shared regions (shm fds) would race the fd
+/// canary windows, so every test that opens fds holds this lock.
 static TEST_SERIALIZE: Mutex<()> = Mutex::new(());
 
 /// Parsed fixture manifest (`key: value` lines, `#` comments).
@@ -332,6 +333,7 @@ fn load_manifest(dir: &Path) -> Option<Manifest> {
 /// fails with a clear error.
 #[test]
 fn manifest_with_missing_binary_fails_clearly() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|p| p.into_inner());
     let tmp = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/corpus-manifest-selftest");
     let _ = fs::remove_dir_all(&tmp);
     let fixture = tmp.join("broken-fixture");
@@ -661,6 +663,7 @@ fn runner_path() -> PathBuf {
 /// and writes to read-only regions must all be denied.
 #[test]
 fn shared_region_boundary_probes_are_denied() {
+    let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|p| p.into_inner());
     use wasmtiny::{RegionProt, WasmApplication, WasmValue};
 
     let guest_wat = r#"

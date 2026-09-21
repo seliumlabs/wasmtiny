@@ -33,6 +33,18 @@ pub const MAX_PAGES: u32 = 65536;
 /// Constant `PAGE_SIZE_BYTES`.
 pub const PAGE_SIZE_BYTES: u32 = 65536;
 
+/// PROT_NONE tail reserved past the accessible capacity of every memory.
+///
+/// The AOT compiler bounds guest heap accesses against the memory's
+/// *capacity* and converts the small (`addr + access_size`) overhang past the
+/// bound into a page fault (mapped to `MemoryOutOfBounds` by the trap
+/// handler). That only works if an unmapped region follows the reservation:
+/// when `min == max` the reservation is exactly the accessible length, so an
+/// access just past the end would otherwise land in an adjacent mapping and
+/// read foreign bytes (or zeros) instead of trapping. One extra wasm page is
+/// far beyond the maximum 8-byte overhang of any scalar access.
+const GUARD_RESERVE_BYTES: usize = PAGE_SIZE_BYTES as usize;
+
 /// Protection level for a shared memory region mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegionProt {
@@ -150,8 +162,12 @@ impl Memory {
                 WasmError::Instantiate("memory size overflow during allocation".to_string())
             })?;
 
-        // Reserve the full VA range with PROT_NONE
-        let ptr = mmap_reserve(capacity)?;
+        // Reserve the accessible capacity plus a PROT_NONE guard tail (see
+        // `GUARD_RESERVE_BYTES`): heap accesses are fault-backed past `len`.
+        let reserve_bytes = capacity.checked_add(GUARD_RESERVE_BYTES).ok_or_else(|| {
+            WasmError::Instantiate("memory capacity overflow during allocation".to_string())
+        })?;
+        let ptr = mmap_reserve(reserve_bytes)?;
 
         // Make initial pages accessible
         if initial_bytes > 0
@@ -159,7 +175,7 @@ impl Memory {
         {
             // Clean up on failure
             unsafe {
-                libc::munmap(ptr as *mut libc::c_void, capacity);
+                libc::munmap(ptr as *mut libc::c_void, reserve_bytes);
             }
             return Err(e);
         }
@@ -830,9 +846,13 @@ impl Clone for Memory {
 impl Drop for Memory {
     fn drop(&mut self) {
         if !self.ptr.is_null() && self.capacity > 0 {
-            // SAFETY: ptr was allocated via mmap with self.capacity bytes.
+            // SAFETY: ptr was allocated via mmap with `capacity +
+            // GUARD_RESERVE_BYTES` bytes (see `try_new`).
             unsafe {
-                libc::munmap(self.ptr as *mut libc::c_void, self.capacity);
+                libc::munmap(
+                    self.ptr as *mut libc::c_void,
+                    self.capacity + GUARD_RESERVE_BYTES,
+                );
             }
         }
     }

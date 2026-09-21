@@ -140,7 +140,7 @@ unsafe extern "C" {
 unsafe extern "C" {
     #[link_name = "__sigsetjmp"]
     fn platform_sigsetjmp(env: *mut SigJmpBuf, savemask: libc::c_int) -> libc::c_int;
-    #[link_name = "__siglongjmp"]
+    #[link_name = "siglongjmp"]
     fn platform_siglongjmp(env: *mut SigJmpBuf, val: libc::c_int) -> !;
 }
 

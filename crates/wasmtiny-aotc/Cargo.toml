@@ -18,7 +18,7 @@ thiserror = "2.0"
 wasmparser = "0.215"
 
 [dev-dependencies]
-wasmtiny = { path = "../.." }
+wasmtiny = { path = "../..", version = "0.1.0" }
 wat = "1.259"
 
 [features]

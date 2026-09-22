@@ -1,60 +1,28 @@
 [workspace]
-members = [".", "crates/wasmtiny-aotc"]
 resolver = "3"
+members = ["crates/aotc", "crates/core"]
 
-[package]
-name = "wasmtiny"
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-description = "Tiny Rust WebAssembly runtime based on WAMR"
 repository = "https://github.com/seliumlabs/wasmtiny"
-license = "Apache-2.0 OR MIT"
+license = "MPL-2.0"
 
-[dependencies]
-anyhow = { version = "1.0", optional = true }
-clap = { version = "4.6", features = ["derive"], optional = true }
-libc = "0.2"
-parking_lot = "0.12"
-sha2 = { version = "0.10", optional = true }
-thiserror = "2.0"
-
-[dev-dependencies]
-walkdir = "2.5"
-wasmtiny-aotc = { path = "crates/wasmtiny-aotc", version = "0.1.0" }
-wast = "259.0"
-wat = "1.259"
-
-[features]
-default = ["aot"]
-# AOT execution path: artifact loading, integrity verification and native
-# execution. This is the default and, once the interpreter is feature-gated,
-# the AOT-only build excludes wasm parsing and the interpreter.
-aot = ["dep:sha2"]
-# Interpreter execution path plus the wasm parser/validator. Optional;
-# retained as the test/reference oracle and for differential testing.
-interpreter = []
-cli = ["clap", "anyhow"]
-# Stage 2 of host-region-wait-notify: compile in platform wake emission
-# (Linux futex, Windows WakeByAddress, FreeBSD _umtx_op) as a side effect
-# of memory.atomic.notify on shared ranges. Build-time only — there is no
-# runtime toggle; embedders detect via SharedMemoryRegistry::host_wait_support().
-# Gated per-OS inside src/runtime/os_wake.rs; unsupported platforms (macOS)
-# compile to a no-op even with this feature on.
-platform-wake-emission = []
-# Sandbox-escape testing build: corpus-runner instrumentation (verdict
-# emission, per-fixture resource caps, budget timer). Compiled into the
-# library and the wasmtiny-corpus-runner / wasmtiny-fuzz binaries only;
-# absent from default and release builds by construction.
-security-test = []
-
-[[bin]]
-name = "wasmtiny"
-required-features = ["cli"]
-
-[[bin]]
-name = "wasmtiny-corpus-runner"
-required-features = ["security-test"]
-
-[[bin]]
-name = "wasmtiny-fuzz"
-required-features = ["security-test"]
+[workspace.dependencies]
+anyhow = { version = "1.0", default-features = false }
+clap = { version = "4.6", default-features = false }
+cranelift-codegen = { version = "0.111", default-features = false }
+cranelift-entity = { version = "0.111", default-features = false }
+cranelift-frontend = { version = "0.111", default-features = false }
+cranelift-wasm = { version = "0.111", default-features = false }
+libc = { version = "0.2", default-features = false }
+parking_lot = { version = "0.12", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+target-lexicon = { version = "0.12", default-features = false }
+thiserror = { version = "2.0", default-features = false }
+walkdir = { version = "2.5", default-features = false }
+wasmparser = { version = "0.215", default-features = false }
+wasmtiny = { path = "crates/core", default-features = false }
+wasmtiny-aotc = { path = "crates/aotc", default-features = false }
+wast = { version = "259.0", default-features = false }
+wat = { version = "1.259", default-features = false }

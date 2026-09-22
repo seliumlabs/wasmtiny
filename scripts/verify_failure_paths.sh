@@ -88,7 +88,7 @@ fi
 # --- (c) off-list unsafe: allowlist gate fails, naming the file -------
 TMP_C=$(mktemp -d)
 mkdir -p "$TMP_C/src"
-cp src/*.rs "$TMP_C/src/"
+cp crates/core/src/*.rs "$TMP_C/src/"
 printf '\npub fn evil() { unsafe { std::hint::black_box(1u8); } }\n' >> "$TMP_C/src/lib.rs"
 
 if ./scripts/check_unsafe.sh "$TMP_C/src" > "$TMP_C/out.log" 2>&1; then

@@ -1,0 +1,31 @@
+[package]
+name = "wasmtiny-aotc"
+version.workspace = true
+edition.workspace = true
+description = "Ahead-of-time compiler for the wasmtiny runtime; compiles .wasm to .aot using Cranelift"
+repository.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "wasmtiny-aotc"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[dependencies]
+clap = { workspace = true, features = ["derive", "help", "std"], optional = true }
+cranelift-codegen = { workspace = true, features = ["all-arch"] }
+cranelift-entity.workspace = true
+cranelift-frontend.workspace = true
+cranelift-wasm = { workspace = true, features = ["std"] }
+sha2.workspace = true
+target-lexicon.workspace = true
+thiserror.workspace = true
+wasmparser.workspace = true
+
+[dev-dependencies]
+wasmtiny.workspace = true
+wat.workspace = true
+
+[features]
+default = ["cli"]
+cli = ["dep:clap"]

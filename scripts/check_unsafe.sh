@@ -3,21 +3,21 @@
 # allowlist (tools/unsafe_allowlist.txt) with matching counts.
 #
 # Counts unsafe-code items (unsafe blocks, unsafe fn, unsafe impl)
-# per file under src/ and compares against the allowlist. Any
+# per file under crates/core/src/ and compares against the allowlist. Any
 # off-list occurrence, count drift, or missing entry fails.
 #
 # Guests (tests/corpus) are exempt by design — no static gate applies
 # to hostile payloads (docs/threat-model.md).
 #
 # Usage: scripts/check_unsafe.sh [src-root]
-#   The optional src-root (default: src/) lets the failure-path
+#   The optional src-root (default: crates/core/src/) lets the failure-path
 #   self-test run this gate against a scratch copy with an injected
 #   violation.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-SRC_ROOT="${1:-src}"
+SRC_ROOT="${1:-crates/core/src}"
 ALLOWLIST="tools/unsafe_allowlist.txt"
 
 if [[ ! -d "$SRC_ROOT" ]]; then
@@ -36,11 +36,11 @@ count_unsafe() {
 status=0
 while IFS= read -r file; do
     # Repo-relative path so allowlist entries match regardless of the
-    # src-root argument (scratch copies map back onto src/...).
-    if [[ "$SRC_ROOT" == "src" ]]; then
+    # src-root argument (scratch copies map back onto crates/core/src/...).
+    if [[ "$SRC_ROOT" == "crates/core/src" ]]; then
         rel="$file"
     else
-        rel="src/${file#"$SRC_ROOT"/}"
+        rel="crates/core/src/${file#"$SRC_ROOT"/}"
     fi
     actual="$(count_unsafe "$file")"
     allowed="$(grep -E "^${rel//\\/\\\\}[[:space:]]" "$ALLOWLIST" | awk '{print $2}' || true)"
@@ -59,9 +59,9 @@ while IFS= read -r line; do
     [[ "$line" =~ ^#.*$ || -z "$line" ]] && continue
     rel="$(echo "$line" | awk '{print $1}')"
     allowed="$(echo "$line" | awk '{print $2}')"
-    # Allowlist entries are repo-relative (src/...); map back onto
+    # Allowlist entries are repo-relative (crates/core/src/...); map back onto
     # the (possibly scratch) source root.
-    file="$SRC_ROOT/${rel#src/}"
+    file="$SRC_ROOT/${rel#crates/core/src/}"
     if [[ ! -f "$file" ]]; then
         echo "FAIL: allowlist entry $rel points at a missing file"
         status=1

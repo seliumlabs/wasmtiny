@@ -89,7 +89,7 @@ jobs:
       - name: Check no instrumentation in default build
         run: ./scripts/check_no_instrumentation.sh
 
-      # Static gates (wasmtiny only; guests exempt by design).
+      # Static gates.
       - name: Unsafe-code allowlist gate
         run: ./scripts/check_unsafe.sh
 

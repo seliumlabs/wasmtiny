@@ -80,13 +80,13 @@ fn collect_fuzz_coverage(targets_file: &Path, coverage: &mut BTreeMap<String, Ve
 #[test]
 fn every_threat_model_entry_has_coverage() {
     let root = manifest_dir();
-    let doc = fs::read_to_string(root.join("docs/threat-model.md"))
+    let doc = fs::read_to_string(root.join("../../docs/threat-model.md"))
         .expect("docs/threat-model.md is the coverage source of truth");
 
     let entries = threat_entries(&doc);
     assert!(
         !entries.is_empty(),
-        "no TM-xx entries parsed from docs/threat-model.md"
+        "no TM-xx entries parsed from ../../docs/threat-model.md"
     );
 
     let mut coverage: BTreeMap<String, Vec<Coverage>> = BTreeMap::new();

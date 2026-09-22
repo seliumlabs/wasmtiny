@@ -1,0 +1,56 @@
+[package]
+name = "wasmtiny"
+version.workspace = true
+edition.workspace = true
+description = "WebAssembly runtime for Selium based on WAMR"
+repository.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "wasmtiny"
+required-features = ["cli"]
+
+[[bin]]
+name = "wasmtiny-corpus-runner"
+required-features = ["security-test"]
+
+[[bin]]
+name = "wasmtiny-fuzz"
+required-features = ["security-test"]
+
+[dependencies]
+anyhow = { workspace = true, optional = true }
+clap = { workspace = true, features = ["derive", "help", "std"], optional = true }
+libc.workspace = true
+parking_lot.workspace = true
+sha2 = { workspace = true, optional = true }
+thiserror.workspace = true
+
+[dev-dependencies]
+walkdir.workspace = true
+wasmtiny-aotc.workspace = true
+wast.workspace = true
+wat.workspace = true
+
+[features]
+default = ["aot"]
+# AOT execution path: artifact loading, integrity verification and native
+# execution. This is the default and, once the interpreter is feature-gated,
+# the AOT-only build excludes wasm parsing and the interpreter.
+aot = ["dep:sha2"]
+cli = ["anyhow", "clap"]
+# Interpreter execution path plus the wasm parser/validator. Optional;
+# retained as the test/reference oracle and for differential testing.
+interpreter = []
+# Stage 2 of host-region-wait-notify: compile in platform wake emission
+# (Linux futex, Windows WakeByAddress, FreeBSD _umtx_op) as a side effect
+# of memory.atomic.notify on shared ranges. Build-time only — there is no
+# runtime toggle; embedders detect via SharedMemoryRegistry::host_wait_support().
+# Gated per-OS inside src/runtime/os_wake.rs; unsupported platforms (macOS)
+# compile to a no-op even with this feature on.
+platform-wake-emission = []
+# Sandbox-escape testing build: corpus-runner instrumentation (verdict
+# emission, per-fixture resource caps, budget timer). Compiled into the
+# library and the wasmtiny-corpus-runner / wasmtiny-fuzz binaries only;
+# absent from default and release builds by construction.
+security-test = []

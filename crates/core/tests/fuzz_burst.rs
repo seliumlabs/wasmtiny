@@ -106,7 +106,7 @@ fn fuzz_bin() -> PathBuf {
 /// complete with no findings.
 #[test]
 fn fuzz_burst_is_clean() {
-    let seeds = manifest_root().join("target/fuzz-seeds-clean");
+    let seeds = tmp_root().join("fuzz-seeds-clean");
     let _ = fs::remove_dir_all(&seeds);
     assemble_seeds(&seeds);
 
@@ -128,13 +128,13 @@ fn fuzz_burst_is_clean() {
 /// the failing input as an artifact, and a clean rerun must go green.
 #[test]
 fn fuzz_crash_discovery_works_end_to_end() {
-    let seeds = manifest_root().join("target/fuzz-seeds-crash");
+    let seeds = tmp_root().join("fuzz-seeds-crash");
     let _ = fs::remove_dir_all(&seeds);
     assemble_seeds(&seeds);
 
     // Sweep artifacts from any earlier run.
-    for entry in fs::read_dir(manifest_root().join("target"))
-        .expect("target dir readable")
+    for entry in fs::read_dir(tmp_root())
+        .expect("target tmp dir readable")
         .map_while(Result::ok)
         .filter(|e| e.file_name().to_string_lossy().starts_with("fuzz-crash-"))
     {
@@ -147,7 +147,7 @@ fn fuzz_crash_discovery_works_end_to_end() {
         !output.status.success(),
         "a finding must fail the run, got success"
     );
-    let crash_artifacts: Vec<_> = fs::read_dir(manifest_root().join("target"))
+    let crash_artifacts: Vec<_> = fs::read_dir(tmp_root())
         .into_iter()
         .flatten()
         .filter_map(|e| e.ok())
@@ -181,6 +181,12 @@ fn manifest_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+/// Cargo's scratch dir for integration-test output (inside the real
+/// build `target/`, not the source tree).
+fn tmp_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+}
+
 fn run_burst(seeds: &Path, extra: &[&str]) -> std::process::Output {
     let mut cmd = Command::new(fuzz_bin());
     cmd.arg("--seeds")
@@ -190,7 +196,7 @@ fn run_burst(seeds: &Path, extra: &[&str]) -> std::process::Output {
         .arg("--seed")
         .arg(PRNG_SEED.to_string())
         .arg("--crash-dir")
-        .arg(manifest_root().join("target"));
+        .arg(tmp_root());
     for arg in extra {
         cmd.arg(arg);
     }

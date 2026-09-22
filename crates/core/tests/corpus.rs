@@ -178,8 +178,15 @@ impl Verdict {
     }
 }
 
+/// Scratch root for test output: Cargo's per-package tmp dir for
+/// integration tests (inside the real build `target/`, never the
+/// source tree), so generated fixtures stay out of `crates/core/`.
+fn tmp_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+}
+
 fn build_dir() -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/corpus-build");
+    let dir = tmp_root().join("corpus-build");
     fs::create_dir_all(&dir).expect("create corpus build dir");
     dir
 }
@@ -188,7 +195,7 @@ fn build_dir() -> PathBuf {
 #[test]
 fn canaries_detect_violations() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|p| p.into_inner());
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/corpus-canary-selftest");
+    let root = tmp_root().join("corpus-canary-selftest");
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(&root).expect("create selftest dir");
     let canaries = Canaries::new(&root);
@@ -334,7 +341,7 @@ fn load_manifest(dir: &Path) -> Option<Manifest> {
 #[test]
 fn manifest_with_missing_binary_fails_clearly() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|p| p.into_inner());
-    let tmp = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/corpus-manifest-selftest");
+    let tmp = tmp_root().join("corpus-manifest-selftest");
     let _ = fs::remove_dir_all(&tmp);
     let fixture = tmp.join("broken-fixture");
     fs::create_dir_all(&fixture).expect("create selftest fixture dir");
@@ -409,7 +416,7 @@ fn resolve_wasm(dir: &Path, manifest: &Manifest) -> Result<PathBuf, String> {
 /// are checked after every fixture.
 fn run_corpus(dir: &Path) -> Vec<Failure> {
     let mut failures = Vec::new();
-    let canary_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/corpus-run");
+    let canary_root = tmp_root().join("corpus-run");
     let _ = fs::remove_dir_all(&canary_root);
     fs::create_dir_all(&canary_root).expect("create corpus run dir");
     let canaries = Canaries::new(&canary_root);
@@ -767,7 +774,7 @@ fn watchdog_classifies_all_four_verdicts() {
     let _guard = TEST_SERIALIZE.lock().unwrap_or_else(|p| p.into_inner());
     let runner = runner_path();
 
-    let smoke = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/corpus-smoke");
+    let smoke = tmp_root().join("corpus-smoke");
     fs::create_dir_all(&smoke).expect("create smoke dir");
     let clean_wasm = smoke.join("clean.wasm");
     fs::write(&clean_wasm, clean_module_bytes()).expect("write smoke module");

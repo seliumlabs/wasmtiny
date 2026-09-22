@@ -3,7 +3,8 @@
 //! manifest (`tests/corpus/*/manifest.txt`, `threat:` field) or fuzz
 //! target declaration (`tests/fuzz/targets.txt`).
 //!
-//! Writes the matrix to `target/traceability-matrix.md` and fails,
+//! Writes the matrix to `CARGO_TARGET_TMPDIR/traceability-matrix.md`
+//! (Cargo's scratch dir for integration tests) and fails,
 //! listing uncovered entries, when coverage is incomplete. This is the
 //! CI gate required by the `sandbox-escape-testing` spec: a new
 //! threat-model entry fails CI until a test exists.
@@ -116,8 +117,8 @@ fn every_threat_model_entry_has_coverage() {
         let _ = writeln!(matrix, "| {id} | {title} | {cell} |");
     }
 
-    let out_path = root.join("target/traceability-matrix.md");
-    let _ = fs::create_dir_all(root.join("target"));
+    // Cargo creates and guarantees CARGO_TARGET_TMPDIR for integration tests.
+    let out_path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("traceability-matrix.md");
     let _ = fs::write(&out_path, &matrix);
 
     assert!(

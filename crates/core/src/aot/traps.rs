@@ -505,22 +505,6 @@ unsafe fn pc_from_context(_context: *mut core::ffi::c_void) -> usize {
     usize::MAX
 }
 
-/// Whether the fault was taken with the stack pointer at or below this
-/// thread's stack base, i.e. the native stack is exhausted (the faulting
-/// access ran into the thread's stack guard page, which sits immediately
-/// below the base).
-///
-/// The comparison is exact — no proximity heuristic: the guard page can only
-/// be touched by an access at or above SP once SP has decayed to the base,
-/// and every other fault inside registered code (a guest access into its
-/// reservation's PROT_NONE tail) leaves SP well inside the usable stack.
-/// `false` on targets without context SP access (which never classify
-/// faults as ours anyway).
-unsafe fn stack_exhausted(context: *mut core::ffi::c_void) -> bool {
-    let sp = unsafe { sp_from_context(context) };
-    STACK_BASE.with(|base| base.get() != 0 && sp <= base.get())
-}
-
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 unsafe fn sp_from_context(context: *mut core::ffi::c_void) -> usize {
     unsafe {
@@ -561,6 +545,22 @@ unsafe fn sp_from_context(context: *mut core::ffi::c_void) -> usize {
 )))]
 unsafe fn sp_from_context(_context: *mut core::ffi::c_void) -> usize {
     0
+}
+
+/// Whether the fault was taken with the stack pointer at or below this
+/// thread's stack base, i.e. the native stack is exhausted (the faulting
+/// access ran into the thread's stack guard page, which sits immediately
+/// below the base).
+///
+/// The comparison is exact — no proximity heuristic: the guard page can only
+/// be touched by an access at or above SP once SP has decayed to the base,
+/// and every other fault inside registered code (a guest access into its
+/// reservation's PROT_NONE tail) leaves SP well inside the usable stack.
+/// `false` on targets without context SP access (which never classify
+/// faults as ours anyway).
+unsafe fn stack_exhausted(context: *mut core::ffi::c_void) -> bool {
+    let sp = unsafe { sp_from_context(context) };
+    STACK_BASE.with(|base| base.get() != 0 && sp <= base.get())
 }
 
 /// Fallback: approximate the least-safe stack address from a fresh stack

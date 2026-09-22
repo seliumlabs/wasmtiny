@@ -31,32 +31,6 @@ use crate::{
 /// The local (owned-memory) waiter registry: address -> waiter.
 pub(crate) type LocalWaiterMap = Arc<RwLock<std::collections::HashMap<u32, Arc<Waiter>>>>;
 
-/// A registered waiter to park on, resolved while holding the memory lock.
-///
-/// The registry owns the waiter references (and, for shared ranges, the
-/// region's waiter map), so the memory lock can be dropped before parking:
-/// a parked waiter therefore never blocks a notifier on another thread.
-pub(crate) enum WaiterRegistry {
-    /// Owned-memory waiter on the local registry.
-    Local(LocalWaiterMap, u32),
-    /// Shared-range waiter on the region's registry.
-    Shared(WaiterMap, u32),
-}
-
-impl WaiterRegistry {
-    /// Parks the current thread on the registered waiter until notified or
-    /// timed out. Returns true if woken, false if the timeout elapsed.
-    ///
-    /// Does not take or hold any memory lock — only the waiter's own
-    /// mutex/condvar — so a thread parked here never blocks a notifier.
-    pub(crate) fn park(&self, timeout_ns: u64) -> bool {
-        match self {
-            WaiterRegistry::Local(waiters, address) => local_wait(waiters, *address, timeout_ns),
-            WaiterRegistry::Shared(waiters, offset) => shared_wait(waiters, *offset, timeout_ns),
-        }
-    }
-}
-
 /// PROT_NONE tail reserved past the accessible capacity of every memory.
 ///
 /// The AOT compiler bounds guest heap accesses against the memory's
@@ -72,6 +46,18 @@ const GUARD_RESERVE_BYTES: usize = PAGE_SIZE_BYTES as usize;
 pub const MAX_PAGES: u32 = 65536;
 /// Constant `PAGE_SIZE_BYTES`.
 pub const PAGE_SIZE_BYTES: u32 = 65536;
+
+/// A registered waiter to park on, resolved while holding the memory lock.
+///
+/// The registry owns the waiter references (and, for shared ranges, the
+/// region's waiter map), so the memory lock can be dropped before parking:
+/// a parked waiter therefore never blocks a notifier on another thread.
+pub(crate) enum WaiterRegistry {
+    /// Owned-memory waiter on the local registry.
+    Local(LocalWaiterMap, u32),
+    /// Shared-range waiter on the region's registry.
+    Shared(WaiterMap, u32),
+}
 
 /// Protection level for a shared memory region mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,6 +134,20 @@ pub struct Memory {
 pub(crate) struct Waiter {
     notified: Mutex<bool>,
     condvar: Condvar,
+}
+
+impl WaiterRegistry {
+    /// Parks the current thread on the registered waiter until notified or
+    /// timed out. Returns true if woken, false if the timeout elapsed.
+    ///
+    /// Does not take or hold any memory lock — only the waiter's own
+    /// mutex/condvar — so a thread parked here never blocks a notifier.
+    pub(crate) fn park(&self, timeout_ns: u64) -> bool {
+        match self {
+            WaiterRegistry::Local(waiters, address) => local_wait(waiters, *address, timeout_ns),
+            WaiterRegistry::Shared(waiters, offset) => shared_wait(waiters, *offset, timeout_ns),
+        }
+    }
 }
 
 impl Memory {
@@ -856,45 +856,6 @@ impl Drop for Memory {
     }
 }
 
-/// Perform an mmap allocation for the full virtual address range.
-fn mmap_reserve(capacity: usize) -> std::result::Result<*mut u8, WasmError> {
-    // SAFETY: We're reserving virtual address space with PROT_NONE.
-    // This is a standard pattern for pre-reserving VA ranges.
-    let ptr = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            capacity,
-            libc::PROT_NONE,
-            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-            -1,
-            0,
-        )
-    };
-    if ptr == libc::MAP_FAILED {
-        return Err(WasmError::Instantiate(format!(
-            "mmap failed to reserve {} bytes of virtual address space",
-            capacity
-        )));
-    }
-    Ok(ptr as *mut u8)
-}
-
-/// Make a range of memory accessible with the given protection.
-fn mprotect_range(ptr: *mut u8, len: usize, prot: i32) -> std::result::Result<(), WasmError> {
-    if len == 0 {
-        return Ok(());
-    }
-    // SAFETY: ptr must point to a valid mmap'd region of at least `len` bytes.
-    let ret = unsafe { libc::mprotect(ptr as *mut libc::c_void, len, prot) };
-    if ret != 0 {
-        return Err(WasmError::Runtime(format!(
-            "mprotect failed: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    Ok(())
-}
-
 /// Parks the calling thread on the local waiter registered for `address`.
 ///
 /// Does not take or hold any memory lock — only the waiter's own
@@ -935,6 +896,45 @@ pub(crate) fn local_wait(waiters: &LocalWaiterMap, address: u32, timeout_ns: u64
         *notified = false;
         true
     }
+}
+
+/// Perform an mmap allocation for the full virtual address range.
+fn mmap_reserve(capacity: usize) -> std::result::Result<*mut u8, WasmError> {
+    // SAFETY: We're reserving virtual address space with PROT_NONE.
+    // This is a standard pattern for pre-reserving VA ranges.
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            capacity,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(WasmError::Instantiate(format!(
+            "mmap failed to reserve {} bytes of virtual address space",
+            capacity
+        )));
+    }
+    Ok(ptr as *mut u8)
+}
+
+/// Make a range of memory accessible with the given protection.
+fn mprotect_range(ptr: *mut u8, len: usize, prot: i32) -> std::result::Result<(), WasmError> {
+    if len == 0 {
+        return Ok(());
+    }
+    // SAFETY: ptr must point to a valid mmap'd region of at least `len` bytes.
+    let ret = unsafe { libc::mprotect(ptr as *mut libc::c_void, len, prot) };
+    if ret != 0 {
+        return Err(WasmError::Runtime(format!(
+            "mprotect failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -153,6 +153,17 @@ pub fn build_isa(config: &CompilerConfig) -> CompileResult<Arc<dyn TargetIsa>> {
     flag_builder
         .set("enable_heap_access_spectre_mitigation", "true")
         .map_err(|err| CompileError::Isa(err.to_string()))?;
+    // Multi-value functions whose results exceed the target's return
+    // registers (e.g. 3+ i64 results on x86_64, which has only rax/rdx) are
+    // legal wasm. Let Cranelift introduce a hidden return-area pointer for
+    // those calls instead of rejecting the module. This is consistent across
+    // the whole artifact: every caller and callee (wasm bodies, entry
+    // trampolines, host-call stubs) is compiled with the same flags, and the
+    // runtime's own ABI surfaces (trampolines, stubs, libcalls) all use
+    // fixed signatures with at most one return value.
+    flag_builder
+        .set("enable_multi_ret_implicit_sret", "true")
+        .map_err(|err| CompileError::Isa(err.to_string()))?;
     flag_builder
         .set("is_pic", "false")
         .map_err(|err| CompileError::Isa(err.to_string()))?;

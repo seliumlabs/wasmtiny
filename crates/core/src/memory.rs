@@ -28,11 +28,6 @@ use crate::{
     runtime::{ensure_shared_waiter, os_wake, shared_notify, shared_wait},
 };
 
-/// Maximum number of pages (65536 pages = 4 GiB).
-pub const MAX_PAGES: u32 = 65536;
-/// Constant `PAGE_SIZE_BYTES`.
-pub const PAGE_SIZE_BYTES: u32 = 65536;
-
 /// PROT_NONE tail reserved past the accessible capacity of every memory.
 ///
 /// The AOT compiler bounds guest heap accesses against the memory's
@@ -44,6 +39,10 @@ pub const PAGE_SIZE_BYTES: u32 = 65536;
 /// read foreign bytes (or zeros) instead of trapping. One extra wasm page is
 /// far beyond the maximum 8-byte overhang of any scalar access.
 const GUARD_RESERVE_BYTES: usize = PAGE_SIZE_BYTES as usize;
+/// Maximum number of pages (65536 pages = 4 GiB).
+pub const MAX_PAGES: u32 = 65536;
+/// Constant `PAGE_SIZE_BYTES`.
+pub const PAGE_SIZE_BYTES: u32 = 65536;
 
 /// Protection level for a shared memory region mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

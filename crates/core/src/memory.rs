@@ -24,9 +24,38 @@ use std::sync::Arc;
 use parking_lot::{Condvar, Mutex, RwLock};
 
 use crate::{
-    runtime::{MemoryType, Result, SharedRegionId, TrapCode, WasmError},
+    runtime::{MemoryType, Result, SharedRegionId, TrapCode, WaiterMap, WasmError},
     runtime::{ensure_shared_waiter, os_wake, shared_notify, shared_wait},
 };
+
+/// The local (owned-memory) waiter registry: address -> waiter.
+pub(crate) type LocalWaiterMap = Arc<RwLock<std::collections::HashMap<u32, Arc<Waiter>>>>;
+
+/// A registered waiter to park on, resolved while holding the memory lock.
+///
+/// The registry owns the waiter references (and, for shared ranges, the
+/// region's waiter map), so the memory lock can be dropped before parking:
+/// a parked waiter therefore never blocks a notifier on another thread.
+pub(crate) enum WaiterRegistry {
+    /// Owned-memory waiter on the local registry.
+    Local(LocalWaiterMap, u32),
+    /// Shared-range waiter on the region's registry.
+    Shared(WaiterMap, u32),
+}
+
+impl WaiterRegistry {
+    /// Parks the current thread on the registered waiter until notified or
+    /// timed out. Returns true if woken, false if the timeout elapsed.
+    ///
+    /// Does not take or hold any memory lock — only the waiter's own
+    /// mutex/condvar — so a thread parked here never blocks a notifier.
+    pub(crate) fn park(&self, timeout_ns: u64) -> bool {
+        match self {
+            WaiterRegistry::Local(waiters, address) => local_wait(waiters, *address, timeout_ns),
+            WaiterRegistry::Shared(waiters, offset) => shared_wait(waiters, *offset, timeout_ns),
+        }
+    }
+}
 
 /// PROT_NONE tail reserved past the accessible capacity of every memory.
 ///
@@ -116,7 +145,7 @@ pub struct Memory {
 }
 
 #[derive(Debug)]
-struct Waiter {
+pub(crate) struct Waiter {
     notified: Mutex<bool>,
     condvar: Condvar,
 }
@@ -190,49 +219,19 @@ impl Memory {
         })
     }
 
-    /// Blocks the current thread waiting for the address to be notified.
-    /// Returns true if woken, false if timeout.
-    pub(crate) fn wait_on(&self, address: u32, timeout_ns: u64) -> bool {
-        // Shared ranges use the per-region waiter registry (the same
-        // mechanism backing the public host wait/notify API). The guest
-        // memory lock is not held while parked — shared_wait only takes
-        // the waiter's own mutex/condvar.
+    /// Registers a waiter for `address` and returns a registry to park on.
+    ///
+    /// Call while holding the memory lock (the register must be atomic with
+    /// the value compare), then drop the lock and park via
+    /// [`WaiterRegistry::park`] — a parked waiter must not hold the memory
+    /// lock, or a notifier on another thread could never reach it.
+    pub(crate) fn waiter_registry(&self, address: u32) -> WaiterRegistry {
         if let Some((range, region_offset)) = self.find_shared_range(address) {
-            return shared_wait(&range.waiters, region_offset, timeout_ns);
-        }
-
-        // Use local waiters for owned memory
-        let waiter = {
-            let mut waiters = self.waiters.write();
-            waiters
-                .entry(address)
-                .or_insert_with(|| {
-                    Arc::new(Waiter {
-                        notified: Mutex::new(false),
-                        condvar: Condvar::new(),
-                    })
-                })
-                .clone()
-        };
-
-        if timeout_ns == 0 {
-            return false;
-        }
-
-        let mut notified = waiter.notified.lock();
-        if *notified {
-            *notified = false;
-            return true;
-        }
-
-        let timeout = std::time::Duration::from_nanos(timeout_ns);
-        let result = waiter.condvar.wait_for(&mut notified, timeout);
-
-        if result.timed_out() {
-            false
+            ensure_shared_waiter(&range.waiters, region_offset);
+            WaiterRegistry::Shared(range.waiters.clone(), region_offset)
         } else {
-            *notified = false;
-            true
+            self.get_waiter(address);
+            WaiterRegistry::Local(self.waiters.clone(), address)
         }
     }
 
@@ -894,6 +893,48 @@ fn mprotect_range(ptr: *mut u8, len: usize, prot: i32) -> std::result::Result<()
         )));
     }
     Ok(())
+}
+
+/// Parks the calling thread on the local waiter registered for `address`.
+///
+/// Does not take or hold any memory lock — only the waiter's own
+/// mutex/condvar — so a thread parked here never blocks a notifier on
+/// another thread (see [`WaiterRegistry`]). A zero timeout does not block; a
+/// notify latched before the park returns `true` immediately; spurious
+/// condvar wakeups re-check the notified flag and re-sleep with the
+/// remaining timeout.
+pub(crate) fn local_wait(waiters: &LocalWaiterMap, address: u32, timeout_ns: u64) -> bool {
+    let waiter = {
+        let mut map = waiters.write();
+        map.entry(address)
+            .or_insert_with(|| {
+                Arc::new(Waiter {
+                    notified: Mutex::new(false),
+                    condvar: Condvar::new(),
+                })
+            })
+            .clone()
+    };
+
+    if timeout_ns == 0 {
+        return false;
+    }
+
+    let mut notified = waiter.notified.lock();
+    if *notified {
+        *notified = false;
+        return true;
+    }
+
+    let timeout = std::time::Duration::from_nanos(timeout_ns);
+    let result = waiter.condvar.wait_for(&mut notified, timeout);
+
+    if result.timed_out() {
+        false
+    } else {
+        *notified = false;
+        true
+    }
 }
 
 #[cfg(test)]

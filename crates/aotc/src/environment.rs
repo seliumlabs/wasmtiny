@@ -58,6 +58,7 @@ pub const GLOBAL_CELL_SIZE: i32 = 8;
 pub const USER_TRAP_BAD_SIGNATURE: u8 = 4;
 pub const USER_TRAP_CALL_INDIRECT_NULL: u8 = 3;
 pub const USER_TRAP_HOST: u8 = 6;
+pub const USER_TRAP_MEMORY_LIMIT: u8 = 7;
 pub const USER_TRAP_NULL_REFERENCE: u8 = 5;
 pub const USER_TRAP_TABLE_OUT_OF_BOUNDS: u8 = 2;
 /// User trap codes (encoded in `TrapCode::User(n)`), mapped to the artifact's
@@ -998,6 +999,11 @@ impl<'info> FuncEnv<'info> {
     }
 
     /// Translates `memory.grow`.
+    ///
+    /// The libcall reports failure two ways: `u32::MAX` (-1) for a grow the
+    /// declaration rejects, and the packed trap sentinel for a runtime
+    /// memory-budget overrun (`MemoryLimitExceeded`, enforced atomically with
+    /// the growth commit inside the runtime's grow critical section).
     pub fn translate_memory_grow(
         &mut self,
         mut pos: FuncCursor,
@@ -1014,7 +1020,11 @@ impl<'info> FuncEnv<'info> {
             LibCallOffsets::MEMORY_GROW,
             &[mem_idx, delta],
         );
-        Ok(unpack_plain_result(&mut pos, raw))
+        Ok(unpack_libcall_result(
+            &mut pos,
+            raw,
+            user_trap(USER_TRAP_MEMORY_LIMIT),
+        ))
     }
 
     /// Translates `memory.size`.

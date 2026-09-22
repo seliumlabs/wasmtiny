@@ -892,16 +892,19 @@ impl Instance {
             .memory(0)
             .ok_or_else(|| WasmError::Runtime("no memory".to_string()))?;
 
-        let memory = memory.lock().map_err(poisoned_lock)?;
-
-        // read_i32 uses ptr_at which checks owned OR shared ranges
-        let actual = memory.read_i32(address)? as i64;
-        if actual != expected {
-            return Ok(1);
-        }
-
-        memory.get_waiter(address);
-        drop(memory);
+        // read_i32 uses ptr_at which checks owned OR shared ranges. The value
+        // compare and waiter registration happen under the memory lock; the
+        // registry keeps the waiter reachable after the lock drops so the
+        // park below never holds the memory lock — a parked waiter must not
+        // block a notifier on another thread.
+        let registry = {
+            let memory = memory.lock().map_err(poisoned_lock)?;
+            let actual = memory.read_i32(address)? as i64;
+            if actual != expected {
+                return Ok(1);
+            }
+            memory.waiter_registry(address)
+        };
 
         // Nanosecond timeout: negative means wait forever
         let timeout_ns = if timeout < 0 {
@@ -910,12 +913,7 @@ impl Instance {
             (timeout as u64).saturating_mul(1)
         };
 
-        let woken = self
-            .memory(0)
-            .ok_or_else(|| WasmError::Runtime("no memory".to_string()))?
-            .lock()
-            .map_err(poisoned_lock)?
-            .wait_on(address, timeout_ns);
+        let woken = registry.park(timeout_ns);
 
         if woken { Ok(0) } else { Ok(2) }
     }
@@ -928,16 +926,16 @@ impl Instance {
             .memory(0)
             .ok_or_else(|| WasmError::Runtime("no memory".to_string()))?;
 
-        let memory = memory.lock().map_err(poisoned_lock)?;
-
-        // read_i64 uses ptr_at which checks owned OR shared ranges
-        let actual = memory.read_i64(address)?;
-        if actual != expected {
-            return Ok(1);
-        }
-
-        memory.get_waiter(address);
-        drop(memory);
+        // See `wait32`: the compare and registration are atomic with the
+        // memory lock, but the park itself never holds it.
+        let registry = {
+            let memory = memory.lock().map_err(poisoned_lock)?;
+            let actual = memory.read_i64(address)?;
+            if actual != expected {
+                return Ok(1);
+            }
+            memory.waiter_registry(address)
+        };
 
         // Nanosecond timeout: negative means wait forever
         let timeout_ns = if timeout < 0 {
@@ -946,12 +944,7 @@ impl Instance {
             (timeout as u64).saturating_mul(1)
         };
 
-        let woken = self
-            .memory(0)
-            .ok_or_else(|| WasmError::Runtime("no memory".to_string()))?
-            .lock()
-            .map_err(poisoned_lock)?
-            .wait_on(address, timeout_ns);
+        let woken = registry.park(timeout_ns);
 
         if woken { Ok(0) } else { Ok(2) }
     }

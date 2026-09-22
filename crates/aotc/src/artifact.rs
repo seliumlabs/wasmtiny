@@ -36,8 +36,9 @@ use crate::{
     compile::CompiledModule,
     environment::{
         DataSegKind, ElemSegKind, ModuleInfo, USER_TRAP_BAD_SIGNATURE,
-        USER_TRAP_CALL_INDIRECT_NULL, USER_TRAP_HOST, USER_TRAP_NULL_REFERENCE,
-        USER_TRAP_TABLE_OUT_OF_BOUNDS, USER_TRAP_UNREACHABLE, wasm_features,
+        USER_TRAP_CALL_INDIRECT_NULL, USER_TRAP_HOST, USER_TRAP_MEMORY_LIMIT,
+        USER_TRAP_NULL_REFERENCE, USER_TRAP_TABLE_OUT_OF_BOUNDS, USER_TRAP_UNREACHABLE,
+        wasm_features,
     },
     types::{self, ConstOp, FuncIndex, GlobalIndex, Memory, Table},
 };
@@ -113,6 +114,7 @@ pub const TRAP_INTEGER_OVERFLOW: u8 = 7;
 /// Trap-code byte encodings, shared with the runtime loader.
 pub const TRAP_INVALID: u8 = 0;
 pub const TRAP_INVALID_CONVERSION_TO_INT: u8 = 9;
+pub const TRAP_MEMORY_LIMIT_EXCEEDED: u8 = 12;
 pub const TRAP_MEMORY_OUT_OF_BOUNDS: u8 = 2;
 pub const TRAP_NULL_REFERENCE: u8 = 10;
 pub const TRAP_STACK_OVERFLOW: u8 = 6;
@@ -159,6 +161,7 @@ pub fn trap_code_byte(code: ClifTrapCode) -> u8 {
         USER_TRAP_BAD_SIGNATURE => TRAP_INDIRECT_CALL_TYPE_MISMATCH,
         USER_TRAP_NULL_REFERENCE => TRAP_NULL_REFERENCE,
         USER_TRAP_HOST => TRAP_HOST,
+        USER_TRAP_MEMORY_LIMIT => TRAP_MEMORY_LIMIT_EXCEEDED,
         _ => TRAP_HOST,
     }
 }

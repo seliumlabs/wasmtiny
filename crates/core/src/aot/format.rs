@@ -55,6 +55,7 @@ pub const TRAP_INTEGER_OVERFLOW: u8 = 7;
 /// Trap-code byte encodings written by the compiler.
 pub const TRAP_INVALID: u8 = 0;
 pub const TRAP_INVALID_CONVERSION_TO_INT: u8 = 9;
+pub const TRAP_MEMORY_LIMIT_EXCEEDED: u8 = 12;
 pub const TRAP_MEMORY_OUT_OF_BOUNDS: u8 = 2;
 pub const TRAP_NULL_REFERENCE: u8 = 10;
 pub const TRAP_STACK_OVERFLOW: u8 = 6;
@@ -76,6 +77,7 @@ pub fn trap_code_from_byte(byte: u8) -> Option<TrapCode> {
         TRAP_INTEGER_DIVISION_BY_ZERO => TrapCode::IntegerDivisionByZero,
         TRAP_INVALID_CONVERSION_TO_INT => TrapCode::InvalidConversionToInt,
         TRAP_NULL_REFERENCE => TrapCode::NullReference,
+        TRAP_MEMORY_LIMIT_EXCEEDED => TrapCode::MemoryLimitExceeded,
         TRAP_HOST => TrapCode::HostTrap,
         TRAP_INVALID => return None,
         _ => return None,

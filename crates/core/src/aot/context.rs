@@ -63,6 +63,10 @@ pub struct FuncDesc {
 }
 
 /// The hidden per-instance context. Pointer-sized fields for 64-bit targets.
+///
+/// `Copy` because a concurrent invocation clones the context (adjusting only
+/// the per-invocation stack limit) instead of writing the shared one.
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct VmCtx {
     /// Array of memory descriptors.

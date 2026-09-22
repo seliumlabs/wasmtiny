@@ -159,6 +159,15 @@ thread_local! {
     static ALTSTACK_READY: Cell<bool> = const { Cell::new(false) };
 }
 
+thread_local! {
+    /// The base (lowest usable address) of this thread's stack, recorded once
+    /// when the thread's alt-stack is registered, so the signal handler can
+    /// classify a guard-page fault: a fault while the saved stack pointer is
+    /// at or below this base is native stack exhaustion, not a guest memory
+    /// access. Never reset (a thread's stack does not move).
+    static STACK_BASE: Cell<usize> = const { Cell::new(0) };
+}
+
 /// Runs `body` with a recovery boundary: if native code faults, the signal
 /// handler transfers control back here and this returns `Err(Trap(code))`.
 #[inline(never)]
@@ -339,6 +348,7 @@ fn ensure_thread_altstack() -> std::result::Result<(), String> {
             std::io::Error::last_os_error()
         ));
     }
+    STACK_BASE.with(|base| base.set(thread_stack_limit(0)));
     ALTSTACK_READY.set(true);
     Ok(())
 }
@@ -404,7 +414,22 @@ unsafe extern "C" fn handle_signal(
     match classify(pc) {
         FaultKind::NotOurs => unsafe { forward_to_previous(signal, info, context) },
         FaultKind::Trap(code) => deliver(code),
-        FaultKind::InCode => deliver(TrapCode::MemoryOutOfBounds),
+        FaultKind::InCode => {
+            // A fault at a non-trap PC inside registered code is either a
+            // guest memory access into the reservation's PROT_NONE guard
+            // tail, or native stack exhaustion: the stack-overflow entry
+            // check is per-invocation, so indirect callees on the
+            // concurrent path recover via the thread's own guard page.
+            // Disambiguate exactly with the saved stack pointer: a stack
+            // guard page can only fault while SP has decayed to or below the
+            // thread's stack base, whereas a guest access leaves SP inside
+            // the healthy stack.
+            if unsafe { stack_exhausted(context) } {
+                deliver(TrapCode::StackOverflow);
+            } else {
+                deliver(TrapCode::MemoryOutOfBounds);
+            }
+        }
     }
 }
 
@@ -478,6 +503,64 @@ unsafe fn pc_from_context(context: *mut core::ffi::c_void) -> usize {
 unsafe fn pc_from_context(_context: *mut core::ffi::c_void) -> usize {
     // Unsupported target: faults are never classified as ours and re-raise.
     usize::MAX
+}
+
+/// Whether the fault was taken with the stack pointer at or below this
+/// thread's stack base, i.e. the native stack is exhausted (the faulting
+/// access ran into the thread's stack guard page, which sits immediately
+/// below the base).
+///
+/// The comparison is exact — no proximity heuristic: the guard page can only
+/// be touched by an access at or above SP once SP has decayed to the base,
+/// and every other fault inside registered code (a guest access into its
+/// reservation's PROT_NONE tail) leaves SP well inside the usable stack.
+/// `false` on targets without context SP access (which never classify
+/// faults as ours anyway).
+unsafe fn stack_exhausted(context: *mut core::ffi::c_void) -> bool {
+    let sp = unsafe { sp_from_context(context) };
+    STACK_BASE.with(|base| base.get() != 0 && sp <= base.get())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+unsafe fn sp_from_context(context: *mut core::ffi::c_void) -> usize {
+    unsafe {
+        let uc = &*(context as *const libc::ucontext_t);
+        (*uc.uc_mcontext).__ss.__rsp as usize
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn sp_from_context(context: *mut core::ffi::c_void) -> usize {
+    unsafe {
+        let uc = &*(context as *const libc::ucontext_t);
+        (*uc.uc_mcontext).__ss.__sp as usize
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+unsafe fn sp_from_context(context: *mut core::ffi::c_void) -> usize {
+    unsafe {
+        let uc = &*(context as *const libc::ucontext_t);
+        uc.uc_mcontext.gregs[libc::REG_RSP as usize] as usize
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+unsafe fn sp_from_context(context: *mut core::ffi::c_void) -> usize {
+    unsafe {
+        let uc = &*(context as *const libc::ucontext_t);
+        uc.uc_mcontext.sp as usize
+    }
+}
+
+#[cfg(not(any(
+    all(target_os = "macos", target_arch = "x86_64"),
+    all(target_os = "macos", target_arch = "aarch64"),
+    all(target_os = "linux", target_arch = "x86_64"),
+    all(target_os = "linux", target_arch = "aarch64")
+)))]
+unsafe fn sp_from_context(_context: *mut core::ffi::c_void) -> usize {
+    0
 }
 
 /// Fallback: approximate the least-safe stack address from a fresh stack

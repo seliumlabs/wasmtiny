@@ -1398,7 +1398,11 @@ impl Interpreter {
         let memory = instance
             .memory(0)
             .ok_or_else(|| WasmError::Runtime("no memory for atomic.wait".to_string()))?;
-        {
+        // Bounds-checked read, compare, and waiter registration happen under
+        // the memory lock; the registry keeps the waiter reachable after the
+        // lock drops so the park below never holds the memory lock — a
+        // parked waiter must not block a notifier on another thread.
+        let registry = {
             let memory = memory.lock().map_err(poisoned_lock)?;
             let access_width = if _is64 { 8 } else { 4 };
             if addr as usize + access_width > memory.len_bytes() {
@@ -1412,23 +1416,15 @@ impl Interpreter {
             if actual != expected {
                 return Ok(1);
             }
-            memory.get_waiter(addr);
-        }
+            memory.waiter_registry(addr)
+        };
         drop(instance);
         let timeout_ns = if timeout < 0 {
             u64::MAX
         } else {
             (timeout as u64).saturating_mul(1)
         };
-        let woken = self
-            .instance_ref()?
-            .lock()
-            .map_err(poisoned_lock)?
-            .memory(0)
-            .ok_or_else(|| WasmError::Runtime("no memory for wait".to_string()))?
-            .lock()
-            .map_err(poisoned_lock)?
-            .wait_on(addr, timeout_ns);
+        let woken = registry.park(timeout_ns);
         if woken { Ok(0) } else { Ok(2) }
     }
 

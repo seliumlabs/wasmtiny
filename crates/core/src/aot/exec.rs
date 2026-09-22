@@ -2,7 +2,10 @@
 //! trampoline, dispatching imported host functions, and wiring the shared
 //! store-wide function/table state used by `call_indirect`.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use super::{
     code::ExecutableCode,
@@ -14,8 +17,8 @@ use super::{
 
 use crate::runtime::{
     DataKind, ElemKind, ExportKind, ExportType, FunctionType, Global, GlobalType, HostCaller,
-    HostFunc, ImportKind, Memory, NumType, RefType, Result, Store, TrapCode, ValType, WasmError,
-    WasmValue, evaluate_const_expr,
+    HostFunc, ImportKind, InstanceMeter, InstanceStats, Memory, NumType, RefType, Result, Store,
+    TrapCode, ValType, WasmError, WasmValue, evaluate_const_expr,
 };
 
 /// The fixed shape of an array-call entry trampoline:
@@ -84,13 +87,20 @@ struct AotDispatchState {
     tables: Vec<Arc<Mutex<AotTable>>>,
     /// Passive data-segment bytes, indexed by unified data-segment index.
     data_segments: Vec<Vec<u8>>,
-    /// Whether each data segment is still available to `memory.init`.
-    data_available: Vec<bool>,
+    /// Whether each data segment is still available to `memory.init`. Stored
+    /// as atomics so `data.drop` and `memory.init` from concurrent
+    /// invocations never alias the dispatch state mutably.
+    data_available: Vec<AtomicBool>,
     /// Element-segment store handles (resolved from `refs`), indexed by
     /// unified element-segment index.
     elem_segments: Vec<Vec<u32>>,
-    /// Whether each element segment is still available to `table.init`.
-    elem_available: Vec<bool>,
+    /// Whether each element segment is still available to `table.init`. See
+    /// `data_available` for the concurrency contract.
+    elem_available: Vec<AtomicBool>,
+    /// Per-instance meter. The memory-page budget is enforced inside the
+    /// `memory.grow` critical section so concurrent grows cannot exceed it;
+    /// the AOT path does not charge executed instructions.
+    meter: Arc<InstanceMeter>,
 }
 
 impl AotInstance {
@@ -135,10 +145,19 @@ impl AotInstance {
         );
 
         let mut ctx = Box::new(VmCtx::empty());
-        // Set a thread-relative stack limit at instantiation so even
-        // cross-module callees (invoked through their own vmctx) have a
-        // correct bound before their first direct `invoke`.
-        ctx.stack_limit = traps::thread_stack_limit(MAX_WASM_STACK);
+        // The shared context's stack limit starts disabled (0 = no entry
+        // check). The single-threaded `invoke` refreshes it to the invoking
+        // thread's bound before every call, but `invoke_shared` must never
+        // write it: indirect and imported callees read the limit from this
+        // shared context (via their `FuncDesc`), and one thread's bound is
+        // not a valid bound for another thread — it would false-trap
+        // `StackOverflow` when thread stacks overlap. Concurrent invocations
+        // instead carry the thread-relative bound in a per-invocation
+        // context copy (see `invoke_shared`); indirect-callee stack overflow
+        // on the concurrent path is recovered by the guard page + signal
+        // alt-stack rather than the entry check, and the signal handler
+        // classifies the exhausted-stack fault as `StackOverflow`.
+        ctx.stack_limit = 0;
         let ctx_ptr = ctx.as_ref() as *const VmCtx as *const u8;
 
         let mut host_funcs: Vec<Arc<dyn HostFunc>> = Vec::new();
@@ -461,10 +480,10 @@ impl AotInstance {
             .iter()
             .map(|segment| segment.init.clone())
             .collect();
-        let data_available: Vec<bool> = module
+        let data_available: Vec<AtomicBool> = module
             .data
             .iter()
-            .map(|segment| !matches!(segment.kind, DataKind::Active { .. }))
+            .map(|segment| AtomicBool::new(!matches!(segment.kind, DataKind::Active { .. })))
             .collect();
         let elem_segments: Vec<Vec<u32>> = module
             .elem_funcs
@@ -482,10 +501,10 @@ impl AotInstance {
                     .collect()
             })
             .collect();
-        let elem_available: Vec<bool> = module
+        let elem_available: Vec<AtomicBool> = module
             .elems
             .iter()
-            .map(|segment| matches!(segment.kind, ElemKind::Passive))
+            .map(|segment| AtomicBool::new(matches!(segment.kind, ElemKind::Passive)))
             .collect();
 
         let rt_store = Arc::new(Mutex::new(Store::new()));
@@ -500,6 +519,7 @@ impl AotInstance {
             data_available,
             elem_segments,
             elem_available,
+            meter: Arc::new(InstanceMeter::new()),
         });
 
         let dangling: *const u8 = std::ptr::NonNull::<u8>::dangling().as_ptr();
@@ -561,6 +581,11 @@ impl AotInstance {
         // Run the start function, if any, after the instance is fully wired.
         if let Some(start) = module.start {
             instance.invoke_start(start)?;
+            // The start function runs through `invoke`, which sets the
+            // shared context's stack limit for the instantiating thread;
+            // re-disable it so concurrent invocations on other threads never
+            // check against it (see the `stack_limit` comment above).
+            instance.ctx.stack_limit = 0;
         }
 
         Ok(instance)
@@ -621,6 +646,12 @@ impl AotInstance {
     }
 
     /// Invokes a function export by name.
+    ///
+    /// Single-threaded entry: refreshes the shared context's thread-relative
+    /// stack limit before entering native code, so imported and indirect
+    /// callees (which read the limit from the instance context) see this
+    /// thread's bound. For concurrent invocations of one instance from many
+    /// threads, use [`invoke_export_shared`](Self::invoke_export_shared).
     pub fn invoke_export(&mut self, name: &str, args: &[WasmValue]) -> Result<Vec<WasmValue>> {
         let index = self
             .export_func_index(name)
@@ -628,8 +659,48 @@ impl AotInstance {
         self.invoke(index, args)
     }
 
+    /// Invokes a function export by name on a shared instance.
+    ///
+    /// Concurrent entry: takes `&self` so the instance can be wrapped in an
+    /// `Arc` and invoked from many threads at once. Each invocation runs with
+    /// its own execution context — a copy of the instance context carrying
+    /// this thread's stack limit — so concurrent invocations never write the
+    /// shared context and each keeps independent locals and control flow on
+    /// its own native stack.
+    pub fn invoke_export_shared(&self, name: &str, args: &[WasmValue]) -> Result<Vec<WasmValue>> {
+        let index = self
+            .export_func_index(name)
+            .ok_or_else(|| WasmError::Runtime(format!("function export '{name}' not found")))?;
+        self.invoke_shared(index, args)
+    }
+
     /// Invokes the function `func_idx` natively.
+    ///
+    /// Single-threaded entry; see [`invoke_export`](Self::invoke_export).
     pub fn invoke(&mut self, func_idx: u32, args: &[WasmValue]) -> Result<Vec<WasmValue>> {
+        self.ctx.stack_limit = traps::thread_stack_limit(MAX_WASM_STACK);
+        self.invoke_with_context(func_idx, args, &self.ctx)
+    }
+
+    /// Invokes the function `func_idx` natively on a shared instance.
+    ///
+    /// Concurrent entry; see [`invoke_export_shared`](Self::invoke_export_shared).
+    pub fn invoke_shared(&self, func_idx: u32, args: &[WasmValue]) -> Result<Vec<WasmValue>> {
+        // Per-invocation execution context: a copy of the instance context
+        // with this thread's stack bound. Direct calls propagate it, so the
+        // whole invocation (entry and same-module callees) checks a correct,
+        // thread-relative limit while leaving the shared context untouched.
+        let mut context = *self.ctx.as_ref();
+        context.stack_limit = traps::thread_stack_limit(MAX_WASM_STACK);
+        self.invoke_with_context(func_idx, args, &context)
+    }
+
+    fn invoke_with_context(
+        &self,
+        func_idx: u32,
+        args: &[WasmValue],
+        context: &VmCtx,
+    ) -> Result<Vec<WasmValue>> {
         let function = self
             .functions
             .iter()
@@ -647,11 +718,6 @@ impl AotInstance {
         let arg_slots: Vec<u64> = args.iter().map(value_to_slot).collect();
         let mut result_slots = vec![0u64; func_type.results.len()];
 
-        // The per-invocation stack limit bounds wasm recursion; it is
-        // thread-relative so cross-module callees (which carry their own
-        // vmctx) see a consistent bound.
-        self.ctx.stack_limit = traps::thread_stack_limit(MAX_WASM_STACK);
-
         // SAFETY: offsets were validated against the code image length by the
         // loader; the trampoline and callee were emitted for this signature.
         let trampoline_ptr = unsafe { self.image.entry().add(function.trampoline_offset as usize) };
@@ -662,7 +728,7 @@ impl AotInstance {
         // returns here as `Err(Trap(code))` via the process-wide handler.
         traps::catch_traps(|| unsafe {
             trampoline(
-                self.ctx.as_ref(),
+                context,
                 callee,
                 arg_slots.as_ptr(),
                 result_slots.as_mut_ptr(),
@@ -671,7 +737,42 @@ impl AotInstance {
 
         decode_results(&result_slots, func_type)
     }
+
+    /// Sets or resets the instance's memory budget (maximum committed page
+    /// count); `None` means unbounded.
+    ///
+    /// Enforced by the native `memory.grow` libcall *inside* the grow
+    /// critical section (the memory lock), so concurrent grows cannot both
+    /// pass the check and push the instance past its budget.
+    pub fn set_memory_budget(&self, budget: Option<u32>) -> Result<()> {
+        self._dispatch.meter.set_memory_budget(budget)
+    }
+
+    /// Returns a snapshot of the instance's metering data: committed owned
+    /// memory pages (shared-region pages excluded) and executed-instruction
+    /// count. The AOT path does not charge instructions, so the count is
+    /// always zero; the page count is authoritative.
+    pub fn stats(&self) -> Result<InstanceStats> {
+        let pages = self._memories.iter().try_fold(0u32, |acc, memory| {
+            let pages = memory.lock().map_err(|_| poisoned_lock())?.size();
+            acc.checked_add(pages)
+                .ok_or_else(|| WasmError::Runtime("memory page count overflowed".to_string()))
+        })?;
+        Ok(self._dispatch.meter.snapshot(pages))
+    }
 }
+
+// SAFETY: an `AotInstance` shares no mutable state across threads while it is
+// being invoked. The compiled image, function/type/global/table/memory
+// descriptor arrays and the shared store are immutable after instantiation;
+// memory and table mutations are serialised behind their mutexes; the dispatch
+// state's mutable segment-availability flags are atomics; and each concurrent
+// invocation uses a per-invocation context copy, never writing the shared
+// context. (`invoke`/`invoke_export` mutate the shared context's stack limit
+// but require `&mut self`, so they cannot race with shared invocations.)
+unsafe impl Send for AotInstance {}
+
+unsafe impl Sync for AotInstance {}
 
 impl LibcallTable {
     fn new() -> Box<Self> {
@@ -748,12 +849,12 @@ fn check_memory_range(memory: &Memory, addr: u32, len: u32) -> Result<()> {
 /// `data.drop`: marks data segment `seg_idx` no longer available.
 unsafe extern "C" fn data_drop(ctx: *const u8, seg_idx: u64) -> u64 {
     // SAFETY: the dispatch state outlives the native call.
-    let Some(dispatch) = (unsafe { dispatch_mut(ctx) }) else {
+    let Some(dispatch) = (unsafe { dispatch(ctx) }) else {
         return LIBCALL_TRAP;
     };
-    match dispatch.data_available.get_mut(seg_idx as usize) {
+    match dispatch.data_available.get(seg_idx as usize) {
         Some(flag) => {
-            *flag = false;
+            flag.store(false, Ordering::SeqCst);
             0
         }
         None => LIBCALL_TRAP,
@@ -794,21 +895,6 @@ fn dispatch_memory(ctx: *const u8, mem_idx: u64) -> Result<Arc<Mutex<Memory>>> {
         .ok_or_else(|| WasmError::Runtime(format!("memory {mem_idx} not found")))
 }
 
-/// Borrows the per-instance dispatch state mutably.
-///
-/// # Safety
-/// `ctx` must point at a live [`VmCtx`] whose `dispatch` references a live
-/// [`AotDispatchState`] for the duration of the native call, and no other
-/// reference to that state may be alive during the borrow.
-unsafe fn dispatch_mut<'a>(ctx: *const u8) -> Option<&'a mut AotDispatchState> {
-    let vmctx = unsafe { &*(ctx as *const VmCtx) };
-    if vmctx.dispatch.is_null() {
-        None
-    } else {
-        Some(unsafe { &mut *(vmctx.dispatch as *mut AotDispatchState) })
-    }
-}
-
 /// Resolves an instance table by index from the dispatch state.
 fn dispatch_table(ctx: *const u8, table_idx: u64) -> Result<Arc<Mutex<AotTable>>> {
     // SAFETY: `ctx` is a live `VmCtx` for the native call's duration.
@@ -824,12 +910,12 @@ fn dispatch_table(ctx: *const u8, table_idx: u64) -> Result<Arc<Mutex<AotTable>>
 /// `elem.drop`: marks element segment `seg_idx` no longer available.
 unsafe extern "C" fn elem_drop(ctx: *const u8, seg_idx: u64) -> u64 {
     // SAFETY: the dispatch state outlives the native call.
-    let Some(dispatch) = (unsafe { dispatch_mut(ctx) }) else {
+    let Some(dispatch) = (unsafe { dispatch(ctx) }) else {
         return LIBCALL_TRAP;
     };
-    match dispatch.elem_available.get_mut(seg_idx as usize) {
+    match dispatch.elem_available.get(seg_idx as usize) {
         Some(flag) => {
-            *flag = false;
+            flag.store(false, Ordering::SeqCst);
             0
         }
         None => LIBCALL_TRAP,
@@ -1005,16 +1091,55 @@ fn memory_fill_impl(ctx: *const u8, mem_idx: u64, dst: u64, val: u64, len: u64) 
     Ok(())
 }
 
-/// `memory.grow`: grows by `delta` pages; returns the old size or `-1`.
+/// `memory.grow`: grows memory `mem_idx` by `delta` pages; returns the old
+/// size or `-1`.
+///
+/// The instance meter's memory-page budget is checked *inside* the grow
+/// critical section, so concurrent grows cannot both pass the check and push
+/// the instance past its configured budget. The critical section is the
+/// instance's full memory-lock set (taken in ascending index order; only
+/// this libcall ever holds more than one memory lock, so the order cannot
+/// deadlock) because the budget counts committed pages across the whole
+/// instance — matching the interpreter's grow path and `stats` — and
+/// concurrent invocations growing *different* memories must not race the
+/// check either. A budget overrun traps with `MemoryLimitExceeded`
+/// (matching the interpreter's guest `memory.grow`); declared-maximum
+/// failures keep returning `-1`, which the specification permits for any
+/// grow failure.
 unsafe extern "C" fn memory_grow(ctx: *const u8, mem_idx: u64, delta: u64) -> u64 {
-    let Ok(memory) = dispatch_memory(ctx, mem_idx) else {
+    // Resolving `mem_idx` also validates it against the dispatch state's
+    // memory directory.
+    if dispatch_memory(ctx, mem_idx).is_err() {
+        return u64::from(u32::MAX);
+    }
+    // SAFETY: the dispatch state outlives the native call.
+    let Some(dispatch) = (unsafe { dispatch(ctx) }) else {
         return u64::from(u32::MAX);
     };
-    match memory.lock() {
-        Ok(mut memory) => match memory.grow(delta as u32) {
-            Ok(old) => u64::from(old),
-            Err(_) => u64::from(u32::MAX),
-        },
+
+    let mut guards = Vec::with_capacity(dispatch.memories.len());
+    for memory in &dispatch.memories {
+        match memory.lock() {
+            Ok(guard) => guards.push(guard),
+            Err(_) => return u64::from(u32::MAX),
+        }
+    }
+
+    let Some(total) = guards
+        .iter()
+        .try_fold(0u32, |acc, memory| acc.checked_add(memory.size()))
+    else {
+        return u64::from(u32::MAX);
+    };
+    let Some(new_total) = total.checked_add(delta as u32) else {
+        return u64::from(u32::MAX);
+    };
+    if dispatch.meter.ensure_memory_pages(new_total).is_err() {
+        return LIBCALL_TRAP;
+    }
+    // The index was validated against this same directory above.
+    match guards[mem_idx as usize].grow(delta as u32) {
+        Ok(old) => u64::from(old),
         Err(_) => u64::from(u32::MAX),
     }
 }
@@ -1054,7 +1179,11 @@ fn memory_init_impl(
         .data_segments
         .get(seg_idx as usize)
         .ok_or_else(|| WasmError::Runtime(format!("data segment {seg_idx} not found")))?;
-    let available = dispatch.data_available.get(seg_idx as usize) == Some(&true);
+    let available = dispatch
+        .data_available
+        .get(seg_idx as usize)
+        .map(|flag| flag.load(Ordering::SeqCst))
+        == Some(true);
     let segment_len = if available { segment.len() as u32 } else { 0 };
     let src_end = src.checked_add(len).ok_or_else(oob_trap)?;
     if src_end > segment_len {
@@ -1124,7 +1253,11 @@ fn memory_wait(
     }
     let memory = dispatch_memory(ctx, mem_idx)?;
 
-    {
+    // Bounds-checked read, compare, and waiter registration happen under the
+    // memory lock; the registry keeps the waiter reachable after the lock
+    // drops, so the park below never holds the memory lock — a parked waiter
+    // must not block a notifier on another thread.
+    let registry = {
         let memory = memory.lock().map_err(|_| poisoned_lock())?;
         // Mirrors the interpreter's `do_wait`: bounds-checked read, compare,
         // then register a waiter before dropping the lock to sleep.
@@ -1136,8 +1269,8 @@ fn memory_wait(
         if actual != expected as i64 {
             return Ok(1);
         }
-        memory.get_waiter(addr);
-    }
+        memory.waiter_registry(addr)
+    };
 
     // Nanosecond timeout: negative means wait forever.
     let timeout_ns = if (timeout as i64) < 0 {
@@ -1146,10 +1279,7 @@ fn memory_wait(
         timeout
     };
 
-    let woken = memory
-        .lock()
-        .map_err(|_| poisoned_lock())?
-        .wait_on(addr, timeout_ns);
+    let woken = registry.park(timeout_ns);
     Ok(if woken { 0 } else { 2 })
 }
 
@@ -1342,7 +1472,11 @@ fn table_init_impl(
         .elem_segments
         .get(seg_idx as usize)
         .ok_or_else(|| WasmError::Runtime(format!("element segment {seg_idx} not found")))?;
-    let available = dispatch.elem_available.get(seg_idx as usize) == Some(&true);
+    let available = dispatch
+        .elem_available
+        .get(seg_idx as usize)
+        .map(|flag| flag.load(Ordering::SeqCst))
+        == Some(true);
     let segment_len = if available { segment.len() as u32 } else { 0 };
     if src_end > segment_len {
         return Err(table_trap());

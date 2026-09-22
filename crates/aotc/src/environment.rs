@@ -40,7 +40,7 @@ use cranelift_codegen::{
     ir::{self, AbiParam, InstBuilder, Signature, Value, types},
     isa::CallConv,
 };
-use cranelift_entity::{EntityRef, PrimaryMap, SecondaryMap};
+use cranelift_entity::{EntityRef, PrimaryMap};
 use cranelift_frontend::FunctionBuilder;
 use wasmparser::{ValType, WasmFeatures};
 
@@ -314,12 +314,17 @@ pub struct TableData {
 }
 
 /// Per-function translation environment, borrowing immutable module info while
-/// accumulating function-local state (global/table maps, memoised call
-/// targets).
+/// accumulating function-scoped declarations (memoised signatures and call
+/// targets, which are Cranelift function-level entities rather than SSA values).
+///
+/// Note: table and global *addresses* are deliberately not memoised here. The
+/// vmctx-derived base pointers are ordinary CLIF `Value`s defined at the point
+/// of first use, and reusing one across basic blocks would not be valid: the
+/// defining block does not necessarily dominate later uses, producing a
+/// Cranelift verifier dominance error. Each lowering re-materialises those
+/// loads at its own insertion point instead.
 pub struct FuncEnv<'info> {
     mod_info: &'info ModuleInfo,
-    tables: SecondaryMap<TableIndex, Option<TableData>>,
-    globals: HashMap<GlobalIndex, GlobalVar>,
     indirect_sigs: HashMap<TypeIndex, (ir::SigRef, usize)>,
     direct_funcs: HashMap<FuncIndex, (ir::FuncRef, usize)>,
 }
@@ -559,8 +564,6 @@ impl<'info> FuncEnv<'info> {
     pub(crate) fn new(mod_info: &'info ModuleInfo) -> Self {
         Self {
             mod_info,
-            tables: SecondaryMap::new(),
-            globals: HashMap::new(),
             indirect_sigs: HashMap::new(),
             direct_funcs: HashMap::new(),
         }
@@ -639,15 +642,16 @@ impl<'info> FuncEnv<'info> {
             .load(ty, flags, array, Offset32::new(elem_offset + field_offset))
     }
 
-    /// Returns the `GlobalVar` for `index`, creating it on first use.
+    /// Returns the `GlobalVar` for `index`.
+    ///
+    /// The base pointer is re-loaded at the current insertion point on every
+    /// call. Caching the loaded `Value` across blocks would be invalid: the
+    /// defining block does not necessarily dominate later uses.
     pub fn make_global(
         &mut self,
         builder: &mut FunctionBuilder,
         index: GlobalIndex,
     ) -> crate::error::CompileResult<GlobalVar> {
-        if let Some(var) = self.globals.get(&index) {
-            return Ok(*var);
-        }
         let ty = match self.mod_info.globals[index].0.wasm_ty {
             ValType::I32 => types::I32,
             ValType::I64 => types::I64,
@@ -666,15 +670,20 @@ impl<'info> FuncEnv<'info> {
             offset: Offset32::new((index.index() as i32) * GLOBAL_CELL_SIZE),
             ty,
         };
-        self.globals.insert(index, var);
         Ok(var)
     }
 
-    fn ensure_table(&mut self, builder: &mut FunctionBuilder, index: TableIndex) {
-        if self.tables[index].is_some() {
-            return;
-        }
-
+    /// Returns the runtime-facing table data for `index`, re-materialising the
+    /// vmctx-derived base and bound loads at the current insertion point.
+    ///
+    /// The loaded values are ordinary SSA `Value`s and must not be cached
+    /// across basic blocks (the defining block would not necessarily dominate
+    /// later uses), so every caller lowers a fresh copy here.
+    pub fn get_table(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        index: TableIndex,
+    ) -> crate::error::CompileResult<TableData> {
         let table = self.mod_info.tables[index];
         // `vmctx.tables[i]` holds a pointer to the shared cells holder; the
         // holder pointer itself is fixed at instantiation, so the slot load
@@ -704,7 +713,9 @@ impl<'info> FuncEnv<'info> {
         } else {
             // The element count advances on `table.grow`; the load must not
             // be readonly or the optimizer could hoist it out of loops and
-            // use a stale bound.
+            // use a stale bound. It is also re-loaded on every access (rather
+            // than memoised) so a `table.grow` earlier in the same function is
+            // observed by subsequent accesses.
             let trusted_flags = cranelift_codegen::ir::MemFlagsData::trusted();
             TableSize::Dynamic {
                 bound: builder.ins().load(
@@ -716,21 +727,11 @@ impl<'info> FuncEnv<'info> {
             }
         };
 
-        self.tables[index] = Some(TableData {
+        Ok(TableData {
             base,
             bound,
             element_size: 4,
-        });
-    }
-
-    /// Returns the memoised table data for `index`, creating it if needed.
-    pub fn get_table(
-        &mut self,
-        builder: &mut FunctionBuilder,
-        index: TableIndex,
-    ) -> crate::error::CompileResult<TableData> {
-        self.ensure_table(builder, index);
-        Ok(self.tables[index].as_ref().expect("table created").clone())
+        })
     }
 
     /// Returns the memoised indirect-call signature for `index` and the

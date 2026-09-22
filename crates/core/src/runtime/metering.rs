@@ -1,6 +1,7 @@
 use super::{Result, TrapCode, WasmError};
-use crate::memory::PAGE_SIZE_BYTES;
 use parking_lot::RwLock;
+
+use crate::memory::PAGE_SIZE_BYTES;
 
 /// Snapshot of a per-instance meter.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

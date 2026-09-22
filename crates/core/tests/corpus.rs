@@ -178,13 +178,6 @@ impl Verdict {
     }
 }
 
-/// Scratch root for test output: Cargo's per-package tmp dir for
-/// integration tests (inside the real build `target/`, never the
-/// source tree), so generated fixtures stay out of `crates/core/`.
-fn tmp_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-}
-
 fn build_dir() -> PathBuf {
     let dir = tmp_root().join("corpus-build");
     fs::create_dir_all(&dir).expect("create corpus build dir");
@@ -752,6 +745,13 @@ fn shared_region_boundary_probes_are_denied() {
         ro_write.is_err(),
         "write to read-only region must be denied, got {ro_write:?}"
     );
+}
+
+/// Scratch root for test output: Cargo's per-package tmp dir for
+/// integration tests (inside the real build `target/`, never the
+/// source tree), so generated fixtures stay out of `crates/core/`.
+fn tmp_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
 }
 
 // trapped: OOB load past a 1-page memory.

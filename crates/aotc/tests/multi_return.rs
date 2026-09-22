@@ -19,6 +19,28 @@ use wasmtiny::{
 };
 use wasmtiny_aotc::{CompileError, CompilerConfig, compile_artifact};
 
+/// Host-call stub: an imported host function with 9 i64 results, invoked from
+/// compiled wasm. The stub's machine ABI gets the hidden return-area pointer
+/// and the caller must pass one too.
+struct NineHost;
+
+impl HostFunc for NineHost {
+    fn call(&self, _caller: &mut HostCaller<'_>, args: &[WasmValue]) -> Result<Vec<WasmValue>> {
+        let value = args[0].i64()?;
+        Ok(vec![WasmValue::I64(value); 9])
+    }
+
+    fn function_type(&self) -> Option<&FunctionType> {
+        static TYPE: OnceLock<FunctionType> = OnceLock::new();
+        Some(TYPE.get_or_init(|| {
+            FunctionType::new(
+                vec![ValType::Num(NumType::I64)],
+                vec![ValType::Num(NumType::I64); 9],
+            )
+        }))
+    }
+}
+
 /// Compiles for the host and asserts success.
 fn compile(source: &str) -> Vec<u8> {
     let wasm = wat::parse_str(source).expect("wat parses");
@@ -29,48 +51,6 @@ fn instantiate(source: &str) -> AotInstance {
     let loader = AotLoader::new();
     let module = loader.load(&compile(source)).expect("artifact loads");
     AotInstance::new(&module).expect("instantiation succeeds")
-}
-
-/// The same 9-i64-result function, spelled in a few ways, forced through the
-/// entry trampoline.
-#[test]
-fn nine_i64_results_via_trampoline() {
-    let mut instance = instantiate(
-        "(module (func (export \"f\") (param i64)
-           (result i64 i64 i64 i64 i64 i64 i64 i64 i64)
-           (local.get 0) (local.get 0) (local.get 0) (local.get 0) (local.get 0)
-           (local.get 0) (local.get 0) (local.get 0) (local.get 0)))",
-    );
-    let results = instance
-        .invoke(0, &[WasmValue::I64(7)])
-        .expect("invoke succeeds");
-    assert_eq!(results.len(), 9);
-    assert!(
-        results.iter().all(|v| *v == WasmValue::I64(7)),
-        "{results:?}"
-    );
-}
-
-/// wasm -> wasm direct call where the callee's results overflow the return
-/// registers: the caller must pass the hidden return-area pointer.
-#[test]
-fn nine_i64_results_direct_call() {
-    let mut instance = instantiate(
-        "(module
-           (func $nine (param i64) (result i64 i64 i64 i64 i64 i64 i64 i64 i64)
-             (local.get 0) (local.get 0) (local.get 0) (local.get 0) (local.get 0)
-             (local.get 0) (local.get 0) (local.get 0) (local.get 0))
-           (func (export \"caller\") (param i64) (result i64 i64 i64 i64 i64 i64 i64 i64 i64)
-             (call $nine (local.get 0))))",
-    );
-    let results = instance
-        .invoke(1, &[WasmValue::I64(3)])
-        .expect("invoke succeeds");
-    assert_eq!(results.len(), 9);
-    assert!(
-        results.iter().all(|v| *v == WasmValue::I64(3)),
-        "{results:?}"
-    );
 }
 
 /// wasm -> wasm call_indirect through a table where the callee's results
@@ -94,60 +74,6 @@ fn nine_i64_results_call_indirect() {
     assert_eq!(results.len(), 9);
     assert!(
         results.iter().all(|v| *v == WasmValue::I64(5)),
-        "{results:?}"
-    );
-}
-
-/// Host-call stub: an imported host function with 9 i64 results, invoked from
-/// compiled wasm. The stub's machine ABI gets the hidden return-area pointer
-/// and the caller must pass one too.
-struct NineHost;
-
-impl HostFunc for NineHost {
-    fn call(&self, _caller: &mut HostCaller<'_>, args: &[WasmValue]) -> Result<Vec<WasmValue>> {
-        let value = args[0].i64()?;
-        Ok(vec![WasmValue::I64(value); 9])
-    }
-
-    fn function_type(&self) -> Option<&FunctionType> {
-        static TYPE: OnceLock<FunctionType> = OnceLock::new();
-        Some(TYPE.get_or_init(|| {
-            FunctionType::new(
-                vec![ValType::Num(NumType::I64)],
-                vec![ValType::Num(NumType::I64); 9],
-            )
-        }))
-    }
-}
-
-#[test]
-fn nine_i64_results_host_import() {
-    let loader = AotLoader::new();
-    let module = loader
-        .load(&compile(
-            "(module
-               (import \"env\" \"nine\" (func $nine (param i64)
-                  (result i64 i64 i64 i64 i64 i64 i64 i64 i64)))
-               (func (export \"main\") (param i64)
-                  (result i64 i64 i64 i64 i64 i64 i64 i64 i64)
-                  (call $nine (local.get 0))))",
-        ))
-        .expect("artifact loads");
-
-    let imports = [(
-        "env".to_string(),
-        "nine".to_string(),
-        AotExtern::HostFunc(Arc::new(NineHost)),
-    )];
-    let mut instance = AotInstance::instantiate(&AotStore::shared(), &module, &imports)
-        .expect("instantiation succeeds");
-
-    let results = instance
-        .invoke(1, &[WasmValue::I64(11)])
-        .expect("invoke succeeds");
-    assert_eq!(results.len(), 9);
-    assert!(
-        results.iter().all(|v| *v == WasmValue::I64(11)),
         "{results:?}"
     );
 }
@@ -193,6 +119,80 @@ fn nine_i64_results_cross_module() {
     assert_eq!(results.len(), 9);
     assert!(
         results.iter().all(|v| *v == WasmValue::I64(13)),
+        "{results:?}"
+    );
+}
+
+/// wasm -> wasm direct call where the callee's results overflow the return
+/// registers: the caller must pass the hidden return-area pointer.
+#[test]
+fn nine_i64_results_direct_call() {
+    let mut instance = instantiate(
+        "(module
+           (func $nine (param i64) (result i64 i64 i64 i64 i64 i64 i64 i64 i64)
+             (local.get 0) (local.get 0) (local.get 0) (local.get 0) (local.get 0)
+             (local.get 0) (local.get 0) (local.get 0) (local.get 0))
+           (func (export \"caller\") (param i64) (result i64 i64 i64 i64 i64 i64 i64 i64 i64)
+             (call $nine (local.get 0))))",
+    );
+    let results = instance
+        .invoke(1, &[WasmValue::I64(3)])
+        .expect("invoke succeeds");
+    assert_eq!(results.len(), 9);
+    assert!(
+        results.iter().all(|v| *v == WasmValue::I64(3)),
+        "{results:?}"
+    );
+}
+
+#[test]
+fn nine_i64_results_host_import() {
+    let loader = AotLoader::new();
+    let module = loader
+        .load(&compile(
+            "(module
+               (import \"env\" \"nine\" (func $nine (param i64)
+                  (result i64 i64 i64 i64 i64 i64 i64 i64 i64)))
+               (func (export \"main\") (param i64)
+                  (result i64 i64 i64 i64 i64 i64 i64 i64 i64)
+                  (call $nine (local.get 0))))",
+        ))
+        .expect("artifact loads");
+
+    let imports = [(
+        "env".to_string(),
+        "nine".to_string(),
+        AotExtern::HostFunc(Arc::new(NineHost)),
+    )];
+    let mut instance = AotInstance::instantiate(&AotStore::shared(), &module, &imports)
+        .expect("instantiation succeeds");
+
+    let results = instance
+        .invoke(1, &[WasmValue::I64(11)])
+        .expect("invoke succeeds");
+    assert_eq!(results.len(), 9);
+    assert!(
+        results.iter().all(|v| *v == WasmValue::I64(11)),
+        "{results:?}"
+    );
+}
+
+/// The same 9-i64-result function, spelled in a few ways, forced through the
+/// entry trampoline.
+#[test]
+fn nine_i64_results_via_trampoline() {
+    let mut instance = instantiate(
+        "(module (func (export \"f\") (param i64)
+           (result i64 i64 i64 i64 i64 i64 i64 i64 i64)
+           (local.get 0) (local.get 0) (local.get 0) (local.get 0) (local.get 0)
+           (local.get 0) (local.get 0) (local.get 0) (local.get 0)))",
+    );
+    let results = instance
+        .invoke(0, &[WasmValue::I64(7)])
+        .expect("invoke succeeds");
+    assert_eq!(results.len(), 9);
+    assert!(
+        results.iter().all(|v| *v == WasmValue::I64(7)),
         "{results:?}"
     );
 }

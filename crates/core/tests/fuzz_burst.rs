@@ -181,12 +181,6 @@ fn manifest_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// Cargo's scratch dir for integration-test output (inside the real
-/// build `target/`, not the source tree).
-fn tmp_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-}
-
 fn run_burst(seeds: &Path, extra: &[&str]) -> std::process::Output {
     let mut cmd = Command::new(fuzz_bin());
     cmd.arg("--seeds")
@@ -201,4 +195,10 @@ fn run_burst(seeds: &Path, extra: &[&str]) -> std::process::Output {
         cmd.arg(arg);
     }
     cmd.output().expect("run fuzz burst")
+}
+
+/// Cargo's scratch dir for integration-test output (inside the real
+/// build `target/`, not the source tree).
+fn tmp_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
 }

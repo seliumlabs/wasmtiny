@@ -1,6 +1,6 @@
-//! Cranelift `ModuleEnvironment` / `FuncEnvironment` implementations that bind
-//! WebAssembly modules to the wasmtiny runtime's calling convention and
-//! per-instance context layout.
+//! Compiler-side module and per-function environments that bind WebAssembly
+//! modules to the wasmtiny runtime's calling convention and per-instance
+//! context layout.
 //!
 //! # Calling convention
 //!
@@ -16,24 +16,40 @@
 //! runtime's `src/aot/` execution glue. The runtime crate does not link this
 //! compiler, so the offsets are deliberately duplicated (and documented) on
 //! the runtime side rather than shared as a type.
+//!
+//! # Wasm translation
+//!
+//! The standalone `cranelift-wasm` crate is discontinued (its last release,
+//! 0.112, is version-incompatible with the current `cranelift-codegen`), so
+//! this crate owns the wasm→CLIF translation: `wasmparser` validates and
+//! parses, `crate::translate` drives the operator stream, and [`FuncEnv`]
+//! lowers every runtime-facing construct (calls, memories, tables, globals,
+//! libcalls) against the vmctx layout.
+//!
+//! Parts of `FuncEnv`'s lowering surface (notably `TableData` and its
+//! `prepare_table_addr` bounds check, and the former `FuncEnvironment` hook
+//! shapes) are derived from `cranelift-wasm` (Apache-2.0 WITH
+//! LLVM-exception); those parts remain under that license — see the
+//! attribution note at the top of `crate::translate`.
+
+use std::collections::HashMap;
 
 use cranelift_codegen::{
     cursor::FuncCursor,
     ir::immediates::Offset32,
-    ir::{self, AbiParam, InstBuilder, MemFlags, Signature, UserFuncName, Value, types},
-    isa::{CallConv, TargetFrontendConfig},
+    ir::{self, AbiParam, InstBuilder, Signature, Value, types},
+    isa::CallConv,
 };
 use cranelift_entity::{EntityRef, PrimaryMap, SecondaryMap};
-use cranelift_wasm::{
-    ConstExpr, DataIndex, DefinedFuncIndex, ElemIndex, EngineOrModuleTypeIndex, FuncIndex,
-    FuncTranslator, FunctionBuilder, Global, GlobalIndex, GlobalVariable, Heap, HeapData,
-    HeapStyle, Memory, MemoryIndex, ModuleEnvironment, ModuleInternedTypeIndex, Table, TableData,
-    TableIndex, TableSize, TargetEnvironment, TypeConvert, TypeIndex, WasmError, WasmFuncType,
-    WasmHeapType, WasmResult, WasmValType,
-};
-use wasmparser::{FuncValidator, FunctionBody, UnpackedIndex, ValidatorResources, WasmFeatures};
+use cranelift_frontend::FunctionBuilder;
+use wasmparser::{ValType, WasmFeatures};
 
 use crate::error::CompileError;
+use crate::types::{ConstExpr, Global, GlobalIndex, Memory, MemoryIndex, Table, TableIndex};
+
+// Re-export the index types used across the crate (they are defined in
+// `crate::types` because they pre-date the translation module split).
+pub use crate::types::{DefinedFuncIndex, FuncIndex, TypeIndex};
 
 /// Size in bytes of a single global cell.
 pub const GLOBAL_CELL_SIZE: i32 = 8;
@@ -186,23 +202,24 @@ pub enum ElemSegKind {
 pub struct ElemSegRecord {
     /// Placement mode.
     pub kind: ElemSegKind,
-    /// Function indices (or `reserved` for null) stored in the segment.
-    pub elements: Vec<FuncIndex>,
+    /// Function indices (or `FuncIndex::reserved_value()` for `ref.null`)
+    /// stored in the segment.
+    pub elements: Vec<crate::types::FuncIndex>,
 }
 
 /// The module-level state gathered during translation.
 pub struct ModuleInfo {
     /// Target description relevant to frontends producing Cranelift IR.
-    pub config: TargetFrontendConfig,
+    pub config: cranelift_codegen::isa::TargetFrontendConfig,
     /// Calling convention used for all functions.
     pub call_conv: CallConv,
     /// Signatures indexed by wasm signature type index (no `vmctx` parameter).
     pub signatures: PrimaryMap<TypeIndex, Signature>,
     /// Original wasm function types, preserving reference-type distinctions
     /// that the CLIF signatures erase (funcref vs externref).
-    pub wasm_types: PrimaryMap<TypeIndex, WasmFuncType>,
+    pub wasm_types: PrimaryMap<TypeIndex, wasmparser::FuncType>,
     /// Function type index for each function (imported first, then defined).
-    pub functions: PrimaryMap<FuncIndex, TypeIndex>,
+    pub functions: PrimaryMap<crate::types::FuncIndex, TypeIndex>,
     /// Imported functions.
     pub imported_funcs: Vec<FuncImport>,
     /// Imported tables.
@@ -219,9 +236,9 @@ pub struct ModuleInfo {
     /// Imports have `None`; defined globals carry their const initialiser.
     pub globals: PrimaryMap<GlobalIndex, (Global, Option<ConstExpr>)>,
     /// Translated machine-function bodies, indexed by defined function.
-    pub function_bodies: PrimaryMap<DefinedFuncIndex, ir::Function>,
+    pub function_bodies: PrimaryMap<crate::types::DefinedFuncIndex, ir::Function>,
     /// Function exports.
-    pub func_exports: Vec<(FuncIndex, String)>,
+    pub func_exports: Vec<(crate::types::FuncIndex, String)>,
     /// Table exports.
     pub table_exports: Vec<(TableIndex, String)>,
     /// Memory exports.
@@ -229,28 +246,84 @@ pub struct ModuleInfo {
     /// Global exports.
     pub global_exports: Vec<(GlobalIndex, String)>,
     /// The optional start function.
-    pub start_func: Option<FuncIndex>,
+    pub start_func: Option<crate::types::FuncIndex>,
     /// Data segments in unified index order (active and passive interleaved).
     pub data_segments: Vec<DataSegRecord>,
     /// Element segments in unified index order (active, passive, declarative).
     pub elem_segments: Vec<ElemSegRecord>,
 }
 
-/// The compiler-side `ModuleEnvironment`, driving module-level translation and
+/// The compiler-side module state, driving module-level translation and
 /// accumulating everything needed to emit an artifact.
 pub struct Translator {
     /// Module information gathered from declarations.
     pub info: ModuleInfo,
     /// Function body translator.
-    pub trans: FuncTranslator,
+    pub trans: crate::translate::FuncTranslator,
 }
 
-/// Per-function translation environment, borrowing immutable module info while
-/// accumulating function-local state (heaps, tables maps).
-pub struct FuncEnv<'info> {
-    mod_info: &'info ModuleInfo,
-    heaps: PrimaryMap<Heap, HeapData>,
-    tables: SecondaryMap<TableIndex, Option<TableData>>,
+/// A runtime-facing global variable: the base pointer plus per-cell offset.
+#[derive(Clone, Copy)]
+pub struct GlobalVar {
+    /// CLIF value materialising the `vmctx.globals` base pointer.
+    pub base: Value,
+    /// Byte offset of this global's 8-byte cell.
+    pub offset: Offset32,
+    /// CLIF type of the cell.
+    pub ty: ir::Type,
+}
+
+/// A runtime-facing table: the element-array base plus its bounds.
+#[derive(Clone)]
+pub struct TableData {
+    /// CLIF value materialising the table's element-array base pointer.
+    pub base: Value,
+    /// The size of the table, in elements.
+    pub bound: TableSize,
+    /// The size of a table element, in bytes.
+    pub element_size: u32,
+}
+
+/// Size of a WebAssembly table, in elements.
+#[derive(Clone)]
+pub enum TableSize {
+    /// Non-resizable table.
+    Static {
+        /// Non-resizable tables have a constant size known at compile time.
+        bound: u32,
+    },
+    /// Resizable table.
+    Dynamic {
+        /// Resizable tables hold the current element count in a CLIF value.
+        bound: Value,
+    },
+}
+
+impl TableSize {
+    /// Get a CLIF value representing the current bounds of this table.
+    pub fn bound(&self, mut pos: FuncCursor, index_ty: ir::Type) -> ir::Value {
+        match *self {
+            TableSize::Static { bound } => pos.ins().iconst(index_ty, i64::from(bound)),
+            TableSize::Dynamic { bound } => bound,
+        }
+    }
+}
+
+/// User trap codes (encoded in `TrapCode::User(n)`), mapped to the artifact's
+/// trap-code bytes by `artifact::trap_code_byte`. The built-in trap codes
+/// (`STACK_OVERFLOW`, `HEAP_OUT_OF_BOUNDS`, `INTEGER_OVERFLOW`,
+/// `INTEGER_DIVISION_BY_ZERO`, `BAD_CONVERSION_TO_INTEGER`) carry the rest of
+/// the runtime's trap taxonomy.
+pub const USER_TRAP_UNREACHABLE: u8 = 1;
+pub const USER_TRAP_TABLE_OUT_OF_BOUNDS: u8 = 2;
+pub const USER_TRAP_CALL_INDIRECT_NULL: u8 = 3;
+pub const USER_TRAP_BAD_SIGNATURE: u8 = 4;
+pub const USER_TRAP_NULL_REFERENCE: u8 = 5;
+pub const USER_TRAP_HOST: u8 = 6;
+
+/// Creates the `TrapCode` for a user trap constant.
+pub fn user_trap(code: u8) -> ir::TrapCode {
+    ir::TrapCode::unwrap_user(code)
 }
 
 impl VmCtxOffsets {
@@ -347,7 +420,7 @@ impl TableCellsOffsets {
 
 impl ModuleInfo {
     /// Creates a new empty module info.
-    pub fn new(config: TargetFrontendConfig, call_conv: CallConv) -> Self {
+    pub fn new(config: cranelift_codegen::isa::TargetFrontendConfig, call_conv: CallConv) -> Self {
         Self {
             config,
             call_conv,
@@ -395,10 +468,10 @@ impl ModuleInfo {
 
 impl Translator {
     /// Creates a new translator.
-    pub fn new(config: TargetFrontendConfig, call_conv: CallConv) -> Self {
+    pub fn new(config: cranelift_codegen::isa::TargetFrontendConfig, call_conv: CallConv) -> Self {
         Self {
             info: ModuleInfo::new(config, call_conv),
-            trans: FuncTranslator::new(),
+            trans: crate::translate::FuncTranslator::new(),
         }
     }
 
@@ -408,281 +481,67 @@ impl Translator {
     }
 }
 
-impl TypeConvert for Translator {
-    fn lookup_heap_type(&self, index: UnpackedIndex) -> WasmHeapType {
-        match index.as_module_index() {
-            Some(idx) => {
-                let idx = ModuleInternedTypeIndex::from_u32(idx);
-                WasmHeapType::ConcreteFunc(EngineOrModuleTypeIndex::Module(idx))
-            }
-            None => WasmHeapType::Func,
-        }
-    }
-
-    fn lookup_type_index(&self, index: UnpackedIndex) -> EngineOrModuleTypeIndex {
-        match index.as_module_index() {
-            Some(idx) => EngineOrModuleTypeIndex::Module(ModuleInternedTypeIndex::from_u32(idx)),
-            None => EngineOrModuleTypeIndex::Module(ModuleInternedTypeIndex::from_u32(0)),
-        }
-    }
+/// Per-function translation environment, borrowing immutable module info while
+/// accumulating function-local state (global/table maps, memoised call
+/// targets).
+pub struct FuncEnv<'info> {
+    mod_info: &'info ModuleInfo,
+    tables: SecondaryMap<TableIndex, Option<TableData>>,
+    globals: HashMap<GlobalIndex, GlobalVar>,
+    indirect_sigs: HashMap<TypeIndex, (ir::SigRef, usize)>,
+    direct_funcs: HashMap<FuncIndex, (ir::FuncRef, usize)>,
 }
 
-impl TargetEnvironment for Translator {
-    fn target_config(&self) -> TargetFrontendConfig {
-        self.info.config
-    }
-
-    fn heap_access_spectre_mitigation(&self) -> bool {
-        true
-    }
-
-    fn proof_carrying_code(&self) -> bool {
-        false
-    }
+/// The `MemFlagsData` for a wasm linear-memory access: traps
+/// `HEAP_OUT_OF_BOUNDS`. WebAssembly alignment is a hint, not a guarantee, so
+/// the access is never marked aligned; the explicit bounds check
+/// (spectre-guarded null address) traps before the access, and a fault here is
+/// still mapped to the same trap by the runtime's signal handler.
+pub fn mem_access_flags() -> cranelift_codegen::ir::MemFlagsData {
+    cranelift_codegen::ir::MemFlagsData::new()
+        .with_trap_code(Some(ir::TrapCode::HEAP_OUT_OF_BOUNDS))
 }
 
-impl<'data> ModuleEnvironment<'data> for Translator {
-    fn declare_type_func(&mut self, wasm: WasmFuncType) -> WasmResult<()> {
-        let mut sig = Signature::new(self.info.call_conv);
-        sig.params.extend(
-            wasm.params()
-                .iter()
-                .map(|ty| AbiParam::new(wasm_type_to_clif(ty))),
-        );
-        sig.returns.extend(
-            wasm.returns()
-                .iter()
-                .map(|ty| AbiParam::new(wasm_type_to_clif(ty))),
-        );
-        self.info.wasm_types.push(wasm.clone());
-        self.info.signatures.push(sig);
-        Ok(())
-    }
-
-    fn declare_func_import(
-        &mut self,
-        index: TypeIndex,
-        module: &'data str,
-        field: &'data str,
-    ) -> WasmResult<()> {
-        self.info.functions.push(index);
-        self.info.imported_funcs.push(FuncImport {
-            module: module.to_string(),
-            field: field.to_string(),
-            type_index: index,
-        });
-        Ok(())
-    }
-
-    fn declare_table_import(
-        &mut self,
-        table: Table,
-        module: &'data str,
-        field: &'data str,
-    ) -> WasmResult<()> {
-        self.info.tables.push(table);
-        self.info.imported_tables.push(TableImport {
-            module: module.to_string(),
-            field: field.to_string(),
-            table,
-        });
-        Ok(())
-    }
-
-    fn declare_memory_import(
-        &mut self,
-        memory: Memory,
-        module: &'data str,
-        field: &'data str,
-    ) -> WasmResult<()> {
-        self.info.memories.push(memory);
-        self.info.imported_memories.push(MemoryImport {
-            module: module.to_string(),
-            field: field.to_string(),
-            memory,
-        });
-        Ok(())
-    }
-
-    fn declare_global_import(
-        &mut self,
-        global: Global,
-        module: &'data str,
-        field: &'data str,
-    ) -> WasmResult<()> {
-        self.info.globals.push((global, None));
-        self.info.imported_globals.push(GlobalImport {
-            module: module.to_string(),
-            field: field.to_string(),
-            global,
-        });
-        Ok(())
-    }
-
-    fn declare_func_type(&mut self, index: TypeIndex) -> WasmResult<()> {
-        self.info.functions.push(index);
-        Ok(())
-    }
-
-    fn declare_table(&mut self, table: Table) -> WasmResult<()> {
-        self.info.tables.push(table);
-        Ok(())
-    }
-
-    fn declare_memory(&mut self, memory: Memory) -> WasmResult<()> {
-        self.info.memories.push(memory);
-        Ok(())
-    }
-
-    fn declare_global(&mut self, global: Global, init: ConstExpr) -> WasmResult<()> {
-        self.info.globals.push((global, Some(init)));
-        Ok(())
-    }
-
-    fn declare_func_export(&mut self, func_index: FuncIndex, name: &'data str) -> WasmResult<()> {
-        self.info.func_exports.push((func_index, name.to_string()));
-        Ok(())
-    }
-
-    fn declare_table_export(
-        &mut self,
-        table_index: TableIndex,
-        name: &'data str,
-    ) -> WasmResult<()> {
-        self.info
-            .table_exports
-            .push((table_index, name.to_string()));
-        Ok(())
-    }
-
-    fn declare_memory_export(
-        &mut self,
-        memory_index: MemoryIndex,
-        name: &'data str,
-    ) -> WasmResult<()> {
-        self.info
-            .memory_exports
-            .push((memory_index, name.to_string()));
-        Ok(())
-    }
-
-    fn declare_global_export(
-        &mut self,
-        global_index: GlobalIndex,
-        name: &'data str,
-    ) -> WasmResult<()> {
-        self.info
-            .global_exports
-            .push((global_index, name.to_string()));
-        Ok(())
-    }
-
-    fn declare_start_func(&mut self, index: FuncIndex) -> WasmResult<()> {
-        self.info.start_func = Some(index);
-        Ok(())
-    }
-
-    fn declare_table_elements(
-        &mut self,
-        table_index: TableIndex,
-        base: Option<GlobalIndex>,
-        offset: u32,
-        elements: Box<[FuncIndex]>,
-    ) -> WasmResult<()> {
-        self.info.elem_segments.push(ElemSegRecord {
-            kind: ElemSegKind::Active {
-                table_index,
-                base,
-                offset,
-            },
-            elements: elements.to_vec(),
-        });
-        Ok(())
-    }
-
-    fn declare_passive_element(
-        &mut self,
-        _index: ElemIndex,
-        elements: Box<[FuncIndex]>,
-    ) -> WasmResult<()> {
-        self.info.elem_segments.push(ElemSegRecord {
-            kind: ElemSegKind::Passive,
-            elements: elements.to_vec(),
-        });
-        Ok(())
-    }
-
-    fn declare_elements(&mut self, elements: Box<[FuncIndex]>) -> WasmResult<()> {
-        self.info.elem_segments.push(ElemSegRecord {
-            kind: ElemSegKind::Declarative,
-            elements: elements.to_vec(),
-        });
-        Ok(())
-    }
-
-    fn declare_passive_data(
-        &mut self,
-        _data_index: DataIndex,
-        data: &'data [u8],
-    ) -> WasmResult<()> {
-        self.info.data_segments.push(DataSegRecord {
-            kind: DataSegKind::Passive,
-            data: data.to_vec(),
-        });
-        Ok(())
-    }
-
-    fn define_function_body(
-        &mut self,
-        mut validator: FuncValidator<ValidatorResources>,
-        body: FunctionBody<'data>,
-    ) -> WasmResult<()> {
-        let func_index = FuncIndex::from_u32(
-            (self.info.imported_func_count() + self.info.function_bodies.len()) as u32,
-        );
-        let type_index = self.info.functions[func_index];
-        let sig = FuncEnv::new(&self.info).vmctx_sig(type_index);
-        let defined_index = self.info.function_bodies.len();
-        let mut func =
-            ir::Function::with_name_signature(UserFuncName::user(0, defined_index as u32), sig);
-
-        let mut func_env = FuncEnv::new(&self.info);
-        self.trans
-            .translate_body(&mut validator, body, &mut func, &mut func_env)?;
-        self.info.function_bodies.push(func);
-        Ok(())
-    }
-
-    fn declare_data_initialization(
-        &mut self,
-        memory_index: MemoryIndex,
-        base: Option<GlobalIndex>,
-        offset: u64,
-        data: &'data [u8],
-    ) -> WasmResult<()> {
-        self.info.data_segments.push(DataSegRecord {
-            kind: DataSegKind::Active {
-                memory_index,
-                base,
-                offset,
-            },
-            data: data.to_vec(),
-        });
-        Ok(())
-    }
-
-    fn wasm_features(&self) -> WasmFeatures {
-        wasm_features()
-    }
+/// The `MemFlagsData` for a wasm table access: traps `TABLE_OUT_OF_BOUNDS`.
+pub fn table_access_flags() -> cranelift_codegen::ir::MemFlagsData {
+    cranelift_codegen::ir::MemFlagsData::new()
+        .with_trap_code(Some(user_trap(USER_TRAP_TABLE_OUT_OF_BOUNDS)))
 }
 
 impl<'info> FuncEnv<'info> {
-    fn new(mod_info: &'info ModuleInfo) -> Self {
+    pub(crate) fn new(mod_info: &'info ModuleInfo) -> Self {
         Self {
             mod_info,
-            heaps: PrimaryMap::new(),
             tables: SecondaryMap::new(),
+            globals: HashMap::new(),
+            indirect_sigs: HashMap::new(),
+            direct_funcs: HashMap::new(),
         }
+    }
+
+    /// The pointer type of the target (always `I64`; 32-bit targets are
+    /// rejected by `build_isa`).
+    pub fn pointer_type(&self) -> ir::Type {
+        match self.mod_info.config.pointer_width {
+            target_lexicon::PointerWidth::U64 => types::I64,
+            other => panic!("unsupported pointer width {other:?}"),
+        }
+    }
+
+    /// The target's frontend configuration.
+    pub fn frontend_config(&self) -> cranelift_codegen::isa::TargetFrontendConfig {
+        self.mod_info.config
+    }
+
+    /// The immutable module info being translated.
+    pub fn module_info(&self) -> &ModuleInfo {
+        self.mod_info
+    }
+
+    /// The `vmctx` argument of the function being translated.
+    pub fn vmctx_value(&self, func: &ir::Function) -> Value {
+        func.special_param(ir::ArgumentPurpose::VMContext)
+            .expect("missing vmctx parameter")
     }
 
     /// Build a signature with a `vmctx` parameter prepended.
@@ -698,36 +557,73 @@ impl<'info> FuncEnv<'info> {
         sig
     }
 
-    fn vmctx_global(&self, func: &mut ir::Function, offset: i32, ty: ir::Type) -> ir::GlobalValue {
-        let vmctx = func.create_global_value(ir::GlobalValueData::VMContext);
-        func.create_global_value(ir::GlobalValueData::Load {
-            base: vmctx,
-            offset: Offset32::new(offset),
-            global_type: ty,
-            flags: MemFlags::trusted().with_readonly(),
-        })
+    /// Loads `vmctx.<offset>`: a trusted, readonly field of the hidden
+    /// context (the field never changes while the function executes).
+    fn vmctx_load(&mut self, builder: &mut FunctionBuilder, offset: i32, ty: ir::Type) -> Value {
+        let vmctx = self.vmctx_value(builder.func);
+        let flags = cranelift_codegen::ir::MemFlagsData::trusted().with_readonly();
+        builder.ins().load(ty, flags, vmctx, Offset32::new(offset))
+    }
+
+    /// Loads `vmctx.<offset>` from a `FuncCursor`.
+    fn vmctx_load_cursor(&mut self, pos: &mut FuncCursor, offset: i32, ty: ir::Type) -> Value {
+        let vmctx = pos
+            .func
+            .special_param(ir::ArgumentPurpose::VMContext)
+            .expect("missing vmctx parameter");
+        let flags = cranelift_codegen::ir::MemFlagsData::trusted().with_readonly();
+        pos.ins().load(ty, flags, vmctx, Offset32::new(offset))
     }
 
     /// A chained load: `vmctx.<array_field>[elem_offset + field_offset]`
     /// (two memory indirections), for per-instance descriptor arrays.
     fn vmctx_slot(
-        &self,
-        func: &mut ir::Function,
+        &mut self,
+        builder: &mut FunctionBuilder,
         array_field: i32,
         elem_offset: i32,
         field_offset: i32,
         ty: ir::Type,
-    ) -> ir::GlobalValue {
-        let array = self.vmctx_global(func, array_field, self.pointer_type());
-        func.create_global_value(ir::GlobalValueData::Load {
-            base: array,
-            offset: Offset32::new(elem_offset + field_offset),
-            global_type: ty,
-            flags: MemFlags::trusted().with_readonly(),
-        })
+    ) -> Value {
+        let array = self.vmctx_load(builder, array_field, self.pointer_type());
+        let flags = cranelift_codegen::ir::MemFlagsData::trusted().with_readonly();
+        builder
+            .ins()
+            .load(ty, flags, array, Offset32::new(elem_offset + field_offset))
     }
 
-    fn ensure_table(&mut self, func: &mut ir::Function, index: TableIndex) {
+    /// Returns the `GlobalVar` for `index`, creating it on first use.
+    pub fn make_global(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        index: GlobalIndex,
+    ) -> crate::error::CompileResult<GlobalVar> {
+        if let Some(var) = self.globals.get(&index) {
+            return Ok(*var);
+        }
+        let ty = match self.mod_info.globals[index].0.wasm_ty {
+            ValType::I32 => types::I32,
+            ValType::I64 => types::I64,
+            ValType::F32 => types::F32,
+            ValType::F64 => types::F64,
+            ValType::V128 => types::I8X16,
+            ValType::Ref(_) => types::I32,
+        };
+        // Global `index` lives in the 8-byte cell at
+        // `vmctx.globals + index * 8`. The base is the loaded `vmctx.globals`
+        // pointer; the translator then adds the per-cell offset and
+        // loads/stores `ty`.
+        let globals_base = self.vmctx_load(builder, VmCtxOffsets::GLOBALS, self.pointer_type());
+        let var = GlobalVar {
+            base: globals_base,
+            offset: Offset32::new((index.index() as i32) * GLOBAL_CELL_SIZE),
+            ty,
+        };
+        self.globals.insert(index, var);
+        Ok(var)
+    }
+
+    fn ensure_table(&mut self, builder: &mut FunctionBuilder, index: TableIndex) {
         if self.tables[index].is_some() {
             return;
         }
@@ -738,7 +634,7 @@ impl<'info> FuncEnv<'info> {
         // may be readonly.
         let slot_offset = (index.index() as i32) * TableSlotOffsets::SIZE;
         let holder = self.vmctx_slot(
-            func,
+            builder,
             VmCtxOffsets::TABLES,
             slot_offset,
             0,
@@ -747,12 +643,13 @@ impl<'info> FuncEnv<'info> {
         // The element base is immutable after instantiation (the cell storage
         // is capacity-reserved and never reallocated), so this load may be
         // readonly too.
-        let base_gv = func.create_global_value(ir::GlobalValueData::Load {
-            base: holder,
-            offset: Offset32::new(TableCellsOffsets::BASE),
-            global_type: self.pointer_type(),
-            flags: MemFlags::trusted().with_readonly(),
-        });
+        let readonly_flags = cranelift_codegen::ir::MemFlagsData::trusted().with_readonly();
+        let base = builder.ins().load(
+            self.pointer_type(),
+            readonly_flags,
+            holder,
+            Offset32::new(TableCellsOffsets::BASE),
+        );
         let bound = if table.maximum == Some(table.minimum) {
             TableSize::Static {
                 bound: table.minimum,
@@ -761,141 +658,61 @@ impl<'info> FuncEnv<'info> {
             // The element count advances on `table.grow`; the load must not
             // be readonly or the optimizer could hoist it out of loops and
             // use a stale bound.
+            let trusted_flags = cranelift_codegen::ir::MemFlagsData::trusted();
             TableSize::Dynamic {
-                bound_gv: func.create_global_value(ir::GlobalValueData::Load {
-                    base: holder,
-                    offset: Offset32::new(TableCellsOffsets::LEN),
-                    global_type: types::I32,
-                    flags: MemFlags::trusted(),
-                }),
+                bound: builder.ins().load(
+                    types::I32,
+                    trusted_flags,
+                    holder,
+                    Offset32::new(TableCellsOffsets::LEN),
+                ),
             }
         };
 
         self.tables[index] = Some(TableData {
-            base_gv,
+            base,
             bound,
             element_size: 4,
         });
     }
-}
 
-impl TypeConvert for FuncEnv<'_> {
-    fn lookup_heap_type(&self, index: UnpackedIndex) -> WasmHeapType {
-        match index.as_module_index() {
-            Some(idx) => {
-                let idx = ModuleInternedTypeIndex::from_u32(idx);
-                WasmHeapType::ConcreteFunc(EngineOrModuleTypeIndex::Module(idx))
-            }
-            None => WasmHeapType::Func,
-        }
-    }
-
-    fn lookup_type_index(&self, index: UnpackedIndex) -> EngineOrModuleTypeIndex {
-        match index.as_module_index() {
-            Some(idx) => EngineOrModuleTypeIndex::Module(ModuleInternedTypeIndex::from_u32(idx)),
-            None => EngineOrModuleTypeIndex::Module(ModuleInternedTypeIndex::from_u32(0)),
-        }
-    }
-}
-
-impl TargetEnvironment for FuncEnv<'_> {
-    fn target_config(&self) -> TargetFrontendConfig {
-        self.mod_info.config
-    }
-
-    fn heap_access_spectre_mitigation(&self) -> bool {
-        true
-    }
-
-    fn proof_carrying_code(&self) -> bool {
-        false
-    }
-
-    fn reference_type(&self, _ty: WasmHeapType) -> ir::Type {
-        // References are raw `u32` handles; see `wasm_type_to_clif`.
-        types::I32
-    }
-}
-
-impl cranelift_wasm::FuncEnvironment for FuncEnv<'_> {
-    fn make_global(
+    /// Returns the memoised table data for `index`, creating it if needed.
+    pub fn get_table(
         &mut self,
-        func: &mut ir::Function,
-        index: GlobalIndex,
-    ) -> WasmResult<GlobalVariable> {
-        let ty = match self.mod_info.globals[index].0.wasm_ty {
-            WasmValType::I32 => types::I32,
-            WasmValType::I64 => types::I64,
-            WasmValType::F32 => types::F32,
-            WasmValType::F64 => types::F64,
-            WasmValType::V128 => types::I8X16,
-            WasmValType::Ref(_) => types::I32,
-        };
-        // Global `index` lives in the 8-byte cell at
-        // `vmctx.globals + index * 8`. The base global value is a pointer load
-        // of `vmctx.globals`; cranelift then adds the per-cell offset and
-        // loads/stores `ty`.
-        let globals_base = self.vmctx_global(func, VmCtxOffsets::GLOBALS, self.pointer_type());
-        Ok(GlobalVariable::Memory {
-            gv: globals_base,
-            offset: Offset32::new((index.index() as i32) * GLOBAL_CELL_SIZE),
-            ty,
-        })
+        builder: &mut FunctionBuilder,
+        index: TableIndex,
+    ) -> crate::error::CompileResult<TableData> {
+        self.ensure_table(builder, index);
+        Ok(self.tables[index].as_ref().expect("table created").clone())
     }
 
-    fn heaps(&self) -> &PrimaryMap<Heap, HeapData> {
-        &self.heaps
-    }
-
-    fn make_heap(&mut self, func: &mut ir::Function, index: MemoryIndex) -> WasmResult<Heap> {
-        let memory = self.mod_info.memories[index];
-        let base = index.index() as i32 * MemoryDescOffsets::SIZE;
-        let base_gv = self.vmctx_slot(
-            func,
-            VmCtxOffsets::MEMORIES,
-            base,
-            MemoryDescOffsets::BASE,
-            self.pointer_type(),
-        );
-        // Bound the heap against the reservation *capacity*, not the current
-        // length: shared regions are mapped top-down inside the same
-        // reservation, so the whole reservation is addressable. Accessing the
-        // grown-but-unmapped gap or a read-only shared page faults and is
-        // mapped to `MemoryOutOfBounds` by the runtime trap handler (D9).
-        let bound_gv = self.vmctx_slot(
-            func,
-            VmCtxOffsets::MEMORIES,
-            base,
-            MemoryDescOffsets::CAPACITY,
-            self.pointer_type(),
-        );
-        let max_size = memory.maximum_byte_size().unwrap_or(u64::from(u32::MAX));
-
-        Ok(self.heaps.push(HeapData {
-            base: base_gv,
-            min_size: 0,
-            max_size: Some(max_size),
-            offset_guard_size: 0x1_0000_0000,
-            style: HeapStyle::Dynamic { bound_gv },
-            index_type: types::I32,
-            memory_type: None,
-            page_size_log2: memory.page_size_log2,
-        }))
-    }
-
-    fn make_indirect_sig(
+    /// Returns the memoised indirect-call signature for `index` and the
+    /// number of wasm parameters it carries.
+    pub fn make_indirect_sig(
         &mut self,
         func: &mut ir::Function,
         index: TypeIndex,
-    ) -> WasmResult<ir::SigRef> {
-        Ok(func.import_signature(self.vmctx_sig(index)))
+    ) -> crate::error::CompileResult<(ir::SigRef, usize)> {
+        if let Some(sig) = self.indirect_sigs.get(&index) {
+            return Ok(*sig);
+        }
+        let sig_ref = func.import_signature(self.vmctx_sig(index));
+        let num_wasm_params = self.mod_info.wasm_types[index].params().len();
+        let sig = (sig_ref, num_wasm_params);
+        self.indirect_sigs.insert(index, sig);
+        Ok(sig)
     }
 
-    fn make_direct_func(
+    /// Returns the memoised direct-call target for `index` and the number of
+    /// wasm parameters it carries.
+    pub fn make_direct_func(
         &mut self,
         func: &mut ir::Function,
         index: FuncIndex,
-    ) -> WasmResult<ir::FuncRef> {
+    ) -> crate::error::CompileResult<(ir::FuncRef, usize)> {
+        if let Some(fref) = self.direct_funcs.get(&index) {
+            return Ok(*fref);
+        }
         let sigidx = self.mod_info.functions[index];
         let signature = func.import_signature(self.vmctx_sig(sigidx));
         // `index` here is the defined-function ordinal (imported functions are
@@ -910,20 +727,101 @@ impl cranelift_wasm::FuncEnvironment for FuncEnv<'_> {
                 namespace: 0,
                 index: ordinal,
             }));
-        Ok(func.import_function(ir::ExtFuncData {
+        let fref = func.import_function(ir::ExtFuncData {
             name,
             signature,
             colocated: true,
-        }))
+            patchable: false,
+        });
+        let num_wasm_params = self.mod_info.wasm_types[sigidx].params().len();
+        let entry = (fref, num_wasm_params);
+        self.direct_funcs.insert(index, entry);
+        Ok(entry)
     }
 
-    fn translate_call(
+    /// Prepares a bounds-checked wasm linear-memory address.
+    ///
+    /// Bounds-checkes the effective byte range `index + offset + access_size`
+    /// against the memory's reserved *capacity* (not its current length:
+    /// shared regions are mapped top-down inside the same reservation, so the
+    /// whole reservation is addressable; accessing the grown-but-unmapped gap
+    /// faults and is mapped to `MemoryOutOfBounds` by the runtime trap
+    /// handler, D9). With Spectre mitigations enabled the out-of-bounds
+    /// address is clamped to null and the subsequent access traps through the
+    /// load/store's trap record; otherwise an explicit `trapnz` is emitted.
+    ///
+    /// Returns `(address, flags)` ready for a load or store with a zero
+    /// offset immediate — the memarg offset is folded into the address.
+    pub fn memory_addr(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        mem_index: MemoryIndex,
+        index: Value,
+        offset: u64,
+        access_size: u32,
+    ) -> crate::error::CompileResult<(Value, cranelift_codegen::ir::MemFlagsData)> {
+        let base = mem_index.index() as i32 * MemoryDescOffsets::SIZE;
+        let base_ptr = self.vmctx_slot(
+            builder,
+            VmCtxOffsets::MEMORIES,
+            base,
+            MemoryDescOffsets::BASE,
+            self.pointer_type(),
+        );
+        let bound = self.vmctx_slot(
+            builder,
+            VmCtxOffsets::MEMORIES,
+            base,
+            MemoryDescOffsets::CAPACITY,
+            self.pointer_type(),
+        );
+
+        let pointer_type = self.pointer_type();
+        let index64 = builder.ins().uextend(pointer_type, index);
+
+        // `index64 + offset + access_size > bound` ⟺ out of bounds. The
+        // addition cannot overflow: `index64 < 2^32` (memory64 is disabled)
+        // and `offset + access_size <= 2^32 + 8`.
+        let limit = builder
+            .ins()
+            .iadd_imm_s(index64, (offset + u64::from(access_size)) as i64);
+        let oob = builder
+            .ins()
+            .icmp(ir::condcodes::IntCC::UnsignedGreaterThan, limit, bound);
+
+        let addr = builder.ins().iadd(base_ptr, index64);
+        let addr = if offset == 0 {
+            addr
+        } else {
+            builder.ins().iadd_imm_s(addr, offset as i64)
+        };
+
+        let flags = mem_access_flags();
+        if self.mod_info.config.pointer_width == target_lexicon::PointerWidth::U64 {
+            let null = builder.ins().iconst(pointer_type, 0);
+            let addr = builder.ins().select_spectre_guard(oob, null, addr);
+            Ok((addr, flags))
+        } else {
+            // 32-bit pointers are rejected earlier, but keep the explicit
+            // check as a defensive fallback.
+            builder.ins().trapnz(oob, ir::TrapCode::HEAP_OUT_OF_BOUNDS);
+            Ok((addr, flags))
+        }
+    }
+
+    /// Returns the number of wasm parameters of a function type index.
+    pub fn wasm_param_count(&self, sigidx: TypeIndex) -> usize {
+        self.mod_info.wasm_types[sigidx].params().len()
+    }
+
+    /// Translates a direct `call`.
+    pub fn translate_call(
         &mut self,
         builder: &mut FunctionBuilder,
         callee_index: FuncIndex,
         callee: ir::FuncRef,
         call_args: &[Value],
-    ) -> WasmResult<ir::Inst> {
+    ) -> crate::error::CompileResult<ir::Inst> {
         let vmctx = builder
             .func
             .special_param(ir::ArgumentPurpose::VMContext)
@@ -935,27 +833,20 @@ impl cranelift_wasm::FuncEnvironment for FuncEnv<'_> {
             // perform an indirect call with the *callee's* vmctx.
             let sigidx = self.mod_info.functions[callee_index];
             let sig_ref = builder.func.import_signature(self.vmctx_sig(sigidx));
-            let funcs_base_gv =
-                self.vmctx_global(builder.func, VmCtxOffsets::FUNCS, self.pointer_type());
-            let funcs_base = builder
-                .ins()
-                .global_value(self.pointer_type(), funcs_base_gv);
-            let slot_ptr = builder.ins().iadd_imm(
+            let funcs_base = self.vmctx_load(builder, VmCtxOffsets::FUNCS, self.pointer_type());
+            let slot_ptr = builder.ins().iadd_imm_s(
                 funcs_base,
                 i64::from((callee_index.index() as i32) * FuncDescOffsets::SIZE),
             );
-            let callee_ptr = builder.ins().load(
-                self.pointer_type(),
-                MemFlags::trusted(),
-                slot_ptr,
-                FuncDescOffsets::ENTRY,
-            );
-            let callee_vmctx = builder.ins().load(
-                self.pointer_type(),
-                MemFlags::trusted(),
-                slot_ptr,
-                FuncDescOffsets::VMCTX,
-            );
+            let flags = cranelift_codegen::ir::MemFlagsData::trusted();
+            let callee_ptr =
+                builder
+                    .ins()
+                    .load(self.pointer_type(), flags, slot_ptr, FuncDescOffsets::ENTRY);
+            let callee_vmctx =
+                builder
+                    .ins()
+                    .load(self.pointer_type(), flags, slot_ptr, FuncDescOffsets::VMCTX);
             let mut args: Vec<Value> = Vec::with_capacity(call_args.len() + 1);
             args.push(callee_vmctx);
             args.extend_from_slice(call_args);
@@ -968,25 +859,11 @@ impl cranelift_wasm::FuncEnvironment for FuncEnv<'_> {
         Ok(builder.ins().call(callee, &args))
     }
 
-    fn translate_return_call(
-        &mut self,
-        builder: &mut FunctionBuilder,
-        _callee_index: FuncIndex,
-        callee: ir::FuncRef,
-        call_args: &[Value],
-    ) -> WasmResult<()> {
-        let vmctx = builder
-            .func
-            .special_param(ir::ArgumentPurpose::VMContext)
-            .expect("missing vmctx parameter");
-        let mut args: Vec<Value> = Vec::with_capacity(call_args.len() + 1);
-        args.push(vmctx);
-        args.extend_from_slice(call_args);
-        builder.ins().return_call(callee, &args);
-        Ok(())
-    }
-
-    fn translate_call_indirect(
+    /// Translates a `call_indirect`.
+    ///
+    /// Returns `None` when the call is in unreachable code and no
+    /// instructions may be emitted.
+    pub fn translate_call_indirect(
         &mut self,
         builder: &mut FunctionBuilder,
         table_index: TableIndex,
@@ -994,10 +871,9 @@ impl cranelift_wasm::FuncEnvironment for FuncEnv<'_> {
         sig_ref: ir::SigRef,
         callee: Value,
         call_args: &[Value],
-    ) -> WasmResult<Option<ir::Inst>> {
+    ) -> crate::error::CompileResult<Option<ir::Inst>> {
         // Bounds-check the table index, then load the 4-byte funcref handle.
-        self.ensure_table(builder.func, table_index);
-        let table = self.tables[table_index].as_ref().unwrap();
+        let table = self.get_table(builder, table_index)?;
         let pointer_type = self.pointer_type();
         let (table_entry_addr, flags) =
             table.prepare_table_addr(builder, callee, pointer_type, true);
@@ -1006,57 +882,48 @@ impl cranelift_wasm::FuncEnvironment for FuncEnv<'_> {
         // Null entry traps.
         let is_null = builder
             .ins()
-            .icmp_imm(ir::condcodes::IntCC::Equal, handle, 0);
+            .icmp_imm_u(ir::condcodes::IntCC::Equal, handle, 0);
         builder
             .ins()
-            .trapnz(is_null, ir::TrapCode::IndirectCallToNull);
+            .trapnz(is_null, user_trap(USER_TRAP_CALL_INDIRECT_NULL));
 
         // Resolve the store-native handle to its fat call target in the
         // store-wide descriptor table; the callee's own vmctx rides along so
         // cross-module and imported calls dispatch correctly.
-        let funcs_gv = self.vmctx_global(builder.func, VmCtxOffsets::STORE_FUNCS, pointer_type);
-        let funcs_base = builder.ins().global_value(pointer_type, funcs_gv);
+        let funcs_base = self.vmctx_load(builder, VmCtxOffsets::STORE_FUNCS, pointer_type);
         let handle_ext = builder.ins().uextend(pointer_type, handle);
         let slot_offset = builder
             .ins()
-            .imul_imm(handle_ext, i64::from(FuncDescOffsets::SIZE));
+            .imul_imm_u(handle_ext, i64::from(FuncDescOffsets::SIZE));
         let slot_ptr = builder.ins().iadd(funcs_base, slot_offset);
-        let func_ptr = builder.ins().load(
-            pointer_type,
-            MemFlags::trusted(),
-            slot_ptr,
-            FuncDescOffsets::ENTRY,
-        );
-        let callee_vmctx = builder.ins().load(
-            pointer_type,
-            MemFlags::trusted(),
-            slot_ptr,
-            FuncDescOffsets::VMCTX,
-        );
+        let flags = cranelift_codegen::ir::MemFlagsData::trusted();
+        let func_ptr = builder
+            .ins()
+            .load(pointer_type, flags, slot_ptr, FuncDescOffsets::ENTRY);
+        let callee_vmctx =
+            builder
+                .ins()
+                .load(pointer_type, flags, slot_ptr, FuncDescOffsets::VMCTX);
 
         // Dynamic signature check: `store_funcs[handle].type_id` must equal the
         // canonical id of the expected signature (from `vmctx.type_ids`).
-        let actual_type_id = builder.ins().load(
-            types::I32,
-            MemFlags::trusted(),
-            slot_ptr,
-            FuncDescOffsets::TYPE_ID,
-        );
-        let type_ids_gv = self.vmctx_global(builder.func, VmCtxOffsets::TYPE_IDS, pointer_type);
-        let type_ids_base = builder.ins().global_value(pointer_type, type_ids_gv);
-        let expected_slot = builder
-            .ins()
-            .iadd_imm(type_ids_base, i64::from(sig_index.index() as i32) * 4);
-        let expected_type_id =
+        let actual_type_id =
             builder
                 .ins()
-                .load(types::I32, MemFlags::trusted(), expected_slot, 0);
+                .load(types::I32, flags, slot_ptr, FuncDescOffsets::TYPE_ID);
+        let type_ids_base = self.vmctx_load(builder, VmCtxOffsets::TYPE_IDS, pointer_type);
+        let expected_slot = builder
+            .ins()
+            .iadd_imm_s(type_ids_base, i64::from(sig_index.index() as i32) * 4);
+        let expected_type_id = builder.ins().load(types::I32, flags, expected_slot, 0);
         let mismatch = builder.ins().icmp(
             ir::condcodes::IntCC::NotEqual,
             actual_type_id,
             expected_type_id,
         );
-        builder.ins().trapnz(mismatch, ir::TrapCode::BadSignature);
+        builder
+            .ins()
+            .trapnz(mismatch, user_trap(USER_TRAP_BAD_SIGNATURE));
 
         let mut args: Vec<Value> = Vec::with_capacity(call_args.len() + 1);
         args.push(callee_vmctx);
@@ -1065,111 +932,32 @@ impl cranelift_wasm::FuncEnvironment for FuncEnv<'_> {
         Ok(Some(builder.ins().call_indirect(sig_ref, func_ptr, &args)))
     }
 
-    fn translate_return_call_indirect(
+    /// Entry-time stack-overflow check: trap if the stack pointer has dropped
+    /// below the limit stored in the hidden context. This bounds wasm
+    /// recursion before the host stack is exhausted, and with a dedicated
+    /// signal alt-stack the trap is always recoverable.
+    pub fn before_translate_function(
         &mut self,
         builder: &mut FunctionBuilder,
-        table_index: TableIndex,
-        sig_index: TypeIndex,
-        sig_ref: ir::SigRef,
-        callee: Value,
-        call_args: &[Value],
-    ) -> WasmResult<()> {
-        self.ensure_table(builder.func, table_index);
-        let table = self.tables[table_index].as_ref().unwrap();
+    ) -> crate::error::CompileResult<()> {
         let pointer_type = self.pointer_type();
-        let (table_entry_addr, flags) =
-            table.prepare_table_addr(builder, callee, pointer_type, true);
-        let handle = builder.ins().load(types::I32, flags, table_entry_addr, 0);
-
-        let is_null = builder
-            .ins()
-            .icmp_imm(ir::condcodes::IntCC::Equal, handle, 0);
-        builder
-            .ins()
-            .trapnz(is_null, ir::TrapCode::IndirectCallToNull);
-
-        let funcs_gv = self.vmctx_global(builder.func, VmCtxOffsets::STORE_FUNCS, pointer_type);
-        let funcs_base = builder.ins().global_value(pointer_type, funcs_gv);
-        let handle_ext = builder.ins().uextend(pointer_type, handle);
-        let slot_offset = builder
-            .ins()
-            .imul_imm(handle_ext, i64::from(FuncDescOffsets::SIZE));
-        let slot_ptr = builder.ins().iadd(funcs_base, slot_offset);
-        let func_ptr = builder.ins().load(
-            pointer_type,
-            MemFlags::trusted(),
-            slot_ptr,
-            FuncDescOffsets::ENTRY,
-        );
-        let callee_vmctx = builder.ins().load(
-            pointer_type,
-            MemFlags::trusted(),
-            slot_ptr,
-            FuncDescOffsets::VMCTX,
-        );
-
-        // Dynamic signature check, identical to `translate_call_indirect`:
-        // `store_funcs[handle].type_id` must equal the canonical id of the
-        // expected signature. Tail calls are outside the v1 feature gate, so
-        // this path is currently unreachable — but it must not become a
-        // type-confusion hole the day they are enabled.
-        let actual_type_id = builder.ins().load(
-            types::I32,
-            MemFlags::trusted(),
-            slot_ptr,
-            FuncDescOffsets::TYPE_ID,
-        );
-        let type_ids_gv = self.vmctx_global(builder.func, VmCtxOffsets::TYPE_IDS, pointer_type);
-        let type_ids_base = builder.ins().global_value(pointer_type, type_ids_gv);
-        let expected_slot = builder
-            .ins()
-            .iadd_imm(type_ids_base, i64::from(sig_index.index() as i32) * 4);
-        let expected_type_id =
+        let limit = self.vmctx_load(builder, VmCtxOffsets::STACK_LIMIT, pointer_type);
+        let stack_pointer = builder.ins().get_stack_pointer(pointer_type);
+        let overflow =
             builder
                 .ins()
-                .load(types::I32, MemFlags::trusted(), expected_slot, 0);
-        let mismatch = builder.ins().icmp(
-            ir::condcodes::IntCC::NotEqual,
-            actual_type_id,
-            expected_type_id,
-        );
-        builder.ins().trapnz(mismatch, ir::TrapCode::BadSignature);
-
-        let mut args: Vec<Value> = Vec::with_capacity(call_args.len() + 1);
-        args.push(callee_vmctx);
-        args.extend_from_slice(call_args);
-
-        builder.ins().return_call_indirect(sig_ref, func_ptr, &args);
+                .icmp(ir::condcodes::IntCC::UnsignedLessThan, stack_pointer, limit);
+        builder.ins().trapnz(overflow, ir::TrapCode::STACK_OVERFLOW);
         Ok(())
     }
 
-    fn translate_return_call_ref(
-        &mut self,
-        _builder: &mut FunctionBuilder,
-        _sig_ref: ir::SigRef,
-        _callee: Value,
-        _call_args: &[Value],
-    ) -> WasmResult<()> {
-        Err(WasmError::Unsupported("return_call_ref".to_string()))
-    }
-
-    fn translate_call_ref(
-        &mut self,
-        _builder: &mut FunctionBuilder,
-        _sig_ref: ir::SigRef,
-        _callee: Value,
-        _call_args: &[Value],
-    ) -> WasmResult<ir::Inst> {
-        Err(WasmError::Unsupported("call_ref".to_string()))
-    }
-
-    fn translate_memory_grow(
+    /// Translates `memory.grow`.
+    pub fn translate_memory_grow(
         &mut self,
         mut pos: FuncCursor,
         index: MemoryIndex,
-        _heap: Heap,
         val: Value,
-    ) -> WasmResult<Value> {
+    ) -> crate::error::CompileResult<Value> {
         let pointer_type = self.pointer_type();
         let mem_idx = pos.ins().iconst(pointer_type, i64::from(index.as_u32()));
         let delta = widen_u32(&mut pos, val, pointer_type);
@@ -1183,12 +971,12 @@ impl cranelift_wasm::FuncEnvironment for FuncEnv<'_> {
         Ok(unpack_plain_result(&mut pos, raw))
     }
 
-    fn translate_memory_size(
+    /// Translates `memory.size`.
+    pub fn translate_memory_size(
         &mut self,
         mut pos: FuncCursor,
         index: MemoryIndex,
-        _heap: Heap,
-    ) -> WasmResult<Value> {
+    ) -> crate::error::CompileResult<Value> {
         let pointer_type = self.pointer_type();
         let mem_idx = pos.ins().iconst(pointer_type, i64::from(index.as_u32()));
         let raw = emit_libcall(
@@ -1201,17 +989,16 @@ impl cranelift_wasm::FuncEnvironment for FuncEnv<'_> {
         Ok(unpack_plain_result(&mut pos, raw))
     }
 
-    fn translate_memory_copy(
+    /// Translates `memory.copy`.
+    pub fn translate_memory_copy(
         &mut self,
         mut pos: FuncCursor,
         src_index: MemoryIndex,
-        _src_heap: Heap,
         dst_index: MemoryIndex,
-        _dst_heap: Heap,
         dst: Value,
         src: Value,
         len: Value,
-    ) -> WasmResult<()> {
+    ) -> crate::error::CompileResult<()> {
         let pointer_type = self.pointer_type();
         let dst_idx = pos
             .ins()
@@ -1229,19 +1016,19 @@ impl cranelift_wasm::FuncEnvironment for FuncEnv<'_> {
             LibCallOffsets::MEMORY_COPY,
             &[dst_idx, src_idx, dst64, src64, len64],
         );
-        unpack_libcall_result(&mut pos, raw, ir::TrapCode::HeapOutOfBounds);
+        unpack_libcall_result(&mut pos, raw, ir::TrapCode::HEAP_OUT_OF_BOUNDS);
         Ok(())
     }
 
-    fn translate_memory_fill(
+    /// Translates `memory.fill`.
+    pub fn translate_memory_fill(
         &mut self,
         mut pos: FuncCursor,
         index: MemoryIndex,
-        _heap: Heap,
         dst: Value,
         val: Value,
         len: Value,
-    ) -> WasmResult<()> {
+    ) -> crate::error::CompileResult<()> {
         let pointer_type = self.pointer_type();
         let mem_idx = pos.ins().iconst(pointer_type, i64::from(index.as_u32()));
         let dst64 = widen_u32(&mut pos, dst, pointer_type);
@@ -1254,20 +1041,20 @@ impl cranelift_wasm::FuncEnvironment for FuncEnv<'_> {
             LibCallOffsets::MEMORY_FILL,
             &[mem_idx, dst64, val64, len64],
         );
-        unpack_libcall_result(&mut pos, raw, ir::TrapCode::HeapOutOfBounds);
+        unpack_libcall_result(&mut pos, raw, ir::TrapCode::HEAP_OUT_OF_BOUNDS);
         Ok(())
     }
 
-    fn translate_memory_init(
+    /// Translates `memory.init`.
+    pub fn translate_memory_init(
         &mut self,
         mut pos: FuncCursor,
         index: MemoryIndex,
-        _heap: Heap,
         seg_index: u32,
         dst: Value,
         src: Value,
         len: Value,
-    ) -> WasmResult<()> {
+    ) -> crate::error::CompileResult<()> {
         let pointer_type = self.pointer_type();
         let mem_idx = pos.ins().iconst(pointer_type, i64::from(index.as_u32()));
         let seg_idx = pos.ins().iconst(pointer_type, i64::from(seg_index));
@@ -1281,11 +1068,16 @@ impl cranelift_wasm::FuncEnvironment for FuncEnv<'_> {
             LibCallOffsets::MEMORY_INIT,
             &[mem_idx, seg_idx, dst64, src64, len64],
         );
-        unpack_libcall_result(&mut pos, raw, ir::TrapCode::HeapOutOfBounds);
+        unpack_libcall_result(&mut pos, raw, ir::TrapCode::HEAP_OUT_OF_BOUNDS);
         Ok(())
     }
 
-    fn translate_data_drop(&mut self, mut pos: FuncCursor, seg_index: u32) -> WasmResult<()> {
+    /// Translates `data.drop`.
+    pub fn translate_data_drop(
+        &mut self,
+        mut pos: FuncCursor,
+        seg_index: u32,
+    ) -> crate::error::CompileResult<()> {
         let pointer_type = self.pointer_type();
         let seg_idx = pos.ins().iconst(pointer_type, i64::from(seg_index));
         let _ = emit_libcall(
@@ -1298,11 +1090,12 @@ impl cranelift_wasm::FuncEnvironment for FuncEnv<'_> {
         Ok(())
     }
 
-    fn translate_table_size(
+    /// Translates `table.size`.
+    pub fn translate_table_size(
         &mut self,
         mut pos: FuncCursor,
         index: TableIndex,
-    ) -> WasmResult<Value> {
+    ) -> crate::error::CompileResult<Value> {
         let pointer_type = self.pointer_type();
         let table_idx = pos.ins().iconst(pointer_type, i64::from(index.as_u32()));
         let raw = emit_libcall(
@@ -1315,13 +1108,14 @@ impl cranelift_wasm::FuncEnvironment for FuncEnv<'_> {
         Ok(unpack_plain_result(&mut pos, raw))
     }
 
-    fn translate_table_grow(
+    /// Translates `table.grow`.
+    pub fn translate_table_grow(
         &mut self,
         mut pos: FuncCursor,
         table_index: TableIndex,
         delta: Value,
         init_value: Value,
-    ) -> WasmResult<Value> {
+    ) -> crate::error::CompileResult<Value> {
         let pointer_type = self.pointer_type();
         let table_idx = pos
             .ins()
@@ -1338,29 +1132,29 @@ impl cranelift_wasm::FuncEnvironment for FuncEnv<'_> {
         Ok(unpack_plain_result(&mut pos, raw))
     }
 
-    fn translate_table_get(
+    /// Translates `table.get`.
+    pub fn translate_table_get(
         &mut self,
         builder: &mut FunctionBuilder,
         table_index: TableIndex,
         index: Value,
-    ) -> WasmResult<Value> {
-        self.ensure_table(builder.func, table_index);
-        let table = self.tables[table_index].as_ref().unwrap();
+    ) -> crate::error::CompileResult<Value> {
+        let table = self.get_table(builder, table_index)?;
         let pointer_type = self.pointer_type();
         let (table_entry_addr, flags) =
             table.prepare_table_addr(builder, index, pointer_type, true);
         Ok(builder.ins().load(types::I32, flags, table_entry_addr, 0))
     }
 
-    fn translate_table_set(
+    /// Translates `table.set`.
+    pub fn translate_table_set(
         &mut self,
         builder: &mut FunctionBuilder,
         table_index: TableIndex,
         value: Value,
         index: Value,
-    ) -> WasmResult<()> {
-        self.ensure_table(builder.func, table_index);
-        let table = self.tables[table_index].as_ref().unwrap();
+    ) -> crate::error::CompileResult<()> {
+        let table = self.get_table(builder, table_index)?;
         let pointer_type = self.pointer_type();
         let (table_entry_addr, flags) =
             table.prepare_table_addr(builder, index, pointer_type, true);
@@ -1368,7 +1162,8 @@ impl cranelift_wasm::FuncEnvironment for FuncEnv<'_> {
         Ok(())
     }
 
-    fn translate_table_copy(
+    /// Translates `table.copy`.
+    pub fn translate_table_copy(
         &mut self,
         mut pos: FuncCursor,
         dst_table_index: TableIndex,
@@ -1376,7 +1171,7 @@ impl cranelift_wasm::FuncEnvironment for FuncEnv<'_> {
         dst: Value,
         src: Value,
         len: Value,
-    ) -> WasmResult<()> {
+    ) -> crate::error::CompileResult<()> {
         let pointer_type = self.pointer_type();
         let dst_idx = pos
             .ins()
@@ -1394,18 +1189,19 @@ impl cranelift_wasm::FuncEnvironment for FuncEnv<'_> {
             LibCallOffsets::TABLE_COPY,
             &[dst_idx, src_idx, dst64, src64, len64],
         );
-        unpack_libcall_result(&mut pos, raw, ir::TrapCode::TableOutOfBounds);
+        unpack_libcall_result(&mut pos, raw, user_trap(USER_TRAP_TABLE_OUT_OF_BOUNDS));
         Ok(())
     }
 
-    fn translate_table_fill(
+    /// Translates `table.fill`.
+    pub fn translate_table_fill(
         &mut self,
         mut pos: FuncCursor,
         table_index: TableIndex,
         dst: Value,
         val: Value,
         len: Value,
-    ) -> WasmResult<()> {
+    ) -> crate::error::CompileResult<()> {
         let pointer_type = self.pointer_type();
         let table_idx = pos
             .ins()
@@ -1420,11 +1216,12 @@ impl cranelift_wasm::FuncEnvironment for FuncEnv<'_> {
             LibCallOffsets::TABLE_FILL,
             &[table_idx, dst64, val64, len64],
         );
-        unpack_libcall_result(&mut pos, raw, ir::TrapCode::TableOutOfBounds);
+        unpack_libcall_result(&mut pos, raw, user_trap(USER_TRAP_TABLE_OUT_OF_BOUNDS));
         Ok(())
     }
 
-    fn translate_table_init(
+    /// Translates `table.init`.
+    pub fn translate_table_init(
         &mut self,
         mut pos: FuncCursor,
         seg_index: u32,
@@ -1432,7 +1229,7 @@ impl cranelift_wasm::FuncEnvironment for FuncEnv<'_> {
         dst: Value,
         src: Value,
         len: Value,
-    ) -> WasmResult<()> {
+    ) -> crate::error::CompileResult<()> {
         let pointer_type = self.pointer_type();
         let seg_idx = pos.ins().iconst(pointer_type, i64::from(seg_index));
         let table_idx = pos
@@ -1448,11 +1245,16 @@ impl cranelift_wasm::FuncEnvironment for FuncEnv<'_> {
             LibCallOffsets::TABLE_INIT,
             &[seg_idx, table_idx, dst64, src64, len64],
         );
-        unpack_libcall_result(&mut pos, raw, ir::TrapCode::TableOutOfBounds);
+        unpack_libcall_result(&mut pos, raw, user_trap(USER_TRAP_TABLE_OUT_OF_BOUNDS));
         Ok(())
     }
 
-    fn translate_elem_drop(&mut self, mut pos: FuncCursor, seg_index: u32) -> WasmResult<()> {
+    /// Translates `elem.drop`.
+    pub fn translate_elem_drop(
+        &mut self,
+        mut pos: FuncCursor,
+        seg_index: u32,
+    ) -> crate::error::CompileResult<()> {
         let pointer_type = self.pointer_type();
         let seg_idx = pos.ins().iconst(pointer_type, i64::from(seg_index));
         let _ = emit_libcall(
@@ -1465,62 +1267,46 @@ impl cranelift_wasm::FuncEnvironment for FuncEnv<'_> {
         Ok(())
     }
 
-    fn translate_ref_null(&mut self, mut pos: FuncCursor, _ty: WasmHeapType) -> WasmResult<Value> {
-        Ok(pos.ins().iconst(types::I32, 0))
+    /// Translates `ref.null`.
+    ///
+    /// References are raw `u32` handles; the null handle is zero regardless of
+    /// the heap type.
+    pub fn translate_ref_null(&mut self, mut pos: FuncCursor, _hty: wasmparser::HeapType) -> Value {
+        pos.ins().iconst(types::I32, 0)
     }
 
-    fn translate_ref_is_null(&mut self, mut pos: FuncCursor, value: Value) -> WasmResult<Value> {
-        let is_null = pos.ins().icmp_imm(ir::condcodes::IntCC::Equal, value, 0);
-        Ok(pos.ins().uextend(types::I32, is_null))
+    /// Translates `ref.is_null`.
+    pub fn translate_ref_is_null(&mut self, mut pos: FuncCursor, value: Value) -> Value {
+        let is_null = pos.ins().icmp_imm_u(ir::condcodes::IntCC::Equal, value, 0);
+        pos.ins().uextend(types::I32, is_null)
     }
 
-    fn translate_ref_func(
+    /// Translates `ref.func`.
+    ///
+    /// A funcref is a store-native handle, looked up from the per-module
+    /// `refs` array (one u32 per function index).
+    pub fn translate_ref_func(
         &mut self,
         mut pos: FuncCursor,
         func_index: FuncIndex,
-    ) -> WasmResult<Value> {
-        // A funcref is a store-native handle, looked up from the per-module
-        // `refs` array (one u32 per function index).
-        let vmctx = pos.func.create_global_value(ir::GlobalValueData::VMContext);
-        let refs_gv = pos.func.create_global_value(ir::GlobalValueData::Load {
-            base: vmctx,
-            offset: Offset32::new(VmCtxOffsets::REFS),
-            global_type: self.pointer_type(),
-            flags: MemFlags::trusted().with_readonly(),
-        });
-        let refs_base = pos.ins().global_value(self.pointer_type(), refs_gv);
+    ) -> crate::error::CompileResult<Value> {
+        let refs_base = self.vmctx_load_cursor(&mut pos, VmCtxOffsets::REFS, self.pointer_type());
         let slot = pos
             .ins()
-            .iadd_imm(refs_base, i64::from(func_index.index() as i32) * 4);
-        Ok(pos.ins().load(types::I32, MemFlags::trusted(), slot, 0))
+            .iadd_imm_s(refs_base, i64::from(func_index.index() as i32) * 4);
+        let flags = cranelift_codegen::ir::MemFlagsData::trusted();
+        Ok(pos.ins().load(types::I32, flags, slot, 0))
     }
 
-    fn translate_custom_global_get(
-        &mut self,
-        _pos: FuncCursor,
-        _global_index: GlobalIndex,
-    ) -> WasmResult<Value> {
-        Err(unsupported_runtime_op("custom global.get"))
-    }
-
-    fn translate_custom_global_set(
-        &mut self,
-        _pos: FuncCursor,
-        _global_index: GlobalIndex,
-        _val: Value,
-    ) -> WasmResult<()> {
-        Err(unsupported_runtime_op("custom global.set"))
-    }
-
-    fn translate_atomic_wait(
+    /// Translates `memory.atomic.wait32/64` (runtime libcall).
+    pub fn translate_atomic_wait(
         &mut self,
         mut pos: FuncCursor,
         index: MemoryIndex,
-        _heap: Heap,
         addr: Value,
         expected: Value,
         timeout: Value,
-    ) -> WasmResult<Value> {
+    ) -> crate::error::CompileResult<Value> {
         let pointer_type = self.pointer_type();
         // The translator leaves the expected value at its native width: i32 for
         // `wait32`, i64 for `wait64`. The runtime compares sign-extended i32s,
@@ -1546,18 +1332,18 @@ impl cranelift_wasm::FuncEnvironment for FuncEnv<'_> {
         Ok(unpack_libcall_result(
             &mut pos,
             raw,
-            ir::TrapCode::HeapOutOfBounds,
+            ir::TrapCode::HEAP_OUT_OF_BOUNDS,
         ))
     }
 
-    fn translate_atomic_notify(
+    /// Translates `memory.atomic.notify` (runtime libcall).
+    pub fn translate_atomic_notify(
         &mut self,
         mut pos: FuncCursor,
         index: MemoryIndex,
-        _heap: Heap,
         addr: Value,
         count: Value,
-    ) -> WasmResult<Value> {
+    ) -> crate::error::CompileResult<Value> {
         let pointer_type = self.pointer_type();
         let addr64 = pos.ins().uextend(pointer_type, addr);
         let count64 = pos.ins().uextend(pointer_type, count);
@@ -1572,56 +1358,81 @@ impl cranelift_wasm::FuncEnvironment for FuncEnv<'_> {
         Ok(unpack_libcall_result(
             &mut pos,
             raw,
-            ir::TrapCode::HeapOutOfBounds,
+            ir::TrapCode::HEAP_OUT_OF_BOUNDS,
         ))
-    }
-
-    fn translate_ref_i31(&mut self, _pos: FuncCursor, _val: Value) -> WasmResult<Value> {
-        Err(unsupported_runtime_op("ref.i31"))
-    }
-
-    fn before_translate_function(
-        &mut self,
-        builder: &mut FunctionBuilder,
-        _state: &cranelift_wasm::FuncTranslationState,
-    ) -> WasmResult<()> {
-        // Entry-time stack-overflow check: trap if the stack pointer has
-        // dropped below the limit stored in the hidden context. This bounds
-        // wasm recursion before the host stack is exhausted, and with a
-        // dedicated signal alt-stack the trap is always recoverable.
-        let pointer_type = self.pointer_type();
-        let vmctx = builder
-            .func
-            .create_global_value(ir::GlobalValueData::VMContext);
-        let limit_gv = builder.func.create_global_value(ir::GlobalValueData::Load {
-            base: vmctx,
-            offset: Offset32::new(VmCtxOffsets::STACK_LIMIT),
-            global_type: pointer_type,
-            flags: MemFlags::trusted().with_readonly(),
-        });
-        let limit = builder.ins().global_value(pointer_type, limit_gv);
-        let stack_pointer = builder.ins().get_stack_pointer(pointer_type);
-        let overflow =
-            builder
-                .ins()
-                .icmp(ir::condcodes::IntCC::UnsignedLessThan, stack_pointer, limit);
-        builder.ins().trapnz(overflow, ir::TrapCode::StackOverflow);
-        Ok(())
-    }
-
-    fn translate_i31_get_s(&mut self, _pos: FuncCursor, _i31ref: Value) -> WasmResult<Value> {
-        Err(unsupported_runtime_op("i31.get_s"))
-    }
-
-    fn translate_i31_get_u(&mut self, _pos: FuncCursor, _i31ref: Value) -> WasmResult<Value> {
-        Err(unsupported_runtime_op("i31.get_u"))
     }
 }
 
-/// Convert a cranelift-wasm translation failure into a compiler error.
-pub fn wasm_error_to_compile(err: WasmError) -> CompileError {
+impl TableData {
+    /// Return a CLIF value containing a native pointer to the beginning of the
+    /// given index within this table, plus the flags to use for the access.
+    ///
+    /// The bounds check uses Spectre mitigation: an out-of-bounds index
+    /// selects a null address and the subsequent access traps through the
+    /// returned flags' trap code. A null address is used rather than an
+    /// explicit branch so the speculative execution does not continue with
+    /// the out-of-bounds address.
+    pub fn prepare_table_addr(
+        &self,
+        pos: &mut FunctionBuilder,
+        mut index: ir::Value,
+        addr_ty: ir::Type,
+        enable_table_access_spectre_mitigation: bool,
+    ) -> (ir::Value, cranelift_codegen::ir::MemFlagsData) {
+        let index_ty = pos.func.dfg.value_type(index);
+
+        // Start with the bounds check. Trap if `index + 1 > bound`.
+        let bound = self.bound.bound(pos.cursor(), index_ty);
+
+        // `index > bound - 1` is the same as `index >= bound`.
+        let oob = pos.ins().icmp(
+            ir::condcodes::IntCC::UnsignedGreaterThanOrEqual,
+            index,
+            bound,
+        );
+
+        if !enable_table_access_spectre_mitigation {
+            pos.ins()
+                .trapnz(oob, user_trap(USER_TRAP_TABLE_OUT_OF_BOUNDS));
+        }
+
+        // Convert `index` to `addr_ty`.
+        if index_ty != addr_ty {
+            index = pos.ins().uextend(addr_ty, index);
+        }
+
+        // Add the table base address base
+        let element_size = self.element_size;
+        let offset = if element_size == 1 {
+            index
+        } else if element_size.is_power_of_two() {
+            pos.ins()
+                .ishl_imm_u(index, i64::from(element_size.trailing_zeros()))
+        } else {
+            pos.ins().imul_imm_u(index, element_size as i64)
+        };
+
+        let element_addr = pos.ins().iadd(self.base, offset);
+
+        if enable_table_access_spectre_mitigation {
+            // Short-circuit the computed table element address to a null
+            // pointer when out-of-bounds. The consumer of this address will
+            // trap when trying to access it.
+            let zero = pos.ins().iconst(addr_ty, 0);
+            (
+                pos.ins().select_spectre_guard(oob, zero, element_addr),
+                table_access_flags(),
+            )
+        } else {
+            (element_addr, cranelift_codegen::ir::MemFlagsData::new())
+        }
+    }
+}
+
+/// Convert a translation failure into a compiler error.
+pub fn translate_error(err: crate::translate::TranslateError) -> CompileError {
     match err {
-        WasmError::Unsupported(msg) => CompileError::Unsupported(msg),
+        crate::translate::TranslateError::Unsupported(msg) => CompileError::Unsupported(msg),
         other => CompileError::Translate(other.to_string()),
     }
 }
@@ -1640,9 +1451,8 @@ pub fn wasm_error_to_compile(err: WasmError) -> CompileError {
 /// `funcref`/`externref` reference types) and keeps typed references out of
 /// the artifact's type section — typed and untyped funcref signatures would
 /// otherwise serialise identically and `call_indirect`'s dynamic signature
-/// check could not tell them apart. `extended_const` remains disabled
-/// because the pinned `cranelift-wasm` cannot lower those const-expr
-/// operators.
+/// check could not tell them apart. `extended_const` remains disabled because
+/// the compiler's const-expression writer does not lower those operators.
 pub fn wasm_features() -> WasmFeatures {
     let mut features = WasmFeatures::empty();
     features.set(WasmFeatures::MUTABLE_GLOBAL, true);
@@ -1653,6 +1463,11 @@ pub fn wasm_features() -> WasmFeatures {
     features.set(WasmFeatures::BULK_MEMORY, true);
     features.set(WasmFeatures::THREADS, true);
     features.set(WasmFeatures::FLOATS, true);
+    // `gc_types` only admits the `externref`/`funcref` *types* that the
+    // reference-types proposal already provides (the `gc` feature, which gates
+    // GC *operators*, remains disabled). Without it, wasmparser 0.259 rejects
+    // `funcref`/`externref` outright.
+    features.set(WasmFeatures::GC_TYPES, true);
     features
 }
 
@@ -1669,18 +1484,20 @@ fn emit_libcall(
         .func
         .special_param(ir::ArgumentPurpose::VMContext)
         .expect("missing vmctx parameter");
-    let vmctx_gv = pos.func.create_global_value(ir::GlobalValueData::VMContext);
-    let libcalls_gv = pos.func.create_global_value(ir::GlobalValueData::Load {
-        base: vmctx_gv,
-        offset: Offset32::new(VmCtxOffsets::LIBCALLS),
-        global_type: pointer_type,
-        flags: MemFlags::trusted().with_readonly(),
-    });
-    let base = pos.ins().global_value(pointer_type, libcalls_gv);
-    let slot_ptr = pos.ins().iadd_imm(base, i64::from(slot));
-    let fn_ptr = pos
-        .ins()
-        .load(pointer_type, MemFlags::trusted(), slot_ptr, 0);
+    let readonly_flags = cranelift_codegen::ir::MemFlagsData::trusted().with_readonly();
+    let base = pos.ins().load(
+        pointer_type,
+        readonly_flags,
+        vmctx,
+        Offset32::new(VmCtxOffsets::LIBCALLS),
+    );
+    let slot_ptr = pos.ins().iadd_imm_s(base, i64::from(slot));
+    let fn_ptr = pos.ins().load(
+        pointer_type,
+        cranelift_codegen::ir::MemFlagsData::trusted(),
+        slot_ptr,
+        0,
+    );
 
     let mut sig = ir::Signature::new(call_conv);
     sig.params.push(AbiParam::new(pointer_type));
@@ -1700,10 +1517,10 @@ fn emit_libcall(
 /// Unpacks a libcall's packed `(trap:u32 << 32) | (result:u32)` return value,
 /// trapping with `trap` when the high word is non-zero.
 fn unpack_libcall_result(pos: &mut FuncCursor, raw: Value, trap: ir::TrapCode) -> Value {
-    let trap_word = pos.ins().ushr_imm(raw, 32);
+    let trap_word = pos.ins().ushr_imm_u(raw, 32);
     let is_trap = pos
         .ins()
-        .icmp_imm(ir::condcodes::IntCC::NotEqual, trap_word, 0);
+        .icmp_imm_u(ir::condcodes::IntCC::NotEqual, trap_word, 0);
     pos.ins().trapnz(is_trap, trap);
     pos.ins().ireduce(types::I32, raw)
 }
@@ -1713,24 +1530,6 @@ fn unpack_plain_result(pos: &mut FuncCursor, raw: Value) -> Value {
     pos.ins().ireduce(types::I32, raw)
 }
 
-fn unsupported_runtime_op(name: &str) -> WasmError {
-    WasmError::Unsupported(format!(
-        "{name} lowering is not yet implemented in the AOT compiler"
-    ))
-}
-
-fn wasm_type_to_clif(ty: &WasmValType) -> ir::Type {
-    match ty {
-        WasmValType::I32 => types::I32,
-        WasmValType::I64 => types::I64,
-        WasmValType::F32 => types::F32,
-        WasmValType::F64 => types::F64,
-        WasmValType::V128 => types::I8X16,
-        // Reference values are represented as raw `u32` handles in wasmtiny.
-        WasmValType::Ref(_) => types::I32,
-    }
-}
-
 /// Widens an `i32` operand to the pointer width for a libcall argument.
 fn widen_u32(pos: &mut FuncCursor, value: Value, pointer_type: ir::Type) -> Value {
     if pos.func.dfg.value_type(value) == types::I32 {
@@ -1738,4 +1537,27 @@ fn widen_u32(pos: &mut FuncCursor, value: Value, pointer_type: ir::Type) -> Valu
     } else {
         value
     }
+}
+
+/// The native CLIF type used for each wasm value type (used by the trampoline
+/// builder too).
+pub fn wasm_type_to_clif(ty: ValType) -> ir::Type {
+    crate::types::valtype_to_clif(ty)
+}
+
+/// Converts a wasm function type into a `vmctx`-augmented CLIF signature
+/// (used by the trampoline builder).
+pub fn wasm_func_type_to_sig(call_conv: CallConv, ty: &wasmparser::FuncType) -> Signature {
+    let mut sig = Signature::new(call_conv);
+    sig.params.extend(
+        ty.params()
+            .iter()
+            .map(|ty| AbiParam::new(crate::types::valtype_to_clif(*ty))),
+    );
+    sig.returns.extend(
+        ty.results()
+            .iter()
+            .map(|ty| AbiParam::new(crate::types::valtype_to_clif(*ty))),
+    );
+    sig
 }

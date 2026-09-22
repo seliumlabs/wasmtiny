@@ -8,15 +8,28 @@
 use cranelift_codegen::{
     ir::immediates::Offset32,
     ir::{
-        self, AbiParam, GlobalValueData, InstBuilder, MemFlags, Signature, StackSlotData,
-        StackSlotKind, UserFuncName, types,
+        self, AbiParam, InstBuilder, Signature, StackSlotData, StackSlotKind, UserFuncName, types,
     },
     isa::CallConv,
 };
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use cranelift_wasm::{WasmFuncType, WasmValType};
+use wasmparser::ValType;
 
-use crate::environment::{LibCallOffsets, VmCtxOffsets};
+use crate::environment::{LibCallOffsets, USER_TRAP_HOST, VmCtxOffsets, user_trap};
+
+/// A `TargetFrontendConfig` for the (stack-map-free) trampoline functions.
+fn trampoline_frontend_config(call_conv: CallConv) -> cranelift_codegen::isa::TargetFrontendConfig {
+    cranelift_codegen::isa::TargetFrontendConfig {
+        default_call_conv: call_conv,
+        pointer_width: target_lexicon::PointerWidth::U64,
+        page_size_align_log2: 12,
+    }
+}
+
+/// Returns the native CLIF type used for each wasm value type.
+fn value_clif_type(ty: ValType) -> ir::Type {
+    crate::types::valtype_to_clif(ty)
+}
 
 /// Builds an array-call entry trampoline for a callee with `callee_sig`
 /// (already `vmctx`-augmented) and `wasm_type`.
@@ -25,7 +38,7 @@ use crate::environment::{LibCallOffsets, VmCtxOffsets};
 pub fn build_entry_trampoline(
     call_conv: CallConv,
     callee_sig: &Signature,
-    wasm_type: &WasmFuncType,
+    wasm_type: &wasmparser::FuncType,
     type_idx: u32,
 ) -> ir::Function {
     let pointer_type = types::I64;
@@ -52,15 +65,17 @@ pub fn build_entry_trampoline(
     let args_ptr = params[2];
     let results_ptr = params[3];
 
-    let mem_flags = MemFlags::trusted();
+    let mem_flags = cranelift_codegen::ir::MemFlagsData::trusted();
     let slot_size = 8i64;
 
     let mut call_args: Vec<ir::Value> = Vec::with_capacity(wasm_type.params().len() + 1);
     call_args.push(vmctx);
     for (index, param) in wasm_type.params().iter().enumerate() {
-        let addr = builder.ins().iadd_imm(args_ptr, index as i64 * slot_size);
-        let raw = builder.ins().load(pointer_type, mem_flags, addr, 0);
-        call_args.push(slot_to_value(&mut builder, raw, value_clif_type(param)));
+        let addr = builder.ins().iadd_imm_s(args_ptr, index as i64 * slot_size);
+        let raw = builder
+            .ins()
+            .load(pointer_type, mem_flags, addr, Offset32::new(0));
+        call_args.push(slot_to_value(&mut builder, raw, value_clif_type(*param)));
     }
 
     let callee_sig_ref = builder.func.import_signature(callee_sig.clone());
@@ -73,12 +88,12 @@ pub fn build_entry_trampoline(
         let wide = value_to_slot(&mut builder, *result);
         let addr = builder
             .ins()
-            .iadd_imm(results_ptr, index as i64 * slot_size);
-        builder.ins().store(mem_flags, wide, addr, 0);
+            .iadd_imm_s(results_ptr, index as i64 * slot_size);
+        builder.ins().store(mem_flags, wide, addr, Offset32::new(0));
     }
 
     builder.ins().return_(&[]);
-    builder.finalize();
+    builder.finalize(trampoline_frontend_config(call_conv));
 
     func
 }
@@ -92,7 +107,7 @@ pub fn build_entry_trampoline(
 pub fn build_host_call_stub(
     call_conv: CallConv,
     callee_sig: &Signature,
-    wasm_type: &WasmFuncType,
+    wasm_type: &wasmparser::FuncType,
     import_ordinal: u32,
 ) -> ir::Function {
     let pointer_type = types::I64;
@@ -118,10 +133,10 @@ pub fn build_host_call_stub(
 
     let vmctx = block_params[0];
     let wasm_params = &block_params[1..];
-    let mem_flags = MemFlags::trusted();
+    let mem_flags = cranelift_codegen::ir::MemFlagsData::trusted();
 
     let param_count = wasm_type.params().len();
-    let result_count = wasm_type.returns().len();
+    let result_count = wasm_type.results().len();
 
     let args_slot = builder.create_sized_stack_slot(StackSlotData::new(
         StackSlotKind::ExplicitSlot,
@@ -139,22 +154,21 @@ pub fn build_host_call_stub(
         let addr = builder
             .ins()
             .stack_addr(pointer_type, args_slot, (index * 8) as i32);
-        builder.ins().store(mem_flags, wide, addr, 0);
+        builder.ins().store(mem_flags, wide, addr, Offset32::new(0));
     }
 
-    let vmctx_gv = builder.func.create_global_value(GlobalValueData::VMContext);
-    let libcalls_gv = builder.func.create_global_value(GlobalValueData::Load {
-        base: vmctx_gv,
-        offset: Offset32::new(VmCtxOffsets::LIBCALLS),
-        global_type: pointer_type,
-        flags: MemFlags::trusted().with_readonly(),
-    });
-    let libcalls_base = builder.ins().global_value(pointer_type, libcalls_gv);
+    let readonly_flags = cranelift_codegen::ir::MemFlagsData::trusted().with_readonly();
+    let libcalls_base = builder.ins().load(
+        pointer_type,
+        readonly_flags,
+        vmctx,
+        Offset32::new(VmCtxOffsets::LIBCALLS),
+    );
     let host_call_fn = builder.ins().load(
         pointer_type,
-        MemFlags::trusted(),
+        mem_flags,
         libcalls_base,
-        LibCallOffsets::HOST_CALL,
+        Offset32::new(LibCallOffsets::HOST_CALL),
     );
 
     let args_addr = builder.ins().stack_addr(pointer_type, args_slot, 0);
@@ -169,19 +183,21 @@ pub fn build_host_call_stub(
         &[vmctx, ordinal, args_addr, results_addr],
     );
     let status = builder.inst_results(call)[0];
-    builder.ins().trapnz(status, ir::TrapCode::User(0));
+    builder.ins().trapnz(status, user_trap(USER_TRAP_HOST));
 
     let mut retvals = Vec::with_capacity(result_count);
-    for (index, result) in wasm_type.returns().iter().enumerate() {
+    for (index, result) in wasm_type.results().iter().enumerate() {
         let addr = builder
             .ins()
             .stack_addr(pointer_type, results_slot, (index * 8) as i32);
-        let raw = builder.ins().load(pointer_type, mem_flags, addr, 0);
-        retvals.push(slot_to_value(&mut builder, raw, value_clif_type(result)));
+        let raw = builder
+            .ins()
+            .load(pointer_type, mem_flags, addr, Offset32::new(0));
+        retvals.push(slot_to_value(&mut builder, raw, value_clif_type(*result)));
     }
 
     builder.ins().return_(&retvals);
-    builder.finalize();
+    builder.finalize(trampoline_frontend_config(call_conv));
 
     func
 }
@@ -193,36 +209,30 @@ fn slot_to_value(builder: &mut FunctionBuilder, raw: ir::Value, ty: ir::Type) ->
         types::I64 => raw,
         types::F32 => {
             let bits = builder.ins().ireduce(types::I32, raw);
-            builder.ins().bitcast(types::F32, MemFlags::new(), bits)
+            builder
+                .ins()
+                .bitcast(types::F32, cranelift_codegen::ir::MemFlagsData::new(), bits)
         }
-        types::F64 => builder.ins().bitcast(types::F64, MemFlags::new(), raw),
+        types::F64 => {
+            builder
+                .ins()
+                .bitcast(types::F64, cranelift_codegen::ir::MemFlagsData::new(), raw)
+        }
         other => unreachable!("unsupported bridging value type {other:?}"),
-    }
-}
-
-/// The native CLIF type used for each wasm value type.
-fn value_clif_type(ty: &WasmValType) -> ir::Type {
-    match ty {
-        WasmValType::I32 => types::I32,
-        WasmValType::I64 => types::I64,
-        WasmValType::F32 => types::F32,
-        WasmValType::F64 => types::F64,
-        WasmValType::V128 => types::I8X16,
-        // References are raw u32 handles.
-        WasmValType::Ref(_) => types::I32,
     }
 }
 
 /// Converts a typed CLIF value into its 64-bit array-call slot.
 fn value_to_slot(builder: &mut FunctionBuilder, value: ir::Value) -> ir::Value {
+    let flags = cranelift_codegen::ir::MemFlagsData::new();
     match builder.func.dfg.value_type(value) {
         types::I32 => builder.ins().uextend(types::I64, value),
         types::I64 => value,
         types::F32 => {
-            let bits = builder.ins().bitcast(types::I32, MemFlags::new(), value);
+            let bits = builder.ins().bitcast(types::I32, flags, value);
             builder.ins().uextend(types::I64, bits)
         }
-        types::F64 => builder.ins().bitcast(types::I64, MemFlags::new(), value),
+        types::F64 => builder.ins().bitcast(types::I64, flags, value),
         other => unreachable!("unsupported bridging value type {other:?}"),
     }
 }

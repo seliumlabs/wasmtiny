@@ -61,6 +61,60 @@ fn cross_module_function_import_dispatches_to_provider() {
     assert_eq!(results, vec![WasmValue::I32(42)]);
 }
 
+/// The wat shorthand `(table funcref (elem $f))` lowers to a plain table plus
+/// a normal active element segment, so dispatch through it works through the
+/// standard segment path.
+#[test]
+fn inline_table_initializer_dispatches() {
+    let module = load(
+        "(module
+           (type $t (func (param i32) (result i32)))
+           (func $inc (type $t) (param i32) (result i32)
+             (i32.add (local.get 0) (i32.const 1)))
+           (func $dec (type $t) (param i32) (result i32)
+             (i32.sub (local.get 0) (i32.const 1)))
+           (table $tab funcref (elem $inc $dec))
+           (func (export \"callat\") (param i32 i32) (result i32)
+             (call_indirect (type $t) (local.get 1) (local.get 0))))",
+    );
+
+    let mut instance = AotInstance::new(&module).expect("instantiation");
+
+    let results = instance
+        .invoke(2, &[WasmValue::I32(0), WasmValue::I32(41)])
+        .expect("inc via inline-initialized slot 0");
+    assert_eq!(results, vec![WasmValue::I32(42)]);
+
+    let results = instance
+        .invoke(2, &[WasmValue::I32(1), WasmValue::I32(41)])
+        .expect("dec via inline-initialized slot 1");
+    assert_eq!(results, vec![WasmValue::I32(40)]);
+}
+
+/// Table-section expression initializers (`(table 1 funcref (ref.null func))`)
+/// are a function-references feature and must be rejected by the curated
+/// feature gate before translation — there is deliberately no lowering for
+/// them in `translate_module`.
+#[test]
+fn table_expression_initializer_is_rejected_as_unsupported() {
+    let wasm = wat::parse_str(
+        "(module
+           (type $t (func (param i32) (result i32)))
+           (table 1 funcref (ref.null func))
+           (func (export \"callat\") (param i32 i32) (result i32)
+             (call_indirect (type $t) (local.get 1) (local.get 0))))",
+    )
+    .expect("wat parses");
+
+    let err = wasmtiny_aotc::compile_artifact(&wasm, &CompilerConfig::host())
+        .expect_err("expression initializers are outside the feature set");
+    assert!(
+        matches!(err, wasmtiny_aotc::CompileError::Unsupported(ref msg)
+            if msg.contains("function-references")),
+        "expected an unsupported-feature error mentioning function-references, got {err}"
+    );
+}
+
 fn load(source: &str) -> wasmtiny::aot::AotModule {
     let wasm = wat::parse_str(source).expect("wat parses");
     let bytes = compile_artifact(&wasm, &CompilerConfig::host()).expect("compilation succeeds");

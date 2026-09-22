@@ -30,11 +30,16 @@
 
 use cranelift_codegen::ir::TrapCode as ClifTrapCode;
 use cranelift_entity::EntityRef;
-use cranelift_wasm::{ConstExpr, FuncIndex, GlobalIndex, Memory, Table, WasmRefType, WasmValType};
+use wasmparser::ValType;
 
 use crate::{
     compile::CompiledModule,
-    environment::{DataSegKind, ElemSegKind, ModuleInfo, wasm_features},
+    environment::{
+        DataSegKind, ElemSegKind, ModuleInfo, USER_TRAP_BAD_SIGNATURE,
+        USER_TRAP_CALL_INDIRECT_NULL, USER_TRAP_HOST, USER_TRAP_NULL_REFERENCE,
+        USER_TRAP_TABLE_OUT_OF_BOUNDS, USER_TRAP_UNREACHABLE, wasm_features,
+    },
+    types::{self, ConstOp, FuncIndex, GlobalIndex, Memory, Table},
 };
 
 /// ABI version written (and accepted) by this compiler.
@@ -129,19 +134,32 @@ pub fn sha512(bytes: &[u8]) -> [u8; SHA512_LEN] {
 
 /// Maps a Cranelift trap code to the artifact's trap code byte.
 pub fn trap_code_byte(code: ClifTrapCode) -> u8 {
-    match code {
-        ClifTrapCode::StackOverflow => TRAP_STACK_OVERFLOW,
-        ClifTrapCode::HeapOutOfBounds | ClifTrapCode::HeapMisaligned => TRAP_MEMORY_OUT_OF_BOUNDS,
-        ClifTrapCode::TableOutOfBounds => TRAP_TABLE_OUT_OF_BOUNDS,
-        ClifTrapCode::IndirectCallToNull => TRAP_CALL_INDIRECT_NULL,
-        ClifTrapCode::BadSignature => TRAP_INDIRECT_CALL_TYPE_MISMATCH,
-        ClifTrapCode::IntegerOverflow => TRAP_INTEGER_OVERFLOW,
-        ClifTrapCode::IntegerDivisionByZero => TRAP_INTEGER_DIVISION_BY_ZERO,
-        ClifTrapCode::BadConversionToInteger => TRAP_INVALID_CONVERSION_TO_INT,
-        ClifTrapCode::UnreachableCodeReached => TRAP_UNREACHABLE,
-        ClifTrapCode::NullReference | ClifTrapCode::NullI31Ref => TRAP_NULL_REFERENCE,
-        ClifTrapCode::Interrupt => TRAP_HOST,
-        ClifTrapCode::User(_) => TRAP_HOST,
+    // The built-in trap codes map to their runtime bytes; the remaining
+    // wasm-level traps are carried in `TrapCode::User(n)` codes defined in
+    // `environment`.
+    if code == ClifTrapCode::STACK_OVERFLOW {
+        return TRAP_STACK_OVERFLOW;
+    }
+    if code == ClifTrapCode::HEAP_OUT_OF_BOUNDS {
+        return TRAP_MEMORY_OUT_OF_BOUNDS;
+    }
+    if code == ClifTrapCode::INTEGER_OVERFLOW {
+        return TRAP_INTEGER_OVERFLOW;
+    }
+    if code == ClifTrapCode::INTEGER_DIVISION_BY_ZERO {
+        return TRAP_INTEGER_DIVISION_BY_ZERO;
+    }
+    if code == ClifTrapCode::BAD_CONVERSION_TO_INTEGER {
+        return TRAP_INVALID_CONVERSION_TO_INT;
+    }
+    match code.as_raw().get() {
+        USER_TRAP_UNREACHABLE => TRAP_UNREACHABLE,
+        USER_TRAP_TABLE_OUT_OF_BOUNDS => TRAP_TABLE_OUT_OF_BOUNDS,
+        USER_TRAP_CALL_INDIRECT_NULL => TRAP_CALL_INDIRECT_NULL,
+        USER_TRAP_BAD_SIGNATURE => TRAP_INDIRECT_CALL_TYPE_MISMATCH,
+        USER_TRAP_NULL_REFERENCE => TRAP_NULL_REFERENCE,
+        USER_TRAP_HOST => TRAP_HOST,
+        _ => TRAP_HOST,
     }
 }
 
@@ -221,41 +239,41 @@ pub fn write_artifact(compiled: &CompiledModule) -> Vec<u8> {
     out
 }
 
-/// Serialises a `ConstExpr` back into wasm constant-expression bytes that the
-/// runtime's existing constant-expression evaluator can replay.
-fn const_expr_bytes(init: &ConstExpr, ref_byte: u8) -> Vec<u8> {
+/// Serialises a [`crate::types::ConstExpr`] back into wasm constant-expression
+/// bytes that the runtime's existing constant-expression evaluator can replay.
+fn const_expr_bytes(init: &crate::types::ConstExpr) -> Vec<u8> {
     let mut out = Vec::new();
-    for op in init.ops() {
+    for op in &init.ops {
         match op {
-            cranelift_wasm::ConstOp::I32Const(value) => {
+            ConstOp::I32Const(value) => {
                 out.push(0x41);
                 push_sleb128(&mut out, i64::from(*value));
             }
-            cranelift_wasm::ConstOp::I64Const(value) => {
+            ConstOp::I64Const(value) => {
                 out.push(0x42);
                 push_sleb128(&mut out, *value);
             }
-            cranelift_wasm::ConstOp::F32Const(bits) => {
+            ConstOp::F32Const(bits) => {
                 out.push(0x43);
                 out.extend_from_slice(&bits.to_le_bytes());
             }
-            cranelift_wasm::ConstOp::F64Const(bits) => {
+            ConstOp::F64Const(bits) => {
                 out.push(0x44);
                 out.extend_from_slice(&bits.to_le_bytes());
             }
-            cranelift_wasm::ConstOp::GlobalGet(index) => {
+            ConstOp::GlobalGet(index) => {
                 out.push(0x23);
-                push_uleb128(&mut out, index.index() as u64);
+                push_uleb128(&mut out, u64::from(*index));
             }
-            cranelift_wasm::ConstOp::RefFunc(index) => {
+            ConstOp::RefFunc(index) => {
                 out.push(0xD2);
-                push_uleb128(&mut out, index.as_u32() as u64);
+                push_uleb128(&mut out, u64::from(*index));
             }
-            cranelift_wasm::ConstOp::RefNull => {
+            ConstOp::RefNull(byte) => {
                 out.push(0xD0);
-                out.push(ref_byte);
+                out.push(*byte);
             }
-            cranelift_wasm::ConstOp::V128Const(_) | cranelift_wasm::ConstOp::RefI31 => {
+            ConstOp::V128Const(_) | ConstOp::RefI31(_) => {
                 // Unreachable: SIMD/GC are rejected before translation.
                 debug_assert!(false, "SIMD/GC const expression reached the writer");
             }
@@ -352,8 +370,8 @@ fn push_string(out: &mut Vec<u8>, value: &str) {
 }
 
 fn push_table_type(out: &mut Vec<u8>, table: &Table) {
-    out.push(ref_type_byte(&table.wasm_ty));
-    out.push(u8::from(table.wasm_ty.nullable));
+    out.push(types::ref_type_byte(table.wasm_ty));
+    out.push(u8::from(table.wasm_ty.is_nullable()));
     push_u32(out, table.minimum);
     match table.maximum {
         Some(max) => {
@@ -378,14 +396,6 @@ fn push_uleb128(out: &mut Vec<u8>, mut value: u64) {
             out.push(byte);
             break;
         }
-    }
-}
-
-/// Encodes a wasm reference type as its standard heap-type byte.
-fn ref_type_byte(ty: &WasmRefType) -> u8 {
-    match ty.heap_type.top() {
-        cranelift_wasm::WasmHeapTopType::Extern => 0x6F,
-        cranelift_wasm::WasmHeapTopType::Func | cranelift_wasm::WasmHeapTopType::Any => 0x70,
     }
 }
 
@@ -522,12 +532,10 @@ fn section_globals(info: &ModuleInfo) -> Vec<u8> {
         .collect();
     push_u32(&mut out, defined.len() as u32);
     for (global, init) in defined {
-        out.push(valtype_byte(&global.wasm_ty));
+        out.push(valtype_byte(global.wasm_ty));
         out.push(u8::from(global.mutability));
-        let init_bytes = const_expr_bytes(
-            init.as_ref().expect("defined global has an initialiser"),
-            valtype_byte(&global.wasm_ty),
-        );
+        let init_bytes =
+            const_expr_bytes(init.as_ref().expect("defined global has an initialiser"));
         push_u32(&mut out, init_bytes.len() as u32);
         out.extend_from_slice(&init_bytes);
     }
@@ -565,7 +573,7 @@ fn section_imports(info: &ModuleInfo, func_import_stub_offsets: &[u32]) -> Vec<u
         push_u32(&mut out, IMPORT_GLOBAL);
         push_string(&mut out, &imp.module);
         push_string(&mut out, &imp.field);
-        out.push(valtype_byte(&imp.global.wasm_ty));
+        out.push(valtype_byte(imp.global.wasm_ty));
         out.push(u8::from(imp.global.mutability));
     }
 
@@ -621,30 +629,20 @@ fn section_types(info: &ModuleInfo) -> Vec<u8> {
     push_u32(&mut out, info.wasm_types.len() as u32);
     for (_, ty) in info.wasm_types.iter() {
         push_u32(&mut out, ty.params().len() as u32);
-        push_u32(&mut out, ty.returns().len() as u32);
+        push_u32(&mut out, ty.results().len() as u32);
         for param in ty.params().iter() {
-            out.push(valtype_byte(param));
+            out.push(valtype_byte(*param));
         }
-        for result in ty.returns().iter() {
-            out.push(valtype_byte(result));
+        for result in ty.results().iter() {
+            out.push(valtype_byte(*result));
         }
     }
     out
 }
 
 /// Encodes a wasm value type as its standard byte.
-fn valtype_byte(ty: &WasmValType) -> u8 {
-    match ty {
-        WasmValType::I32 => 0x7F,
-        WasmValType::I64 => 0x7E,
-        WasmValType::F32 => 0x7D,
-        WasmValType::F64 => 0x7C,
-        WasmValType::V128 => 0x7B,
-        WasmValType::Ref(reference) => match reference.heap_type.top() {
-            cranelift_wasm::WasmHeapTopType::Extern => 0x6F,
-            cranelift_wasm::WasmHeapTopType::Func | cranelift_wasm::WasmHeapTopType::Any => 0x70,
-        },
-    }
+fn valtype_byte(ty: ValType) -> u8 {
+    types::valtype_byte(ty)
 }
 
 /// Writes a fixed-size header.

@@ -13,17 +13,17 @@ required-features = ["cli"]
 
 [dependencies]
 clap = { workspace = true, features = ["derive", "help", "std"], optional = true }
-cranelift-codegen = { workspace = true, features = ["all-arch"] }
+cranelift-codegen = { workspace = true, features = ["all-arch", "std"] }
 cranelift-entity.workspace = true
 cranelift-frontend.workspace = true
-cranelift-wasm = { workspace = true, features = ["std"] }
 sha2.workspace = true
 target-lexicon.workspace = true
 thiserror.workspace = true
 wasmparser.workspace = true
 
 [dev-dependencies]
-wasmtiny.workspace = true
+# The integration tests drive the runtime's AOT execution path.
+wasmtiny = { workspace = true, features = ["aot"] }
 wat.workspace = true
 
 [features]

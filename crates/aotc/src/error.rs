@@ -35,15 +35,6 @@ pub enum CompileError {
     Internal(String),
 }
 
-impl From<cranelift_wasm::WasmError> for CompileError {
-    fn from(err: cranelift_wasm::WasmError) -> Self {
-        match err {
-            cranelift_wasm::WasmError::Unsupported(msg) => CompileError::Unsupported(msg),
-            other => CompileError::Translate(other.to_string()),
-        }
-    }
-}
-
 impl From<wasmparser::BinaryReaderError> for CompileError {
     fn from(err: wasmparser::BinaryReaderError) -> Self {
         CompileError::Validation(err.to_string())

@@ -11,14 +11,15 @@ use cranelift_codegen::{
     settings::{self, Configurable},
 };
 use cranelift_entity::EntityRef;
-use cranelift_wasm::{FuncIndex, TableIndex, translate_module};
 use target_lexicon::Triple;
-use wasmparser::{Parser, Payload, TableInit};
+use wasmparser::{Parser, Payload};
 
 use crate::{
     config::CompilerConfig,
-    environment::{ElemSegKind, ElemSegRecord, Translator, wasm_error_to_compile},
+    environment::Translator,
     error::{CompileError, CompileResult},
+    translate::translate_module,
+    types::FuncIndex,
 };
 
 /// The raw per-function machine-code compilation result.
@@ -442,53 +443,6 @@ fn apply_reloc(
     Ok(())
 }
 
-/// Recovers defined-table initialiser expressions from the raw wasm.
-///
-/// Returns `(table_index, elements)` pairs for tables whose initialiser is
-/// `ref.func` (repeated across the table's minimum size). `ref.null`
-/// initialisers are elided: a freshly allocated table already starts null.
-fn collect_table_inits(
-    wasm: &[u8],
-    imported_tables: u32,
-) -> CompileResult<Vec<(u32, Vec<FuncIndex>)>> {
-    let mut inits = Vec::new();
-    for payload in Parser::new(0).parse_all(wasm) {
-        let Payload::TableSection(tables) =
-            payload.map_err(|err| CompileError::Validation(err.to_string()))?
-        else {
-            continue;
-        };
-        for (offset, entry) in tables.into_iter().enumerate() {
-            let table = entry.map_err(|err| CompileError::Validation(err.to_string()))?;
-            let TableInit::Expr(expr) = &table.init else {
-                continue;
-            };
-            let mut reader = expr.get_binary_reader();
-            let opcode = reader
-                .read_u8()
-                .map_err(|err| CompileError::Validation(err.to_string()))?;
-            if opcode == 0xD0 {
-                // `ref.null`: keep the table's natural null initialisation.
-                continue;
-            }
-            if opcode != 0xD2 {
-                return Err(CompileError::Unsupported(format!(
-                    "unsupported table initialiser expression (opcode {opcode:#04x})"
-                )));
-            }
-            let func = reader
-                .read_var_u32()
-                .map_err(|err| CompileError::Validation(err.to_string()))?;
-            let min = table.ty.initial as u32;
-            inits.push((
-                imported_tables + offset as u32,
-                vec![FuncIndex::from_u32(func); min as usize],
-            ));
-        }
-    }
-    Ok(inits)
-}
-
 /// Compiles a CLIF function to machine code, returning its buffer, traps, and
 /// external relocations.
 fn compile_clif(
@@ -544,7 +498,7 @@ fn gate_unsupported_features(wasm: &[u8]) -> CompileResult<()> {
                 memories = memories.saturating_add(section.count());
             }
             Payload::ImportSection(section) => {
-                for import in section {
+                for import in section.into_imports() {
                     let import = import.map_err(|err| CompileError::Validation(err.to_string()))?;
                     if matches!(import.ty, wasmparser::TypeRef::Memory(_)) {
                         memories = memories.saturating_add(1);
@@ -567,11 +521,18 @@ fn gate_unsupported_features(wasm: &[u8]) -> CompileResult<()> {
         let lower = message.to_ascii_lowercase();
         if lower.contains("not enabled")
             || lower.contains("must be enabled")
+            // "... requires `gc` proposal to be enabled" (rec groups) and the
+            // component-model gates all use the "to be enabled" phrasing.
+            || lower.contains("to be enabled")
             || lower.contains("without the gc feature")
             || lower.contains("gc feature")
             || lower.contains("requires the")
+            // Plural form ("... initializers require the ...") and both
+            // spellings of the function-references proposal name.
+            || lower.contains("require the")
             || lower.contains("multiple memories")
             || lower.contains("function references")
+            || lower.contains("function-references")
         {
             return Err(CompileError::Unsupported(message));
         }
@@ -605,24 +566,7 @@ fn translate(
     gate_unsupported_features(wasm)?;
 
     let mut translator = Translator::new(isa.frontend_config(), isa.default_call_conv());
-    translate_module(wasm, &mut translator).map_err(wasm_error_to_compile)?;
-
-    // Table initialiser expressions (`(table funcref (elem $f))`) are dropped
-    // by `cranelift-wasm`'s table-section parser; recover them here as
-    // synthetic active element segments appended after the module's own
-    // segments so they replay at instantiation without disturbing the
-    // `table.init`/`elem.drop` index space.
-    let inits = collect_table_inits(wasm, translator.info.imported_table_count() as u32)?;
-    for (table_index, elements) in inits {
-        translator.info.elem_segments.push(ElemSegRecord {
-            kind: ElemSegKind::Active {
-                table_index: TableIndex::from_u32(table_index),
-                base: None,
-                offset: 0,
-            },
-            elements,
-        });
-    }
+    translate_module(wasm, &mut translator)?;
 
     let _ = config;
     Ok(translator)

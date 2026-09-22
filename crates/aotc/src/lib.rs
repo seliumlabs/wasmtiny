@@ -8,9 +8,14 @@
 //!
 //! 1. `wasmparser` validation with a curated feature set (no SIMD, GC,
 //!    exception handling, tail calls, multi-memory, or memory64).
-//! 2. `cranelift-wasm` translation guided by a [`environment::FuncEnvironment`]
-//!    that binds every function to a hidden context pointer plus the wasmtiny
-//!    memory/table/global layout.
+//! 2. Self-contained wasm→CLIF translation (`translate`, a private module)
+//!    guided by a [`environment::FuncEnv`] that binds every function to a
+//!    hidden context pointer plus the wasmtiny memory/table/global layout.
+//!    (The standalone `cranelift-wasm` crate is discontinued and incompatible
+//!    with the current `cranelift-codegen`, so the translation lives here —
+//!    derived from that crate's final 0.112 sources, which are licensed under
+//!    Apache-2.0 WITH LLVM-exception; see the attribution note atop
+//!    the module.)
 //! 3. `cranelift-codegen` machine-code generation.
 //! 4. Finish-linking of intra-module calls against the final code image.
 
@@ -26,6 +31,8 @@ pub mod config;
 pub mod environment;
 pub mod error;
 mod trampoline;
+mod translate;
+pub mod types;
 
 /// Compiles a WebAssembly binary into a finish-linked module.
 ///
@@ -56,7 +63,7 @@ mod tests {
         assert_eq!(compiled.translator.info.signatures.len(), 1);
         // The type is (i32, i32) -> (i32).
         let sig = &compiled.translator.info.signatures
-            [compiled.translator.info.functions[cranelift_wasm::FuncIndex::from_u32(0)]];
+            [compiled.translator.info.functions[crate::types::FuncIndex::from_u32(0)]];
         assert_eq!(sig.params.len(), 2);
         assert_eq!(sig.returns.len(), 1);
     }
@@ -145,19 +152,20 @@ mod tests {
         .unwrap();
 
         let golden_hex = concat!(
-            "57544130010000000100000000000000080000007838365f36342d756e6b6e6f776e2d6c",
-            "696e75782d676e7500000000000000000000000000000000000000000000000000000000",
-            "000000000000000000000000ff010000010000000f000000010000000200000001000000",
-            "7f7f7f020000000400000000000000030000001300000001000000030000006164640000",
-            "000000000000040000000400000000000000050000000400000000000000060000000400",
-            "000000000000070000000400000000000000080000000400000000000000090000002100",
-            "000001000000000000000000000020000000000000001e000000010000001c000000060a",
-            "00000052000000554889e54989e14c8b57384d39d10f82080000008d04164889ec5dc30f",
-            "0bcccc554889e54883ec104c893c244989f04989cf488b32488b520841ffd0448bd84c89",
-            "f94c89194c8b3c244883c4104889ec5dc30b00000004000000000000000c000000010000",
-            "00000d000000420000000100a7018acecfb5512c3c60470082cdd84fc051c64f427e9cf6",
-            "3490f4aec248909cd6c07e3b2019feabe51657a0c5af18aa8629722b9f3ac9e70390e3b6",
-            "56fb5caa",
+            "57544130010000000100000000000000080000007838365f36342d756e6b6e6f",
+            "776e2d6c696e75782d676e750000000000000000000000000000000000000000",
+            "0000000000000000000000000000000000000000ff010000010000000f000000",
+            "0100000002000000010000007f7f7f0200000004000000000000000300000013",
+            "0000000100000003000000616464000000000000000004000000040000000000",
+            "0000050000000400000000000000060000000400000000000000070000000400",
+            "0000000000000800000004000000000000000900000021000000010000000000",
+            "00000000000020000000000000001b0000000100000019000000060a00000051",
+            "000000554889e54989e04c3b47380f82080000008d04164889ec5dc30f0bcccc",
+            "cccccc554889e54883ec104c8924244889f04989cc488b32488b5208ffd0448b",
+            "c04c89e14c89014c8b24244883c4104889ec5dc30b0000000400000000000000",
+            "0c00000001000000000d000000420000000100393a8070df87de5f9b65ef1beb",
+            "7cb1c9bbf2ffdc1b7aef7248137338ac26975d483b88f0f6d5ca848c8f8d087d",
+            "e4645b3e975a089ef16a1509e1fa8f03471087",
         );
 
         let golden: Vec<u8> = (0..golden_hex.len())

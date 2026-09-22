@@ -10,13 +10,16 @@ yanked = "deny"
 
 [licenses]
 version = 2
-# wasmtiny is Apache-2.0 OR MIT; dev/test tooling may add permissive
-# crates. Anything unlisted here fails the gate.
+# wasmtiny is MPL-2.0 (re-licensed from Apache-2.0 OR MIT); dev/test tooling
+# may add permissive crates. Anything unlisted here fails the gate.
 allow = [
     "MIT",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
+    "MPL-2.0",
     "Unicode-3.0",
+    # foldhash (pulled by hashbrown 0.17 -> cranelift-codegen) is Zlib.
+    "Zlib",
 ]
 
 [bans]
@@ -24,13 +27,16 @@ allow = [
 multiple-versions = "deny"
 wildcards = "deny"
 highlight = "all"
-# hashbrown appears at three semver-incompatible versions pulled by the
-# Cranelift stack: 0.13.2 (regalloc2), 0.14.5 (cranelift-codegen/wasmparser),
-# 0.17.1 (indexmap/gimli). They cannot be unified; keep 0.14.5 as the
-# checked version and skip the two outliers.
+# hashbrown appears at two semver-incompatible versions pulled by the
+# Cranelift stack: 0.14.5 (cranelift-wasm-era codegen) and 0.17.1
+# (cranelift-codegen/wasmparser). They cannot be unified; keep 0.14.5 as the
+# checked version and skip the outlier.
 skip = [
-    { name = "hashbrown", version = "=0.13.2" },
     { name = "hashbrown", version = "=0.17.1" },
+    # syn appears at two semver-incompatible versions: 3.x (clap_derive) and
+    # 2.x (pulley-macros, the cranelift-codegen-meta build dependency). They
+    # cannot be unified; keep 3.x checked and skip the pulley-pulled 2.x.
+    { name = "syn", version = "=2.0.119" },
 ]
 
 [sources]

@@ -1,13 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-// This file is derived from the `cranelift-wasm` crate, which was discontinued
-// upstream after its 0.112.3 release (sources: the `cranelift/` directory of
-// https://github.com/bytecodealliance/wasmtime in the pre-vendoring history).
-// The upstream copyright and its Apache-2.0 WITH LLVM-exception license apply
-// to this file in full. The modifications made for wasmtiny are additionally
-// made available under MPL-2.0, the workspace license (see the root
-// `Cargo.toml`).
-
 //! The wasm→CLIF translation pipeline.
 //!
 //! The standalone `cranelift-wasm` crate is discontinued (last published at
@@ -40,12 +30,17 @@ use wasmparser::{
     ExternalKind, FunctionBody, MemArg, Operator, Parser, Payload, TypeRef, ValType,
 };
 
-use crate::environment::{
-    DataSegKind, DataSegRecord, ElemSegKind, ElemSegRecord, FuncEnv, GlobalVar, ModuleInfo,
-    Translator, USER_TRAP_UNREACHABLE, mem_access_flags, user_trap,
+use crate::{
+    environment::{
+        DataSegKind, DataSegRecord, ElemSegKind, ElemSegRecord, FuncEnv, GlobalVar, ModuleInfo,
+        Translator, USER_TRAP_UNREACHABLE, mem_access_flags, user_trap,
+    },
+    error::{CompileError, CompileResult},
+    types::{FuncIndex, GlobalIndex, MemoryIndex, TableIndex, TypeIndex},
 };
-use crate::error::{CompileError, CompileResult};
-use crate::types::{FuncIndex, GlobalIndex, MemoryIndex, TableIndex, TypeIndex};
+
+/// A wasm translation result.
+pub type TranslateResult<T> = Result<T, TranslateError>;
 
 /// Errors produced while translating wasm to CLIF.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,32 +50,6 @@ pub enum TranslateError {
     /// Any other translation failure.
     Other(String),
 }
-
-impl std::fmt::Display for TranslateError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TranslateError::Unsupported(msg) => write!(f, "unsupported: {msg}"),
-            TranslateError::Other(msg) => write!(f, "{msg}"),
-        }
-    }
-}
-
-impl std::error::Error for TranslateError {}
-
-impl From<crate::error::CompileError> for TranslateError {
-    fn from(err: crate::error::CompileError) -> Self {
-        TranslateError::Other(err.to_string())
-    }
-}
-
-impl From<wasmparser::BinaryReaderError> for TranslateError {
-    fn from(err: wasmparser::BinaryReaderError) -> Self {
-        TranslateError::Other(err.to_string())
-    }
-}
-
-/// A wasm translation result.
-pub type TranslateResult<T> = Result<T, TranslateError>;
 
 /// Information about the presence of an associated `else` for an `if`, or the
 /// lack thereof.
@@ -155,6 +124,52 @@ pub enum ControlStackFrame {
         /// Size of the value stack at the beginning of the control block.
         original_stack_size: usize,
     },
+}
+
+/// Contains information passed along during a function's translation: the
+/// current value and control stacks, and the reachability of the current
+/// position.
+#[derive(Debug)]
+pub struct FuncTranslationState {
+    /// A stack of values corresponding to the active values in the input wasm
+    /// function at this point.
+    stack: Vec<Value>,
+    /// A stack of active control flow operations.
+    control_stack: Vec<ControlStackFrame>,
+    /// Is the current translation state still reachable?
+    reachable: bool,
+}
+
+/// WebAssembly to Cranelift IR function translator.
+///
+/// A single translator instance can be reused to translate multiple functions,
+/// which reduces heap allocation traffic.
+pub struct FuncTranslator {
+    func_ctx: cranelift_frontend::FunctionBuilderContext,
+    state: FuncTranslationState,
+}
+
+impl std::fmt::Display for TranslateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TranslateError::Unsupported(msg) => write!(f, "unsupported: {msg}"),
+            TranslateError::Other(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+impl std::error::Error for TranslateError {}
+
+impl From<crate::error::CompileError> for TranslateError {
+    fn from(err: crate::error::CompileError) -> Self {
+        TranslateError::Other(err.to_string())
+    }
+}
+
+impl From<wasmparser::BinaryReaderError> for TranslateError {
+    fn from(err: wasmparser::BinaryReaderError) -> Self {
+        TranslateError::Other(err.to_string())
+    }
 }
 
 impl ControlStackFrame {
@@ -274,20 +289,6 @@ impl ControlStackFrame {
         };
         stack.truncate(self.original_stack_size() - num_duplicated_params);
     }
-}
-
-/// Contains information passed along during a function's translation: the
-/// current value and control stacks, and the reachability of the current
-/// position.
-#[derive(Debug)]
-pub struct FuncTranslationState {
-    /// A stack of values corresponding to the active values in the input wasm
-    /// function at this point.
-    stack: Vec<Value>,
-    /// A stack of active control flow operations.
-    control_stack: Vec<ControlStackFrame>,
-    /// Is the current translation state still reachable?
-    reachable: bool,
 }
 
 impl FuncTranslationState {
@@ -448,15 +449,6 @@ impl FuncTranslationState {
     }
 }
 
-/// WebAssembly to Cranelift IR function translator.
-///
-/// A single translator instance can be reused to translate multiple functions,
-/// which reduces heap allocation traffic.
-pub struct FuncTranslator {
-    func_ctx: cranelift_frontend::FunctionBuilderContext,
-    state: FuncTranslationState,
-}
-
 impl FuncTranslator {
     /// Creates a new translator.
     pub fn new() -> Self {
@@ -532,46 +524,382 @@ impl Default for FuncTranslator {
     }
 }
 
-/// Declare local variables for the signature parameters that correspond to
-/// WebAssembly locals.
+/// Walks the module payloads, collecting declarations into `translator` and
+/// translating every defined function body.
 ///
-/// Returns the number of local variables declared.
-fn declare_wasm_parameters(builder: &mut FunctionBuilder, entry_block: Block) -> usize {
-    let sig_len = builder.func.signature.params.len();
-    let mut next_local: usize = 0;
-    for i in 0..sig_len {
-        let param = builder.func.signature.params[i];
-        // Skip the hidden `VMContext` parameter; every other parameter is a
-        // normal wasm parameter.
-        if param.purpose == ir::ArgumentPurpose::Normal {
-            let local = builder.declare_var(param.value_type);
-            next_local += 1;
-            let param_value = builder.block_params(entry_block)[i];
-            builder.def_var(local, param_value);
-            builder.set_val_label(param_value, ValueLabel::from_u32((next_local - 1) as u32));
+/// The input must already have been validated with [`crate::environment::wasm_features`]
+/// (the caller runs `gate_unsupported_features` first).
+pub fn translate_module(wasm: &[u8], translator: &mut Translator) -> CompileResult<()> {
+    let mut defined_func_types: Vec<TypeIndex> = Vec::new();
+
+    for payload in Parser::new(0).parse_all(wasm) {
+        let payload = payload.map_err(|err| CompileError::Validation(err.to_string()))?;
+        match payload {
+            Payload::Version { .. }
+            | Payload::End(_)
+            | Payload::CustomSection(_)
+            | Payload::DataCountSection { .. } => {}
+
+            Payload::TypeSection(section) => {
+                for entry in section {
+                    let group = entry.map_err(|err| CompileError::Validation(err.to_string()))?;
+                    for sub in group.types() {
+                        match &sub.composite_type.inner {
+                            CompositeInnerType::Func(ty) => {
+                                let mut sig = ir::Signature::new(translator.info.call_conv);
+                                sig.params.extend(ty.params().iter().map(|ty| {
+                                    ir::AbiParam::new(crate::types::valtype_to_clif(*ty))
+                                }));
+                                sig.returns.extend(ty.results().iter().map(|ty| {
+                                    ir::AbiParam::new(crate::types::valtype_to_clif(*ty))
+                                }));
+                                translator.info.wasm_types.push(ty.clone());
+                                translator.info.signatures.push(sig);
+                            }
+                            _ => {
+                                return Err(CompileError::Unsupported(
+                                    "GC types (struct/array) are outside the supported feature set"
+                                        .to_string(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            Payload::ImportSection(section) => {
+                for import in section.into_imports() {
+                    let import = import.map_err(|err| CompileError::Validation(err.to_string()))?;
+                    match import.ty {
+                        TypeRef::Func(type_index) => {
+                            translator
+                                .info
+                                .functions
+                                .push(TypeIndex::from_u32(type_index));
+                            translator
+                                .info
+                                .imported_funcs
+                                .push(crate::environment::FuncImport {
+                                    module: import.module.to_string(),
+                                    field: import.name.to_string(),
+                                    type_index: TypeIndex::from_u32(type_index),
+                                });
+                        }
+                        TypeRef::Table(ty) => {
+                            translator.info.tables.push(crate::types::Table::from(ty));
+                            translator
+                                .info
+                                .imported_tables
+                                .push(crate::environment::TableImport {
+                                    module: import.module.to_string(),
+                                    field: import.name.to_string(),
+                                    table: crate::types::Table::from(ty),
+                                });
+                        }
+                        TypeRef::Memory(ty) => {
+                            translator
+                                .info
+                                .memories
+                                .push(crate::types::Memory::from(ty));
+                            translator.info.imported_memories.push(
+                                crate::environment::MemoryImport {
+                                    module: import.module.to_string(),
+                                    field: import.name.to_string(),
+                                    memory: crate::types::Memory::from(ty),
+                                },
+                            );
+                        }
+                        TypeRef::Global(ty) => {
+                            translator
+                                .info
+                                .globals
+                                .push((crate::types::Global::from(ty), None));
+                            translator.info.imported_globals.push(
+                                crate::environment::GlobalImport {
+                                    module: import.module.to_string(),
+                                    field: import.name.to_string(),
+                                    global: crate::types::Global::from(ty),
+                                },
+                            );
+                        }
+                        TypeRef::Tag(_) | TypeRef::FuncExact(_) => {
+                            return Err(CompileError::Unsupported(
+                                "exception handling / exact function types are outside the \
+                                 supported feature set"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            Payload::FunctionSection(section) => {
+                for entry in section {
+                    let type_index =
+                        entry.map_err(|err| CompileError::Validation(err.to_string()))?;
+                    let type_index = TypeIndex::from_u32(type_index);
+                    translator.info.functions.push(type_index);
+                    defined_func_types.push(type_index);
+                }
+            }
+
+            Payload::TableSection(section) => {
+                for entry in section {
+                    let table = entry.map_err(|err| CompileError::Validation(err.to_string()))?;
+                    translator
+                        .info
+                        .tables
+                        .push(crate::types::Table::from(table.ty));
+                }
+            }
+
+            Payload::MemorySection(section) => {
+                for entry in section {
+                    let memory = entry.map_err(|err| CompileError::Validation(err.to_string()))?;
+                    translator
+                        .info
+                        .memories
+                        .push(crate::types::Memory::from(memory));
+                }
+            }
+
+            Payload::GlobalSection(section) => {
+                for entry in section {
+                    let global = entry.map_err(|err| CompileError::Validation(err.to_string()))?;
+                    let init = crate::types::ConstExpr::parse(&global.init_expr)
+                        .map_err(CompileError::Unsupported)?;
+                    translator
+                        .info
+                        .globals
+                        .push((crate::types::Global::from(global.ty), Some(init)));
+                }
+            }
+
+            Payload::ExportSection(section) => {
+                for entry in section {
+                    let export = entry.map_err(|err| CompileError::Validation(err.to_string()))?;
+                    match export.kind {
+                        ExternalKind::Func => translator
+                            .info
+                            .func_exports
+                            .push((FuncIndex::from_u32(export.index), export.name.to_string())),
+                        ExternalKind::Table => translator
+                            .info
+                            .table_exports
+                            .push((TableIndex::from_u32(export.index), export.name.to_string())),
+                        ExternalKind::Memory => translator
+                            .info
+                            .memory_exports
+                            .push((MemoryIndex::from_u32(export.index), export.name.to_string())),
+                        ExternalKind::Global => translator
+                            .info
+                            .global_exports
+                            .push((GlobalIndex::from_u32(export.index), export.name.to_string())),
+                        ExternalKind::Tag => {
+                            return Err(CompileError::Unsupported(
+                                "exception handling is outside the supported feature set"
+                                    .to_string(),
+                            ));
+                        }
+                        _ => {
+                            return Err(CompileError::Unsupported(format!(
+                                "unsupported export kind {:?}",
+                                export.kind
+                            )));
+                        }
+                    }
+                }
+            }
+
+            Payload::StartSection { func, .. } => {
+                translator.info.start_func = Some(FuncIndex::from_u32(func));
+            }
+
+            Payload::ElementSection(section) => {
+                for entry in section {
+                    let element = entry.map_err(|err| CompileError::Validation(err.to_string()))?;
+                    let elements = read_elems(&element.items)?;
+                    let record = match element.kind {
+                        ElementKind::Active {
+                            table_index,
+                            offset_expr,
+                        } => {
+                            let (base, offset) = const_offset(&offset_expr)?;
+                            ElemSegRecord {
+                                kind: ElemSegKind::Active {
+                                    table_index: TableIndex::from_u32(table_index.unwrap_or(0)),
+                                    base,
+                                    offset: offset as u32,
+                                },
+                                elements,
+                            }
+                        }
+                        ElementKind::Passive => ElemSegRecord {
+                            kind: ElemSegKind::Passive,
+                            elements,
+                        },
+                        ElementKind::Declared => ElemSegRecord {
+                            kind: ElemSegKind::Declarative,
+                            elements,
+                        },
+                    };
+                    translator.info.elem_segments.push(record);
+                }
+            }
+
+            Payload::DataSection(section) => {
+                for entry in section {
+                    let data = entry.map_err(|err| CompileError::Validation(err.to_string()))?;
+                    let record = match data.kind {
+                        DataKind::Active {
+                            memory_index,
+                            offset_expr,
+                        } => {
+                            let (base, offset) = const_offset(&offset_expr)?;
+                            DataSegRecord {
+                                kind: DataSegKind::Active {
+                                    memory_index: MemoryIndex::from_u32(memory_index),
+                                    base,
+                                    offset,
+                                },
+                                data: data.data.to_vec(),
+                            }
+                        }
+                        DataKind::Passive => DataSegRecord {
+                            kind: DataSegKind::Passive,
+                            data: data.data.to_vec(),
+                        },
+                    };
+                    translator.info.data_segments.push(record);
+                }
+            }
+
+            Payload::CodeSectionStart { .. } => {}
+
+            Payload::CodeSectionEntry(body) => {
+                let type_index = defined_func_types
+                    .get(translator.info.function_bodies.len())
+                    .copied()
+                    .ok_or_else(|| {
+                        CompileError::Internal(
+                            "code section has more entries than the function section".to_string(),
+                        )
+                    })?;
+                translate_function_body(translator, body, type_index)?;
+            }
+
+            // Never produced for a validated core module with the v1 feature
+            // set (tags are handled above; components and the rest are gated
+            // off).
+            other => {
+                return Err(CompileError::Internal(format!(
+                    "unexpected payload during translation: {other:?}"
+                )));
+            }
         }
-    }
-    next_local
-}
-
-/// Parse the local variable declarations that precede the function body.
-///
-/// Declare local variables, starting from `num_params`.
-fn parse_local_decls(
-    reader: &mut BinaryReader<'_>,
-    builder: &mut FunctionBuilder,
-    num_params: usize,
-) -> TranslateResult<()> {
-    let mut next_local = num_params;
-    let local_count = reader.read_var_u32()?;
-
-    for _ in 0..local_count {
-        let count = reader.read_var_u32()?;
-        let ty = reader.read::<ValType>()?;
-        declare_locals(builder, count, ty, &mut next_local)?;
     }
 
     Ok(())
+}
+
+/// Checks that an atomic address is aligned, trapping `HEAP_OUT_OF_BOUNDS`
+/// (the artifact maps heap misalignment to `MemoryOutOfBounds`, matching the
+/// historical `HeapMisaligned` trap) if not.
+fn align_atomic_addr(
+    memarg: &MemArg,
+    loaded_bytes: u32,
+    builder: &mut FunctionBuilder,
+    state: &mut FuncTranslationState,
+) {
+    // Atomic addresses must all be aligned correctly; the check runs before
+    // the out-of-bounds check (matching the threads proposal's current
+    // semantics).
+    if loaded_bytes > 1 {
+        let addr = state.peek1();
+        let effective_addr = if memarg.offset == 0 {
+            addr
+        } else {
+            builder
+                .ins()
+                .iadd_imm_s(addr, i64::from(memarg.offset as i32))
+        };
+        debug_assert!(loaded_bytes.is_power_of_two());
+        let misalignment = builder
+            .ins()
+            .band_imm_u(effective_addr, i64::from(loaded_bytes - 1));
+        let f = builder.ins().icmp_imm_u(IntCC::NotEqual, misalignment, 0);
+        builder.ins().trapnz(f, ir::TrapCode::HEAP_OUT_OF_BOUNDS);
+    }
+}
+
+/// Create a `Block` with the given Wasm parameters.
+fn block_with_params(builder: &mut FunctionBuilder, params: &[ValType]) -> Block {
+    let block = builder.create_block();
+    for ty in params {
+        builder.append_block_param(block, crate::types::valtype_to_clif(*ty));
+    }
+    block
+}
+
+/// Get the parameter and result types for the given Wasm blocktype.
+fn blocktype_params_results(
+    info: &ModuleInfo,
+    ty: BlockType,
+) -> TranslateResult<(Vec<ValType>, Vec<ValType>)> {
+    Ok(match ty {
+        BlockType::Empty => (Vec::new(), Vec::new()),
+        BlockType::Type(ty) => (Vec::new(), vec![ty]),
+        BlockType::FuncType(ty_index) => {
+            let ty = &info.wasm_types[TypeIndex::from_u32(ty_index)];
+            (ty.params().to_vec(), ty.results().to_vec())
+        }
+    })
+}
+
+/// The same but for a `brif` instruction.
+fn canonicalise_brif(
+    builder: &mut FunctionBuilder,
+    cond: ir::Value,
+    block_then: ir::Block,
+    params_then: &[ir::Value],
+    block_else: ir::Block,
+    params_else: &[ir::Value],
+) -> ir::Inst {
+    let args_then: Vec<BlockArg> = params_then.iter().copied().map(BlockArg::from).collect();
+    let args_else: Vec<BlockArg> = params_else.iter().copied().map(BlockArg::from).collect();
+    builder
+        .ins()
+        .brif(cond, block_then, &args_then, block_else, &args_else)
+}
+
+/// Generate a `jump` instruction to `destination` with `params`.
+fn canonicalise_then_jump(
+    builder: &mut FunctionBuilder,
+    destination: ir::Block,
+    params: &[ir::Value],
+) -> ir::Inst {
+    let args: Vec<BlockArg> = params.iter().copied().map(BlockArg::from).collect();
+    builder.ins().jump(destination, &args)
+}
+
+/// Extracts `(base_global, constant_offset)` from an active segment's offset
+/// constant expression.
+fn const_offset(expr: &ConstExpr<'_>) -> CompileResult<(Option<GlobalIndex>, u64)> {
+    let mut ops = expr.get_operators_reader();
+    let op = ops
+        .read()
+        .map_err(|err| CompileError::Validation(err.to_string()))?;
+    let out = match op {
+        Operator::I32Const { value } => (None, value as u64),
+        Operator::GlobalGet { global_index } => (Some(GlobalIndex::from_u32(global_index)), 0),
+        Operator::I64Const { value } => (None, value as u64),
+        other => {
+            return Err(CompileError::Unsupported(format!(
+                "unsupported segment offset expression {other:?}"
+            )));
+        }
+    };
+    Ok(out)
 }
 
 /// Declare `count` local variables of the same type, starting from `next_local`.
@@ -615,54 +943,480 @@ fn declare_locals(
     Ok(())
 }
 
-/// Get the parameter and result types for the given Wasm blocktype.
-fn blocktype_params_results(
-    info: &ModuleInfo,
-    ty: BlockType,
-) -> TranslateResult<(Vec<ValType>, Vec<ValType>)> {
-    Ok(match ty {
-        BlockType::Empty => (Vec::new(), Vec::new()),
-        BlockType::Type(ty) => (Vec::new(), vec![ty]),
-        BlockType::FuncType(ty_index) => {
-            let ty = &info.wasm_types[TypeIndex::from_u32(ty_index)];
-            (ty.params().to_vec(), ty.results().to_vec())
+/// Declare local variables for the signature parameters that correspond to
+/// WebAssembly locals.
+///
+/// Returns the number of local variables declared.
+fn declare_wasm_parameters(builder: &mut FunctionBuilder, entry_block: Block) -> usize {
+    let sig_len = builder.func.signature.params.len();
+    let mut next_local: usize = 0;
+    for i in 0..sig_len {
+        let param = builder.func.signature.params[i];
+        // Skip the hidden `VMContext` parameter; every other parameter is a
+        // normal wasm parameter.
+        if param.purpose == ir::ArgumentPurpose::Normal {
+            let local = builder.declare_var(param.value_type);
+            next_local += 1;
+            let param_value = builder.block_params(entry_block)[i];
+            builder.def_var(local, param_value);
+            builder.set_val_label(param_value, ValueLabel::from_u32((next_local - 1) as u32));
         }
-    })
-}
-
-/// Create a `Block` with the given Wasm parameters.
-fn block_with_params(builder: &mut FunctionBuilder, params: &[ValType]) -> Block {
-    let block = builder.create_block();
-    for ty in params {
-        builder.append_block_param(block, crate::types::valtype_to_clif(*ty));
     }
-    block
+    next_local
 }
 
-/// Generate a `jump` instruction to `destination` with `params`.
-fn canonicalise_then_jump(
-    builder: &mut FunctionBuilder,
-    destination: ir::Block,
-    params: &[ir::Value],
-) -> ir::Inst {
-    let args: Vec<BlockArg> = params.iter().copied().map(BlockArg::from).collect();
-    builder.ins().jump(destination, &args)
+/// Maps a wasm load operator to its CLIF opcode and result type.
+fn load_opcode_and_type(op: &Operator<'_>) -> (Opcode, ir::Type) {
+    use Operator::*;
+    match op {
+        I32Load { .. } => (Opcode::Load, types::I32),
+        I64Load { .. } => (Opcode::Load, types::I64),
+        F32Load { .. } => (Opcode::Load, types::F32),
+        F64Load { .. } => (Opcode::Load, types::F64),
+        I32Load8S { .. } => (Opcode::Sload8, types::I32),
+        I32Load8U { .. } => (Opcode::Uload8, types::I32),
+        I32Load16S { .. } => (Opcode::Sload16, types::I32),
+        I32Load16U { .. } => (Opcode::Uload16, types::I32),
+        I64Load8S { .. } => (Opcode::Sload8, types::I64),
+        I64Load8U { .. } => (Opcode::Uload8, types::I64),
+        I64Load16S { .. } => (Opcode::Sload16, types::I64),
+        I64Load16U { .. } => (Opcode::Uload16, types::I64),
+        I64Load32S { .. } => (Opcode::Sload32, types::I64),
+        I64Load32U { .. } => (Opcode::Uload32, types::I64),
+        _ => unreachable!("not a load operator"),
+    }
 }
 
-/// The same but for a `brif` instruction.
-fn canonicalise_brif(
+/// The size in bytes of the memory access for a load/store opcode.
+fn mem_op_size(opcode: Opcode, ty: ir::Type) -> u32 {
+    match opcode {
+        Opcode::Istore8 | Opcode::Sload8 | Opcode::Uload8 => 1,
+        Opcode::Istore16 | Opcode::Sload16 | Opcode::Uload16 => 2,
+        Opcode::Istore32 | Opcode::Sload32 | Opcode::Uload32 => 4,
+        Opcode::Store | Opcode::Load => ty.bytes(),
+        _ => panic!("unknown size of mem op for {opcode:?}"),
+    }
+}
+
+/// Parse the local variable declarations that precede the function body.
+///
+/// Declare local variables, starting from `num_params`.
+fn parse_local_decls(
+    reader: &mut BinaryReader<'_>,
     builder: &mut FunctionBuilder,
-    cond: ir::Value,
-    block_then: ir::Block,
-    params_then: &[ir::Value],
-    block_else: ir::Block,
-    params_else: &[ir::Value],
-) -> ir::Inst {
-    let args_then: Vec<BlockArg> = params_then.iter().copied().map(BlockArg::from).collect();
-    let args_else: Vec<BlockArg> = params_else.iter().copied().map(BlockArg::from).collect();
-    builder
+    num_params: usize,
+) -> TranslateResult<()> {
+    let mut next_local = num_params;
+    let local_count = reader.read_var_u32()?;
+
+    for _ in 0..local_count {
+        let count = reader.read_var_u32()?;
+        let ty = reader.read::<ValType>()?;
+        declare_locals(builder, count, ty, &mut next_local)?;
+    }
+
+    Ok(())
+}
+
+/// Extracts the function indices from an element-segment's items, using
+/// `FuncIndex::reserved_value()` (`u32::MAX`) for `ref.null` entries (the
+/// artifact's encoding for a null element).
+fn read_elems(items: &ElementItems<'_>) -> CompileResult<Vec<FuncIndex>> {
+    let mut elems = Vec::new();
+    match items {
+        ElementItems::Functions(funcs) => {
+            for func in funcs.clone() {
+                let idx = func.map_err(|err| CompileError::Validation(err.to_string()))?;
+                elems.push(FuncIndex::from_u32(idx));
+            }
+        }
+        ElementItems::Expressions(_ty, exprs) => {
+            for expr in exprs.clone() {
+                let expr = expr.map_err(|err| CompileError::Validation(err.to_string()))?;
+                let idx = match expr
+                    .get_operators_reader()
+                    .read()
+                    .map_err(|err| CompileError::Validation(err.to_string()))?
+                {
+                    Operator::RefNull { .. } => FuncIndex::reserved_value(),
+                    Operator::RefFunc { function_index } => FuncIndex::from_u32(function_index),
+                    other => {
+                        return Err(CompileError::Unsupported(format!(
+                            "unsupported element-segment initialiser {other:?}"
+                        )));
+                    }
+                };
+                elems.push(idx);
+            }
+        }
+    }
+    Ok(elems)
+}
+
+/// Maps a wasm store operator to its CLIF opcode and stored type.
+fn store_opcode_and_type(op: &Operator<'_>, val_ty: ir::Type) -> (Opcode, ir::Type) {
+    use Operator::*;
+    match op {
+        I32Store { .. } => (Opcode::Store, types::I32),
+        I64Store { .. } => (Opcode::Store, types::I64),
+        F32Store { .. } => (Opcode::Store, types::F32),
+        F64Store { .. } => (Opcode::Store, types::F64),
+        I32Store8 { .. } => (Opcode::Istore8, val_ty),
+        I32Store16 { .. } => (Opcode::Istore16, val_ty),
+        I64Store8 { .. } => (Opcode::Istore8, val_ty),
+        I64Store16 { .. } => (Opcode::Istore16, val_ty),
+        I64Store32 { .. } => (Opcode::Istore32, val_ty),
+        _ => unreachable!("not a store operator"),
+    }
+}
+
+/// Translates an atomic compare-and-swap.
+fn translate_atomic_cas(
+    widened_ty: ir::Type,
+    access_ty: ir::Type,
+    memarg: &MemArg,
+    builder: &mut FunctionBuilder,
+    state: &mut FuncTranslationState,
+    environ: &mut FuncEnv<'_>,
+) -> TranslateResult<()> {
+    let (mut expected, mut replacement) = state.pop2();
+    let expected_ty = builder.func.dfg.value_type(expected);
+    let replacement_ty = builder.func.dfg.value_type(replacement);
+
+    // The compare-and-swap is performed at type `access_ty`, and the old value
+    // is zero-extended to type `widened_ty`.
+    debug_assert!(widened_ty.bytes() >= access_ty.bytes());
+    debug_assert!(expected_ty.bytes() >= access_ty.bytes());
+    debug_assert!(replacement_ty.bytes() >= access_ty.bytes());
+    if expected_ty.bytes() > access_ty.bytes() {
+        expected = builder.ins().ireduce(access_ty, expected);
+    }
+    if replacement_ty.bytes() > access_ty.bytes() {
+        replacement = builder.ins().ireduce(access_ty, replacement);
+    }
+
+    align_atomic_addr(memarg, access_ty.bytes(), builder, state);
+    let index = state.pop1();
+    let (addr, _) = environ.memory_addr(
+        builder,
+        MemoryIndex::from_u32(memarg.memory),
+        index,
+        memarg.offset,
+        access_ty.bytes(),
+    )?;
+    let atomic_flags = mem_access_flags();
+
+    let mut res = builder
         .ins()
-        .brif(cond, block_then, &args_then, block_else, &args_else)
+        .atomic_cas(atomic_flags, addr, expected, replacement);
+    if access_ty != widened_ty {
+        res = builder.ins().uextend(widened_ty, res);
+    }
+    state.push1(res);
+    Ok(())
+}
+
+/// Translates an atomic load.
+fn translate_atomic_load(
+    widened_ty: ir::Type,
+    access_ty: ir::Type,
+    memarg: &MemArg,
+    builder: &mut FunctionBuilder,
+    state: &mut FuncTranslationState,
+    environ: &mut FuncEnv<'_>,
+) -> TranslateResult<()> {
+    // The load is performed at type `access_ty`, and the loaded value is zero
+    // extended to `widened_ty`.
+    debug_assert!(widened_ty.bytes() >= access_ty.bytes());
+
+    align_atomic_addr(memarg, access_ty.bytes(), builder, state);
+    let index = state.pop1();
+    let (addr, _) = environ.memory_addr(
+        builder,
+        MemoryIndex::from_u32(memarg.memory),
+        index,
+        memarg.offset,
+        access_ty.bytes(),
+    )?;
+    let atomic_flags = mem_access_flags();
+
+    let mut res = builder.ins().atomic_load(access_ty, atomic_flags, addr);
+    if access_ty != widened_ty {
+        res = builder.ins().uextend(widened_ty, res);
+    }
+    state.push1(res);
+    Ok(())
+}
+
+/// Translates an atomic read-modify-write.
+fn translate_atomic_rmw(
+    widened_ty: ir::Type,
+    access_ty: ir::Type,
+    op: AtomicRmwOp,
+    memarg: &MemArg,
+    builder: &mut FunctionBuilder,
+    state: &mut FuncTranslationState,
+    environ: &mut FuncEnv<'_>,
+) -> TranslateResult<()> {
+    let mut arg2 = state.pop1();
+    let arg2_ty = builder.func.dfg.value_type(arg2);
+
+    // The operation is performed at type `access_ty`, and the old value is
+    // zero-extended to type `widened_ty`.
+    debug_assert!(widened_ty.bytes() >= access_ty.bytes());
+    debug_assert!(arg2_ty.bytes() >= access_ty.bytes());
+    if arg2_ty.bytes() > access_ty.bytes() {
+        arg2 = builder.ins().ireduce(access_ty, arg2);
+    }
+
+    align_atomic_addr(memarg, access_ty.bytes(), builder, state);
+    let index = state.pop1();
+    let (addr, _) = environ.memory_addr(
+        builder,
+        MemoryIndex::from_u32(memarg.memory),
+        index,
+        memarg.offset,
+        access_ty.bytes(),
+    )?;
+    let atomic_flags = mem_access_flags();
+
+    let mut res = builder
+        .ins()
+        .atomic_rmw(access_ty, atomic_flags, op, addr, arg2);
+    if access_ty != widened_ty {
+        res = builder.ins().uextend(widened_ty, res);
+    }
+    state.push1(res);
+    Ok(())
+}
+
+/// Translates an atomic store.
+fn translate_atomic_store(
+    access_ty: ir::Type,
+    memarg: &MemArg,
+    builder: &mut FunctionBuilder,
+    state: &mut FuncTranslationState,
+    environ: &mut FuncEnv<'_>,
+) -> TranslateResult<()> {
+    let mut data = state.pop1();
+    let data_ty = builder.func.dfg.value_type(data);
+
+    // The operation is performed at type `access_ty`, and the data to be
+    // stored may first need to be narrowed accordingly.
+    debug_assert!(data_ty.bytes() >= access_ty.bytes());
+    if data_ty.bytes() > access_ty.bytes() {
+        data = builder.ins().ireduce(access_ty, data);
+    }
+
+    align_atomic_addr(memarg, access_ty.bytes(), builder, state);
+    let index = state.pop1();
+    let (addr, _) = environ.memory_addr(
+        builder,
+        MemoryIndex::from_u32(memarg.memory),
+        index,
+        memarg.offset,
+        access_ty.bytes(),
+    )?;
+    let atomic_flags = mem_access_flags();
+
+    builder.ins().atomic_store(atomic_flags, data, addr);
+    Ok(())
+}
+
+/// Translates a binary integer or float operator.
+fn translate_binop(
+    opcode: Opcode,
+    builder: &mut FunctionBuilder,
+    state: &mut FuncTranslationState,
+) {
+    let (arg0, arg1) = state.pop2();
+    let res = match opcode {
+        Opcode::Iadd => builder.ins().iadd(arg0, arg1),
+        Opcode::Isub => builder.ins().isub(arg0, arg1),
+        Opcode::Imul => builder.ins().imul(arg0, arg1),
+        Opcode::Sdiv => builder.ins().sdiv(arg0, arg1),
+        Opcode::Udiv => builder.ins().udiv(arg0, arg1),
+        Opcode::Srem => builder.ins().srem(arg0, arg1),
+        Opcode::Urem => builder.ins().urem(arg0, arg1),
+        Opcode::Band => builder.ins().band(arg0, arg1),
+        Opcode::Bor => builder.ins().bor(arg0, arg1),
+        Opcode::Bxor => builder.ins().bxor(arg0, arg1),
+        Opcode::Ishl => builder.ins().ishl(arg0, arg1),
+        Opcode::Sshr => builder.ins().sshr(arg0, arg1),
+        Opcode::Ushr => builder.ins().ushr(arg0, arg1),
+        Opcode::Rotl => builder.ins().rotl(arg0, arg1),
+        Opcode::Rotr => builder.ins().rotr(arg0, arg1),
+        Opcode::Fadd => builder.ins().fadd(arg0, arg1),
+        Opcode::Fsub => builder.ins().fsub(arg0, arg1),
+        Opcode::Fmul => builder.ins().fmul(arg0, arg1),
+        Opcode::Fdiv => builder.ins().fdiv(arg0, arg1),
+        Opcode::Fmin => builder.ins().fmin(arg0, arg1),
+        Opcode::Fmax => builder.ins().fmax(arg0, arg1),
+        Opcode::Fcopysign => builder.ins().fcopysign(arg0, arg1),
+        _ => unreachable!("not a binary operator"),
+    };
+    state.push1(res);
+}
+
+fn translate_br_if(
+    relative_depth: u32,
+    builder: &mut FunctionBuilder,
+    state: &mut FuncTranslationState,
+) {
+    let val = state.pop1();
+    let (br_destination, inputs) = translate_br_if_args(relative_depth, state);
+    let next_block = builder.create_block();
+    canonicalise_brif(builder, val, br_destination, inputs, next_block, &[]);
+
+    builder.seal_block(next_block); // The only predecessor is the current block.
+    builder.switch_to_block(next_block);
+}
+
+fn translate_br_if_args(
+    relative_depth: u32,
+    state: &mut FuncTranslationState,
+) -> (ir::Block, &mut [ir::Value]) {
+    let i = state.control_stack.len() - 1 - (relative_depth as usize);
+    let (return_count, br_destination) = {
+        let frame = &mut state.control_stack[i];
+        // The values returned by the branch are still available for the
+        // reachable code that comes after it.
+        frame.set_branched_to_exit();
+        let return_count = if frame.is_loop() {
+            frame.num_param_values()
+        } else {
+            frame.num_return_values()
+        };
+        (return_count, frame.br_destination())
+    };
+    let inputs = state.peekn_mut(return_count);
+    (br_destination, inputs)
+}
+
+/// Translates an `fcmp` operator, pushing the zero-extended `i32` result.
+fn translate_fcmp(cc: FloatCC, builder: &mut FunctionBuilder, state: &mut FuncTranslationState) {
+    let (arg0, arg1) = state.pop2();
+    let val = builder.ins().fcmp(cc, arg0, arg1);
+    state.push1(builder.ins().uextend(types::I32, val));
+}
+
+/// Translates an int-to-float conversion.
+fn translate_fcvt_from_sint(
+    result_ty: ir::Type,
+    builder: &mut FunctionBuilder,
+    state: &mut FuncTranslationState,
+) {
+    let val = state.pop1();
+    state.push1(builder.ins().fcvt_from_sint(result_ty, val));
+}
+
+fn translate_fcvt_from_uint(
+    result_ty: ir::Type,
+    builder: &mut FunctionBuilder,
+    state: &mut FuncTranslationState,
+) {
+    let val = state.pop1();
+    state.push1(builder.ins().fcvt_from_uint(result_ty, val));
+}
+
+/// Translates a float-to-int conversion that traps on overflow / invalid.
+fn translate_fcvt_to_sint(
+    result_ty: ir::Type,
+    builder: &mut FunctionBuilder,
+    state: &mut FuncTranslationState,
+) {
+    let val = state.pop1();
+    state.push1(builder.ins().fcvt_to_sint(result_ty, val));
+}
+
+/// Translates a saturating float-to-int conversion.
+fn translate_fcvt_to_sint_sat(
+    result_ty: ir::Type,
+    builder: &mut FunctionBuilder,
+    state: &mut FuncTranslationState,
+) {
+    let val = state.pop1();
+    state.push1(builder.ins().fcvt_to_sint_sat(result_ty, val));
+}
+
+fn translate_fcvt_to_uint(
+    result_ty: ir::Type,
+    builder: &mut FunctionBuilder,
+    state: &mut FuncTranslationState,
+) {
+    let val = state.pop1();
+    state.push1(builder.ins().fcvt_to_uint(result_ty, val));
+}
+
+fn translate_fcvt_to_uint_sat(
+    result_ty: ir::Type,
+    builder: &mut FunctionBuilder,
+    state: &mut FuncTranslationState,
+) {
+    let val = state.pop1();
+    state.push1(builder.ins().fcvt_to_uint_sat(result_ty, val));
+}
+
+/// Translates one defined function body into CLIF and stores it.
+fn translate_function_body(
+    translator: &mut Translator,
+    body: FunctionBody<'_>,
+    type_index: TypeIndex,
+) -> CompileResult<()> {
+    let sig = translator.func_env().vmctx_sig(type_index);
+    let defined_index = translator.info.function_bodies.len();
+    let mut func =
+        ir::Function::with_name_signature(ir::UserFuncName::user(0, defined_index as u32), sig);
+
+    let mut func_env = FuncEnv::new(&translator.info);
+    translator
+        .trans
+        .translate_body(body, &mut func, &mut func_env)
+        .map_err(crate::environment::translate_error)?;
+    translator.info.function_bodies.push(func);
+    Ok(())
+}
+
+/// Translates an `icmp` operator, pushing the zero-extended `i32` result.
+fn translate_icmp(cc: IntCC, builder: &mut FunctionBuilder, state: &mut FuncTranslationState) {
+    let (arg0, arg1) = state.pop2();
+    let val = builder.ins().icmp(cc, arg0, arg1);
+    state.push1(builder.ins().uextend(types::I32, val));
+}
+
+/// Translates a wasm load instruction into a bounds-checked CLIF load.
+fn translate_load(
+    op: &Operator<'_>,
+    memarg: &MemArg,
+    builder: &mut FunctionBuilder,
+    state: &mut FuncTranslationState,
+    environ: &mut FuncEnv<'_>,
+) -> TranslateResult<()> {
+    let (opcode, result_ty) = load_opcode_and_type(op);
+    let index = state.pop1();
+    let mem_op_size = mem_op_size(opcode, result_ty);
+    let (addr, flags) = environ.memory_addr(
+        builder,
+        MemoryIndex::from_u32(memarg.memory),
+        index,
+        memarg.offset,
+        mem_op_size,
+    )?;
+    let offset = Offset32::new(0);
+    let val = match opcode {
+        Opcode::Load => builder.ins().load(result_ty, flags, addr, offset),
+        Opcode::Sload8 => builder.ins().sload8(result_ty, flags, addr, offset),
+        Opcode::Uload8 => builder.ins().uload8(result_ty, flags, addr, offset),
+        Opcode::Sload16 => builder.ins().sload16(result_ty, flags, addr, offset),
+        Opcode::Uload16 => builder.ins().uload16(result_ty, flags, addr, offset),
+        // `sload32`/`uload32` infer their result type from the address
+        // operand (always i64 for wasm32), so no explicit type is passed.
+        Opcode::Sload32 => builder.ins().sload32(flags, addr, offset),
+        Opcode::Uload32 => builder.ins().uload32(flags, addr, offset),
+        _ => unreachable!("not a load opcode"),
+    };
+    state.push1(val);
+    Ok(())
 }
 
 /// Translates a single operator.
@@ -1957,6 +2711,65 @@ fn translate_operator(
     Ok(())
 }
 
+/// Translates a wasm store instruction into a bounds-checked CLIF store.
+fn translate_store(
+    op: &Operator<'_>,
+    memarg: &MemArg,
+    builder: &mut FunctionBuilder,
+    state: &mut FuncTranslationState,
+    environ: &mut FuncEnv<'_>,
+) -> TranslateResult<()> {
+    let val = state.pop1();
+    let val_ty = builder.func.dfg.value_type(val);
+    let (opcode, _) = store_opcode_and_type(op, val_ty);
+    let mem_op_size = mem_op_size(opcode, val_ty);
+
+    let index = state.pop1();
+    let (addr, flags) = environ.memory_addr(
+        builder,
+        MemoryIndex::from_u32(memarg.memory),
+        index,
+        memarg.offset,
+        mem_op_size,
+    )?;
+    let offset = Offset32::new(0);
+    match opcode {
+        Opcode::Store => {
+            builder.ins().store(flags, val, addr, offset);
+        }
+        Opcode::Istore8 => {
+            builder.ins().istore8(flags, val, addr, offset);
+        }
+        Opcode::Istore16 => {
+            builder.ins().istore16(flags, val, addr, offset);
+        }
+        Opcode::Istore32 => {
+            builder.ins().istore32(flags, val, addr, offset);
+        }
+        _ => unreachable!("not a store opcode"),
+    }
+    Ok(())
+}
+
+/// Translates a unary integer or float operator.
+fn translate_unop(opcode: Opcode, builder: &mut FunctionBuilder, state: &mut FuncTranslationState) {
+    let val = state.pop1();
+    let res = match opcode {
+        Opcode::Clz => builder.ins().clz(val),
+        Opcode::Ctz => builder.ins().ctz(val),
+        Opcode::Popcnt => builder.ins().popcnt(val),
+        Opcode::Fabs => builder.ins().fabs(val),
+        Opcode::Fneg => builder.ins().fneg(val),
+        Opcode::Ceil => builder.ins().ceil(val),
+        Opcode::Floor => builder.ins().floor(val),
+        Opcode::Trunc => builder.ins().trunc(val),
+        Opcode::Nearest => builder.ins().nearest(val),
+        Opcode::Sqrt => builder.ins().sqrt(val),
+        _ => unreachable!("not a unary operator"),
+    };
+    state.push1(res);
+}
+
 /// Handle operators in statically unreachable code: only the control-flow
 /// frames need to stay balanced.
 fn translate_unreachable_operator(
@@ -2093,826 +2906,5 @@ fn translate_unreachable_operator(
         }
     }
 
-    Ok(())
-}
-
-fn translate_br_if(
-    relative_depth: u32,
-    builder: &mut FunctionBuilder,
-    state: &mut FuncTranslationState,
-) {
-    let val = state.pop1();
-    let (br_destination, inputs) = translate_br_if_args(relative_depth, state);
-    let next_block = builder.create_block();
-    canonicalise_brif(builder, val, br_destination, inputs, next_block, &[]);
-
-    builder.seal_block(next_block); // The only predecessor is the current block.
-    builder.switch_to_block(next_block);
-}
-
-fn translate_br_if_args(
-    relative_depth: u32,
-    state: &mut FuncTranslationState,
-) -> (ir::Block, &mut [ir::Value]) {
-    let i = state.control_stack.len() - 1 - (relative_depth as usize);
-    let (return_count, br_destination) = {
-        let frame = &mut state.control_stack[i];
-        // The values returned by the branch are still available for the
-        // reachable code that comes after it.
-        frame.set_branched_to_exit();
-        let return_count = if frame.is_loop() {
-            frame.num_param_values()
-        } else {
-            frame.num_return_values()
-        };
-        (return_count, frame.br_destination())
-    };
-    let inputs = state.peekn_mut(return_count);
-    (br_destination, inputs)
-}
-
-/// Translates an `icmp` operator, pushing the zero-extended `i32` result.
-fn translate_icmp(cc: IntCC, builder: &mut FunctionBuilder, state: &mut FuncTranslationState) {
-    let (arg0, arg1) = state.pop2();
-    let val = builder.ins().icmp(cc, arg0, arg1);
-    state.push1(builder.ins().uextend(types::I32, val));
-}
-
-/// Translates an `fcmp` operator, pushing the zero-extended `i32` result.
-fn translate_fcmp(cc: FloatCC, builder: &mut FunctionBuilder, state: &mut FuncTranslationState) {
-    let (arg0, arg1) = state.pop2();
-    let val = builder.ins().fcmp(cc, arg0, arg1);
-    state.push1(builder.ins().uextend(types::I32, val));
-}
-
-/// Translates a unary integer or float operator.
-fn translate_unop(opcode: Opcode, builder: &mut FunctionBuilder, state: &mut FuncTranslationState) {
-    let val = state.pop1();
-    let res = match opcode {
-        Opcode::Clz => builder.ins().clz(val),
-        Opcode::Ctz => builder.ins().ctz(val),
-        Opcode::Popcnt => builder.ins().popcnt(val),
-        Opcode::Fabs => builder.ins().fabs(val),
-        Opcode::Fneg => builder.ins().fneg(val),
-        Opcode::Ceil => builder.ins().ceil(val),
-        Opcode::Floor => builder.ins().floor(val),
-        Opcode::Trunc => builder.ins().trunc(val),
-        Opcode::Nearest => builder.ins().nearest(val),
-        Opcode::Sqrt => builder.ins().sqrt(val),
-        _ => unreachable!("not a unary operator"),
-    };
-    state.push1(res);
-}
-
-/// Translates a binary integer or float operator.
-fn translate_binop(
-    opcode: Opcode,
-    builder: &mut FunctionBuilder,
-    state: &mut FuncTranslationState,
-) {
-    let (arg0, arg1) = state.pop2();
-    let res = match opcode {
-        Opcode::Iadd => builder.ins().iadd(arg0, arg1),
-        Opcode::Isub => builder.ins().isub(arg0, arg1),
-        Opcode::Imul => builder.ins().imul(arg0, arg1),
-        Opcode::Sdiv => builder.ins().sdiv(arg0, arg1),
-        Opcode::Udiv => builder.ins().udiv(arg0, arg1),
-        Opcode::Srem => builder.ins().srem(arg0, arg1),
-        Opcode::Urem => builder.ins().urem(arg0, arg1),
-        Opcode::Band => builder.ins().band(arg0, arg1),
-        Opcode::Bor => builder.ins().bor(arg0, arg1),
-        Opcode::Bxor => builder.ins().bxor(arg0, arg1),
-        Opcode::Ishl => builder.ins().ishl(arg0, arg1),
-        Opcode::Sshr => builder.ins().sshr(arg0, arg1),
-        Opcode::Ushr => builder.ins().ushr(arg0, arg1),
-        Opcode::Rotl => builder.ins().rotl(arg0, arg1),
-        Opcode::Rotr => builder.ins().rotr(arg0, arg1),
-        Opcode::Fadd => builder.ins().fadd(arg0, arg1),
-        Opcode::Fsub => builder.ins().fsub(arg0, arg1),
-        Opcode::Fmul => builder.ins().fmul(arg0, arg1),
-        Opcode::Fdiv => builder.ins().fdiv(arg0, arg1),
-        Opcode::Fmin => builder.ins().fmin(arg0, arg1),
-        Opcode::Fmax => builder.ins().fmax(arg0, arg1),
-        Opcode::Fcopysign => builder.ins().fcopysign(arg0, arg1),
-        _ => unreachable!("not a binary operator"),
-    };
-    state.push1(res);
-}
-
-/// Translates a float-to-int conversion that traps on overflow / invalid.
-fn translate_fcvt_to_sint(
-    result_ty: ir::Type,
-    builder: &mut FunctionBuilder,
-    state: &mut FuncTranslationState,
-) {
-    let val = state.pop1();
-    state.push1(builder.ins().fcvt_to_sint(result_ty, val));
-}
-
-fn translate_fcvt_to_uint(
-    result_ty: ir::Type,
-    builder: &mut FunctionBuilder,
-    state: &mut FuncTranslationState,
-) {
-    let val = state.pop1();
-    state.push1(builder.ins().fcvt_to_uint(result_ty, val));
-}
-
-/// Translates a saturating float-to-int conversion.
-fn translate_fcvt_to_sint_sat(
-    result_ty: ir::Type,
-    builder: &mut FunctionBuilder,
-    state: &mut FuncTranslationState,
-) {
-    let val = state.pop1();
-    state.push1(builder.ins().fcvt_to_sint_sat(result_ty, val));
-}
-
-fn translate_fcvt_to_uint_sat(
-    result_ty: ir::Type,
-    builder: &mut FunctionBuilder,
-    state: &mut FuncTranslationState,
-) {
-    let val = state.pop1();
-    state.push1(builder.ins().fcvt_to_uint_sat(result_ty, val));
-}
-
-/// Translates an int-to-float conversion.
-fn translate_fcvt_from_sint(
-    result_ty: ir::Type,
-    builder: &mut FunctionBuilder,
-    state: &mut FuncTranslationState,
-) {
-    let val = state.pop1();
-    state.push1(builder.ins().fcvt_from_sint(result_ty, val));
-}
-
-fn translate_fcvt_from_uint(
-    result_ty: ir::Type,
-    builder: &mut FunctionBuilder,
-    state: &mut FuncTranslationState,
-) {
-    let val = state.pop1();
-    state.push1(builder.ins().fcvt_from_uint(result_ty, val));
-}
-
-/// The size in bytes of the memory access for a load/store opcode.
-fn mem_op_size(opcode: Opcode, ty: ir::Type) -> u32 {
-    match opcode {
-        Opcode::Istore8 | Opcode::Sload8 | Opcode::Uload8 => 1,
-        Opcode::Istore16 | Opcode::Sload16 | Opcode::Uload16 => 2,
-        Opcode::Istore32 | Opcode::Sload32 | Opcode::Uload32 => 4,
-        Opcode::Store | Opcode::Load => ty.bytes(),
-        _ => panic!("unknown size of mem op for {opcode:?}"),
-    }
-}
-
-/// Translates a wasm load instruction into a bounds-checked CLIF load.
-fn translate_load(
-    op: &Operator<'_>,
-    memarg: &MemArg,
-    builder: &mut FunctionBuilder,
-    state: &mut FuncTranslationState,
-    environ: &mut FuncEnv<'_>,
-) -> TranslateResult<()> {
-    let (opcode, result_ty) = load_opcode_and_type(op);
-    let index = state.pop1();
-    let mem_op_size = mem_op_size(opcode, result_ty);
-    let (addr, flags) = environ.memory_addr(
-        builder,
-        MemoryIndex::from_u32(memarg.memory),
-        index,
-        memarg.offset,
-        mem_op_size,
-    )?;
-    let offset = Offset32::new(0);
-    let val = match opcode {
-        Opcode::Load => builder.ins().load(result_ty, flags, addr, offset),
-        Opcode::Sload8 => builder.ins().sload8(result_ty, flags, addr, offset),
-        Opcode::Uload8 => builder.ins().uload8(result_ty, flags, addr, offset),
-        Opcode::Sload16 => builder.ins().sload16(result_ty, flags, addr, offset),
-        Opcode::Uload16 => builder.ins().uload16(result_ty, flags, addr, offset),
-        // `sload32`/`uload32` infer their result type from the address
-        // operand (always i64 for wasm32), so no explicit type is passed.
-        Opcode::Sload32 => builder.ins().sload32(flags, addr, offset),
-        Opcode::Uload32 => builder.ins().uload32(flags, addr, offset),
-        _ => unreachable!("not a load opcode"),
-    };
-    state.push1(val);
-    Ok(())
-}
-
-/// Translates a wasm store instruction into a bounds-checked CLIF store.
-fn translate_store(
-    op: &Operator<'_>,
-    memarg: &MemArg,
-    builder: &mut FunctionBuilder,
-    state: &mut FuncTranslationState,
-    environ: &mut FuncEnv<'_>,
-) -> TranslateResult<()> {
-    let val = state.pop1();
-    let val_ty = builder.func.dfg.value_type(val);
-    let (opcode, _) = store_opcode_and_type(op, val_ty);
-    let mem_op_size = mem_op_size(opcode, val_ty);
-
-    let index = state.pop1();
-    let (addr, flags) = environ.memory_addr(
-        builder,
-        MemoryIndex::from_u32(memarg.memory),
-        index,
-        memarg.offset,
-        mem_op_size,
-    )?;
-    let offset = Offset32::new(0);
-    match opcode {
-        Opcode::Store => {
-            builder.ins().store(flags, val, addr, offset);
-        }
-        Opcode::Istore8 => {
-            builder.ins().istore8(flags, val, addr, offset);
-        }
-        Opcode::Istore16 => {
-            builder.ins().istore16(flags, val, addr, offset);
-        }
-        Opcode::Istore32 => {
-            builder.ins().istore32(flags, val, addr, offset);
-        }
-        _ => unreachable!("not a store opcode"),
-    }
-    Ok(())
-}
-
-/// Maps a wasm load operator to its CLIF opcode and result type.
-fn load_opcode_and_type(op: &Operator<'_>) -> (Opcode, ir::Type) {
-    use Operator::*;
-    match op {
-        I32Load { .. } => (Opcode::Load, types::I32),
-        I64Load { .. } => (Opcode::Load, types::I64),
-        F32Load { .. } => (Opcode::Load, types::F32),
-        F64Load { .. } => (Opcode::Load, types::F64),
-        I32Load8S { .. } => (Opcode::Sload8, types::I32),
-        I32Load8U { .. } => (Opcode::Uload8, types::I32),
-        I32Load16S { .. } => (Opcode::Sload16, types::I32),
-        I32Load16U { .. } => (Opcode::Uload16, types::I32),
-        I64Load8S { .. } => (Opcode::Sload8, types::I64),
-        I64Load8U { .. } => (Opcode::Uload8, types::I64),
-        I64Load16S { .. } => (Opcode::Sload16, types::I64),
-        I64Load16U { .. } => (Opcode::Uload16, types::I64),
-        I64Load32S { .. } => (Opcode::Sload32, types::I64),
-        I64Load32U { .. } => (Opcode::Uload32, types::I64),
-        _ => unreachable!("not a load operator"),
-    }
-}
-
-/// Maps a wasm store operator to its CLIF opcode and stored type.
-fn store_opcode_and_type(op: &Operator<'_>, val_ty: ir::Type) -> (Opcode, ir::Type) {
-    use Operator::*;
-    match op {
-        I32Store { .. } => (Opcode::Store, types::I32),
-        I64Store { .. } => (Opcode::Store, types::I64),
-        F32Store { .. } => (Opcode::Store, types::F32),
-        F64Store { .. } => (Opcode::Store, types::F64),
-        I32Store8 { .. } => (Opcode::Istore8, val_ty),
-        I32Store16 { .. } => (Opcode::Istore16, val_ty),
-        I64Store8 { .. } => (Opcode::Istore8, val_ty),
-        I64Store16 { .. } => (Opcode::Istore16, val_ty),
-        I64Store32 { .. } => (Opcode::Istore32, val_ty),
-        _ => unreachable!("not a store operator"),
-    }
-}
-
-/// Checks that an atomic address is aligned, trapping `HEAP_OUT_OF_BOUNDS`
-/// (the artifact maps heap misalignment to `MemoryOutOfBounds`, matching the
-/// historical `HeapMisaligned` trap) if not.
-fn align_atomic_addr(
-    memarg: &MemArg,
-    loaded_bytes: u32,
-    builder: &mut FunctionBuilder,
-    state: &mut FuncTranslationState,
-) {
-    // Atomic addresses must all be aligned correctly; the check runs before
-    // the out-of-bounds check (matching the threads proposal's current
-    // semantics).
-    if loaded_bytes > 1 {
-        let addr = state.peek1();
-        let effective_addr = if memarg.offset == 0 {
-            addr
-        } else {
-            builder
-                .ins()
-                .iadd_imm_s(addr, i64::from(memarg.offset as i32))
-        };
-        debug_assert!(loaded_bytes.is_power_of_two());
-        let misalignment = builder
-            .ins()
-            .band_imm_u(effective_addr, i64::from(loaded_bytes - 1));
-        let f = builder.ins().icmp_imm_u(IntCC::NotEqual, misalignment, 0);
-        builder.ins().trapnz(f, ir::TrapCode::HEAP_OUT_OF_BOUNDS);
-    }
-}
-
-/// Translates an atomic read-modify-write.
-fn translate_atomic_rmw(
-    widened_ty: ir::Type,
-    access_ty: ir::Type,
-    op: AtomicRmwOp,
-    memarg: &MemArg,
-    builder: &mut FunctionBuilder,
-    state: &mut FuncTranslationState,
-    environ: &mut FuncEnv<'_>,
-) -> TranslateResult<()> {
-    let mut arg2 = state.pop1();
-    let arg2_ty = builder.func.dfg.value_type(arg2);
-
-    // The operation is performed at type `access_ty`, and the old value is
-    // zero-extended to type `widened_ty`.
-    debug_assert!(widened_ty.bytes() >= access_ty.bytes());
-    debug_assert!(arg2_ty.bytes() >= access_ty.bytes());
-    if arg2_ty.bytes() > access_ty.bytes() {
-        arg2 = builder.ins().ireduce(access_ty, arg2);
-    }
-
-    align_atomic_addr(memarg, access_ty.bytes(), builder, state);
-    let index = state.pop1();
-    let (addr, _) = environ.memory_addr(
-        builder,
-        MemoryIndex::from_u32(memarg.memory),
-        index,
-        memarg.offset,
-        access_ty.bytes(),
-    )?;
-    let atomic_flags = mem_access_flags();
-
-    let mut res = builder
-        .ins()
-        .atomic_rmw(access_ty, atomic_flags, op, addr, arg2);
-    if access_ty != widened_ty {
-        res = builder.ins().uextend(widened_ty, res);
-    }
-    state.push1(res);
-    Ok(())
-}
-
-/// Translates an atomic compare-and-swap.
-fn translate_atomic_cas(
-    widened_ty: ir::Type,
-    access_ty: ir::Type,
-    memarg: &MemArg,
-    builder: &mut FunctionBuilder,
-    state: &mut FuncTranslationState,
-    environ: &mut FuncEnv<'_>,
-) -> TranslateResult<()> {
-    let (mut expected, mut replacement) = state.pop2();
-    let expected_ty = builder.func.dfg.value_type(expected);
-    let replacement_ty = builder.func.dfg.value_type(replacement);
-
-    // The compare-and-swap is performed at type `access_ty`, and the old value
-    // is zero-extended to type `widened_ty`.
-    debug_assert!(widened_ty.bytes() >= access_ty.bytes());
-    debug_assert!(expected_ty.bytes() >= access_ty.bytes());
-    debug_assert!(replacement_ty.bytes() >= access_ty.bytes());
-    if expected_ty.bytes() > access_ty.bytes() {
-        expected = builder.ins().ireduce(access_ty, expected);
-    }
-    if replacement_ty.bytes() > access_ty.bytes() {
-        replacement = builder.ins().ireduce(access_ty, replacement);
-    }
-
-    align_atomic_addr(memarg, access_ty.bytes(), builder, state);
-    let index = state.pop1();
-    let (addr, _) = environ.memory_addr(
-        builder,
-        MemoryIndex::from_u32(memarg.memory),
-        index,
-        memarg.offset,
-        access_ty.bytes(),
-    )?;
-    let atomic_flags = mem_access_flags();
-
-    let mut res = builder
-        .ins()
-        .atomic_cas(atomic_flags, addr, expected, replacement);
-    if access_ty != widened_ty {
-        res = builder.ins().uextend(widened_ty, res);
-    }
-    state.push1(res);
-    Ok(())
-}
-
-/// Translates an atomic load.
-fn translate_atomic_load(
-    widened_ty: ir::Type,
-    access_ty: ir::Type,
-    memarg: &MemArg,
-    builder: &mut FunctionBuilder,
-    state: &mut FuncTranslationState,
-    environ: &mut FuncEnv<'_>,
-) -> TranslateResult<()> {
-    // The load is performed at type `access_ty`, and the loaded value is zero
-    // extended to `widened_ty`.
-    debug_assert!(widened_ty.bytes() >= access_ty.bytes());
-
-    align_atomic_addr(memarg, access_ty.bytes(), builder, state);
-    let index = state.pop1();
-    let (addr, _) = environ.memory_addr(
-        builder,
-        MemoryIndex::from_u32(memarg.memory),
-        index,
-        memarg.offset,
-        access_ty.bytes(),
-    )?;
-    let atomic_flags = mem_access_flags();
-
-    let mut res = builder.ins().atomic_load(access_ty, atomic_flags, addr);
-    if access_ty != widened_ty {
-        res = builder.ins().uextend(widened_ty, res);
-    }
-    state.push1(res);
-    Ok(())
-}
-
-/// Translates an atomic store.
-fn translate_atomic_store(
-    access_ty: ir::Type,
-    memarg: &MemArg,
-    builder: &mut FunctionBuilder,
-    state: &mut FuncTranslationState,
-    environ: &mut FuncEnv<'_>,
-) -> TranslateResult<()> {
-    let mut data = state.pop1();
-    let data_ty = builder.func.dfg.value_type(data);
-
-    // The operation is performed at type `access_ty`, and the data to be
-    // stored may first need to be narrowed accordingly.
-    debug_assert!(data_ty.bytes() >= access_ty.bytes());
-    if data_ty.bytes() > access_ty.bytes() {
-        data = builder.ins().ireduce(access_ty, data);
-    }
-
-    align_atomic_addr(memarg, access_ty.bytes(), builder, state);
-    let index = state.pop1();
-    let (addr, _) = environ.memory_addr(
-        builder,
-        MemoryIndex::from_u32(memarg.memory),
-        index,
-        memarg.offset,
-        access_ty.bytes(),
-    )?;
-    let atomic_flags = mem_access_flags();
-
-    builder.ins().atomic_store(atomic_flags, data, addr);
-    Ok(())
-}
-
-/// Walks the module payloads, collecting declarations into `translator` and
-/// translating every defined function body.
-///
-/// The input must already have been validated with [`crate::environment::wasm_features`]
-/// (the caller runs `gate_unsupported_features` first).
-pub fn translate_module(wasm: &[u8], translator: &mut Translator) -> CompileResult<()> {
-    let mut defined_func_types: Vec<TypeIndex> = Vec::new();
-
-    for payload in Parser::new(0).parse_all(wasm) {
-        let payload = payload.map_err(|err| CompileError::Validation(err.to_string()))?;
-        match payload {
-            Payload::Version { .. }
-            | Payload::End(_)
-            | Payload::CustomSection(_)
-            | Payload::DataCountSection { .. } => {}
-
-            Payload::TypeSection(section) => {
-                for entry in section {
-                    let group = entry.map_err(|err| CompileError::Validation(err.to_string()))?;
-                    for sub in group.types() {
-                        match &sub.composite_type.inner {
-                            CompositeInnerType::Func(ty) => {
-                                let mut sig = ir::Signature::new(translator.info.call_conv);
-                                sig.params.extend(ty.params().iter().map(|ty| {
-                                    ir::AbiParam::new(crate::types::valtype_to_clif(*ty))
-                                }));
-                                sig.returns.extend(ty.results().iter().map(|ty| {
-                                    ir::AbiParam::new(crate::types::valtype_to_clif(*ty))
-                                }));
-                                translator.info.wasm_types.push(ty.clone());
-                                translator.info.signatures.push(sig);
-                            }
-                            _ => {
-                                return Err(CompileError::Unsupported(
-                                    "GC types (struct/array) are outside the supported feature set"
-                                        .to_string(),
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-
-            Payload::ImportSection(section) => {
-                for import in section.into_imports() {
-                    let import = import.map_err(|err| CompileError::Validation(err.to_string()))?;
-                    match import.ty {
-                        TypeRef::Func(type_index) => {
-                            translator
-                                .info
-                                .functions
-                                .push(TypeIndex::from_u32(type_index));
-                            translator
-                                .info
-                                .imported_funcs
-                                .push(crate::environment::FuncImport {
-                                    module: import.module.to_string(),
-                                    field: import.name.to_string(),
-                                    type_index: TypeIndex::from_u32(type_index),
-                                });
-                        }
-                        TypeRef::Table(ty) => {
-                            translator.info.tables.push(crate::types::Table::from(ty));
-                            translator
-                                .info
-                                .imported_tables
-                                .push(crate::environment::TableImport {
-                                    module: import.module.to_string(),
-                                    field: import.name.to_string(),
-                                    table: crate::types::Table::from(ty),
-                                });
-                        }
-                        TypeRef::Memory(ty) => {
-                            translator
-                                .info
-                                .memories
-                                .push(crate::types::Memory::from(ty));
-                            translator.info.imported_memories.push(
-                                crate::environment::MemoryImport {
-                                    module: import.module.to_string(),
-                                    field: import.name.to_string(),
-                                    memory: crate::types::Memory::from(ty),
-                                },
-                            );
-                        }
-                        TypeRef::Global(ty) => {
-                            translator
-                                .info
-                                .globals
-                                .push((crate::types::Global::from(ty), None));
-                            translator.info.imported_globals.push(
-                                crate::environment::GlobalImport {
-                                    module: import.module.to_string(),
-                                    field: import.name.to_string(),
-                                    global: crate::types::Global::from(ty),
-                                },
-                            );
-                        }
-                        TypeRef::Tag(_) | TypeRef::FuncExact(_) => {
-                            return Err(CompileError::Unsupported(
-                                "exception handling / exact function types are outside the \
-                                 supported feature set"
-                                    .to_string(),
-                            ));
-                        }
-                    }
-                }
-            }
-
-            Payload::FunctionSection(section) => {
-                for entry in section {
-                    let type_index =
-                        entry.map_err(|err| CompileError::Validation(err.to_string()))?;
-                    let type_index = TypeIndex::from_u32(type_index);
-                    translator.info.functions.push(type_index);
-                    defined_func_types.push(type_index);
-                }
-            }
-
-            Payload::TableSection(section) => {
-                for entry in section {
-                    let table = entry.map_err(|err| CompileError::Validation(err.to_string()))?;
-                    translator
-                        .info
-                        .tables
-                        .push(crate::types::Table::from(table.ty));
-                }
-            }
-
-            Payload::MemorySection(section) => {
-                for entry in section {
-                    let memory = entry.map_err(|err| CompileError::Validation(err.to_string()))?;
-                    translator
-                        .info
-                        .memories
-                        .push(crate::types::Memory::from(memory));
-                }
-            }
-
-            Payload::GlobalSection(section) => {
-                for entry in section {
-                    let global = entry.map_err(|err| CompileError::Validation(err.to_string()))?;
-                    let init = crate::types::ConstExpr::parse(&global.init_expr)
-                        .map_err(CompileError::Unsupported)?;
-                    translator
-                        .info
-                        .globals
-                        .push((crate::types::Global::from(global.ty), Some(init)));
-                }
-            }
-
-            Payload::ExportSection(section) => {
-                for entry in section {
-                    let export = entry.map_err(|err| CompileError::Validation(err.to_string()))?;
-                    match export.kind {
-                        ExternalKind::Func => translator
-                            .info
-                            .func_exports
-                            .push((FuncIndex::from_u32(export.index), export.name.to_string())),
-                        ExternalKind::Table => translator
-                            .info
-                            .table_exports
-                            .push((TableIndex::from_u32(export.index), export.name.to_string())),
-                        ExternalKind::Memory => translator
-                            .info
-                            .memory_exports
-                            .push((MemoryIndex::from_u32(export.index), export.name.to_string())),
-                        ExternalKind::Global => translator
-                            .info
-                            .global_exports
-                            .push((GlobalIndex::from_u32(export.index), export.name.to_string())),
-                        ExternalKind::Tag => {
-                            return Err(CompileError::Unsupported(
-                                "exception handling is outside the supported feature set"
-                                    .to_string(),
-                            ));
-                        }
-                        _ => {
-                            return Err(CompileError::Unsupported(format!(
-                                "unsupported export kind {:?}",
-                                export.kind
-                            )));
-                        }
-                    }
-                }
-            }
-
-            Payload::StartSection { func, .. } => {
-                translator.info.start_func = Some(FuncIndex::from_u32(func));
-            }
-
-            Payload::ElementSection(section) => {
-                for entry in section {
-                    let element = entry.map_err(|err| CompileError::Validation(err.to_string()))?;
-                    let elements = read_elems(&element.items)?;
-                    let record = match element.kind {
-                        ElementKind::Active {
-                            table_index,
-                            offset_expr,
-                        } => {
-                            let (base, offset) = const_offset(&offset_expr)?;
-                            ElemSegRecord {
-                                kind: ElemSegKind::Active {
-                                    table_index: TableIndex::from_u32(table_index.unwrap_or(0)),
-                                    base,
-                                    offset: offset as u32,
-                                },
-                                elements,
-                            }
-                        }
-                        ElementKind::Passive => ElemSegRecord {
-                            kind: ElemSegKind::Passive,
-                            elements,
-                        },
-                        ElementKind::Declared => ElemSegRecord {
-                            kind: ElemSegKind::Declarative,
-                            elements,
-                        },
-                    };
-                    translator.info.elem_segments.push(record);
-                }
-            }
-
-            Payload::DataSection(section) => {
-                for entry in section {
-                    let data = entry.map_err(|err| CompileError::Validation(err.to_string()))?;
-                    let record = match data.kind {
-                        DataKind::Active {
-                            memory_index,
-                            offset_expr,
-                        } => {
-                            let (base, offset) = const_offset(&offset_expr)?;
-                            DataSegRecord {
-                                kind: DataSegKind::Active {
-                                    memory_index: MemoryIndex::from_u32(memory_index),
-                                    base,
-                                    offset,
-                                },
-                                data: data.data.to_vec(),
-                            }
-                        }
-                        DataKind::Passive => DataSegRecord {
-                            kind: DataSegKind::Passive,
-                            data: data.data.to_vec(),
-                        },
-                    };
-                    translator.info.data_segments.push(record);
-                }
-            }
-
-            Payload::CodeSectionStart { .. } => {}
-
-            Payload::CodeSectionEntry(body) => {
-                let type_index = defined_func_types
-                    .get(translator.info.function_bodies.len())
-                    .copied()
-                    .ok_or_else(|| {
-                        CompileError::Internal(
-                            "code section has more entries than the function section".to_string(),
-                        )
-                    })?;
-                translate_function_body(translator, body, type_index)?;
-            }
-
-            // Never produced for a validated core module with the v1 feature
-            // set (tags are handled above; components and the rest are gated
-            // off).
-            other => {
-                return Err(CompileError::Internal(format!(
-                    "unexpected payload during translation: {other:?}"
-                )));
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Extracts the function indices from an element-segment's items, using
-/// `FuncIndex::reserved_value()` (`u32::MAX`) for `ref.null` entries (the
-/// artifact's encoding for a null element).
-fn read_elems(items: &ElementItems<'_>) -> CompileResult<Vec<FuncIndex>> {
-    let mut elems = Vec::new();
-    match items {
-        ElementItems::Functions(funcs) => {
-            for func in funcs.clone() {
-                let idx = func.map_err(|err| CompileError::Validation(err.to_string()))?;
-                elems.push(FuncIndex::from_u32(idx));
-            }
-        }
-        ElementItems::Expressions(_ty, exprs) => {
-            for expr in exprs.clone() {
-                let expr = expr.map_err(|err| CompileError::Validation(err.to_string()))?;
-                let idx = match expr
-                    .get_operators_reader()
-                    .read()
-                    .map_err(|err| CompileError::Validation(err.to_string()))?
-                {
-                    Operator::RefNull { .. } => FuncIndex::reserved_value(),
-                    Operator::RefFunc { function_index } => FuncIndex::from_u32(function_index),
-                    other => {
-                        return Err(CompileError::Unsupported(format!(
-                            "unsupported element-segment initialiser {other:?}"
-                        )));
-                    }
-                };
-                elems.push(idx);
-            }
-        }
-    }
-    Ok(elems)
-}
-
-/// Extracts `(base_global, constant_offset)` from an active segment's offset
-/// constant expression.
-fn const_offset(expr: &ConstExpr<'_>) -> CompileResult<(Option<GlobalIndex>, u64)> {
-    let mut ops = expr.get_operators_reader();
-    let op = ops
-        .read()
-        .map_err(|err| CompileError::Validation(err.to_string()))?;
-    let out = match op {
-        Operator::I32Const { value } => (None, value as u64),
-        Operator::GlobalGet { global_index } => (Some(GlobalIndex::from_u32(global_index)), 0),
-        Operator::I64Const { value } => (None, value as u64),
-        other => {
-            return Err(CompileError::Unsupported(format!(
-                "unsupported segment offset expression {other:?}"
-            )));
-        }
-    };
-    Ok(out)
-}
-
-/// Translates one defined function body into CLIF and stores it.
-fn translate_function_body(
-    translator: &mut Translator,
-    body: FunctionBody<'_>,
-    type_index: TypeIndex,
-) -> CompileResult<()> {
-    let sig = translator.func_env().vmctx_sig(type_index);
-    let defined_index = translator.info.function_bodies.len();
-    let mut func =
-        ir::Function::with_name_signature(ir::UserFuncName::user(0, defined_index as u32), sig);
-
-    let mut func_env = FuncEnv::new(&translator.info);
-    translator
-        .trans
-        .translate_body(body, &mut func, &mut func_env)
-        .map_err(crate::environment::translate_error)?;
-    translator.info.function_bodies.push(func);
     Ok(())
 }

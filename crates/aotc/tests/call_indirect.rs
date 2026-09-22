@@ -91,30 +91,6 @@ fn inline_table_initializer_dispatches() {
     assert_eq!(results, vec![WasmValue::I32(40)]);
 }
 
-/// Table-section expression initializers (`(table 1 funcref (ref.null func))`)
-/// are a function-references feature and must be rejected by the curated
-/// feature gate before translation — there is deliberately no lowering for
-/// them in `translate_module`.
-#[test]
-fn table_expression_initializer_is_rejected_as_unsupported() {
-    let wasm = wat::parse_str(
-        "(module
-           (type $t (func (param i32) (result i32)))
-           (table 1 funcref (ref.null func))
-           (func (export \"callat\") (param i32 i32) (result i32)
-             (call_indirect (type $t) (local.get 1) (local.get 0))))",
-    )
-    .expect("wat parses");
-
-    let err = wasmtiny_aotc::compile_artifact(&wasm, &CompilerConfig::host())
-        .expect_err("expression initializers are outside the feature set");
-    assert!(
-        matches!(err, wasmtiny_aotc::CompileError::Unsupported(ref msg)
-            if msg.contains("function-references")),
-        "expected an unsupported-feature error mentioning function-references, got {err}"
-    );
-}
-
 fn load(source: &str) -> wasmtiny::aot::AotModule {
     let wasm = wat::parse_str(source).expect("wat parses");
     let bytes = compile_artifact(&wasm, &CompilerConfig::host()).expect("compilation succeeds");
@@ -198,6 +174,30 @@ fn shared_table_growth_is_visible_across_instances() {
         .invoke(0, &[WasmValue::I32(4), WasmValue::I32(32)])
         .expect("B dispatches through a slot grown after its instantiation");
     assert_eq!(results, vec![WasmValue::I32(42)]);
+}
+
+/// Table-section expression initializers (`(table 1 funcref (ref.null func))`)
+/// are a function-references feature and must be rejected by the curated
+/// feature gate before translation — there is deliberately no lowering for
+/// them in `translate_module`.
+#[test]
+fn table_expression_initializer_is_rejected_as_unsupported() {
+    let wasm = wat::parse_str(
+        "(module
+           (type $t (func (param i32) (result i32)))
+           (table 1 funcref (ref.null func))
+           (func (export \"callat\") (param i32 i32) (result i32)
+             (call_indirect (type $t) (local.get 1) (local.get 0))))",
+    )
+    .expect("wat parses");
+
+    let err = wasmtiny_aotc::compile_artifact(&wasm, &CompilerConfig::host())
+        .expect_err("expression initializers are outside the feature set");
+    assert!(
+        matches!(err, wasmtiny_aotc::CompileError::Unsupported(ref msg)
+            if msg.contains("function-references")),
+        "expected an unsupported-feature error mentioning function-references, got {err}"
+    );
 }
 
 /// Regression: `table.grow` must not invalidate the cell base or the bound

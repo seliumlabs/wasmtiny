@@ -44,8 +44,10 @@ use cranelift_entity::{EntityRef, PrimaryMap, SecondaryMap};
 use cranelift_frontend::FunctionBuilder;
 use wasmparser::{ValType, WasmFeatures};
 
-use crate::error::CompileError;
-use crate::types::{ConstExpr, Global, GlobalIndex, Memory, MemoryIndex, Table, TableIndex};
+use crate::{
+    error::CompileError,
+    types::{ConstExpr, Global, GlobalIndex, Memory, MemoryIndex, Table, TableIndex},
+};
 
 // Re-export the index types used across the crate (they are defined in
 // `crate::types` because they pre-date the translation module split).
@@ -53,6 +55,17 @@ pub use crate::types::{DefinedFuncIndex, FuncIndex, TypeIndex};
 
 /// Size in bytes of a single global cell.
 pub const GLOBAL_CELL_SIZE: i32 = 8;
+pub const USER_TRAP_BAD_SIGNATURE: u8 = 4;
+pub const USER_TRAP_CALL_INDIRECT_NULL: u8 = 3;
+pub const USER_TRAP_HOST: u8 = 6;
+pub const USER_TRAP_NULL_REFERENCE: u8 = 5;
+pub const USER_TRAP_TABLE_OUT_OF_BOUNDS: u8 = 2;
+/// User trap codes (encoded in `TrapCode::User(n)`), mapped to the artifact's
+/// trap-code bytes by `artifact::trap_code_byte`. The built-in trap codes
+/// (`STACK_OVERFLOW`, `HEAP_OUT_OF_BOUNDS`, `INTEGER_OVERFLOW`,
+/// `INTEGER_DIVISION_BY_ZERO`, `BAD_CONVERSION_TO_INTEGER`) carry the rest of
+/// the runtime's trap taxonomy.
+pub const USER_TRAP_UNREACHABLE: u8 = 1;
 
 /// Offset of the shared-memory base pointer inside the hidden context.
 ///
@@ -273,17 +286,6 @@ pub struct GlobalVar {
     pub ty: ir::Type,
 }
 
-/// A runtime-facing table: the element-array base plus its bounds.
-#[derive(Clone)]
-pub struct TableData {
-    /// CLIF value materialising the table's element-array base pointer.
-    pub base: Value,
-    /// The size of the table, in elements.
-    pub bound: TableSize,
-    /// The size of a table element, in bytes.
-    pub element_size: u32,
-}
-
 /// Size of a WebAssembly table, in elements.
 #[derive(Clone)]
 pub enum TableSize {
@@ -299,31 +301,26 @@ pub enum TableSize {
     },
 }
 
-impl TableSize {
-    /// Get a CLIF value representing the current bounds of this table.
-    pub fn bound(&self, mut pos: FuncCursor, index_ty: ir::Type) -> ir::Value {
-        match *self {
-            TableSize::Static { bound } => pos.ins().iconst(index_ty, i64::from(bound)),
-            TableSize::Dynamic { bound } => bound,
-        }
-    }
+/// A runtime-facing table: the element-array base plus its bounds.
+#[derive(Clone)]
+pub struct TableData {
+    /// CLIF value materialising the table's element-array base pointer.
+    pub base: Value,
+    /// The size of the table, in elements.
+    pub bound: TableSize,
+    /// The size of a table element, in bytes.
+    pub element_size: u32,
 }
 
-/// User trap codes (encoded in `TrapCode::User(n)`), mapped to the artifact's
-/// trap-code bytes by `artifact::trap_code_byte`. The built-in trap codes
-/// (`STACK_OVERFLOW`, `HEAP_OUT_OF_BOUNDS`, `INTEGER_OVERFLOW`,
-/// `INTEGER_DIVISION_BY_ZERO`, `BAD_CONVERSION_TO_INTEGER`) carry the rest of
-/// the runtime's trap taxonomy.
-pub const USER_TRAP_UNREACHABLE: u8 = 1;
-pub const USER_TRAP_TABLE_OUT_OF_BOUNDS: u8 = 2;
-pub const USER_TRAP_CALL_INDIRECT_NULL: u8 = 3;
-pub const USER_TRAP_BAD_SIGNATURE: u8 = 4;
-pub const USER_TRAP_NULL_REFERENCE: u8 = 5;
-pub const USER_TRAP_HOST: u8 = 6;
-
-/// Creates the `TrapCode` for a user trap constant.
-pub fn user_trap(code: u8) -> ir::TrapCode {
-    ir::TrapCode::unwrap_user(code)
+/// Per-function translation environment, borrowing immutable module info while
+/// accumulating function-local state (global/table maps, memoised call
+/// targets).
+pub struct FuncEnv<'info> {
+    mod_info: &'info ModuleInfo,
+    tables: SecondaryMap<TableIndex, Option<TableData>>,
+    globals: HashMap<GlobalIndex, GlobalVar>,
+    indirect_sigs: HashMap<TypeIndex, (ir::SigRef, usize)>,
+    direct_funcs: HashMap<FuncIndex, (ir::FuncRef, usize)>,
 }
 
 impl VmCtxOffsets {
@@ -481,31 +478,80 @@ impl Translator {
     }
 }
 
-/// Per-function translation environment, borrowing immutable module info while
-/// accumulating function-local state (global/table maps, memoised call
-/// targets).
-pub struct FuncEnv<'info> {
-    mod_info: &'info ModuleInfo,
-    tables: SecondaryMap<TableIndex, Option<TableData>>,
-    globals: HashMap<GlobalIndex, GlobalVar>,
-    indirect_sigs: HashMap<TypeIndex, (ir::SigRef, usize)>,
-    direct_funcs: HashMap<FuncIndex, (ir::FuncRef, usize)>,
+impl TableSize {
+    /// Get a CLIF value representing the current bounds of this table.
+    pub fn bound(&self, mut pos: FuncCursor, index_ty: ir::Type) -> ir::Value {
+        match *self {
+            TableSize::Static { bound } => pos.ins().iconst(index_ty, i64::from(bound)),
+            TableSize::Dynamic { bound } => bound,
+        }
+    }
 }
 
-/// The `MemFlagsData` for a wasm linear-memory access: traps
-/// `HEAP_OUT_OF_BOUNDS`. WebAssembly alignment is a hint, not a guarantee, so
-/// the access is never marked aligned; the explicit bounds check
-/// (spectre-guarded null address) traps before the access, and a fault here is
-/// still mapped to the same trap by the runtime's signal handler.
-pub fn mem_access_flags() -> cranelift_codegen::ir::MemFlagsData {
-    cranelift_codegen::ir::MemFlagsData::new()
-        .with_trap_code(Some(ir::TrapCode::HEAP_OUT_OF_BOUNDS))
-}
+impl TableData {
+    /// Return a CLIF value containing a native pointer to the beginning of the
+    /// given index within this table, plus the flags to use for the access.
+    ///
+    /// The bounds check uses Spectre mitigation: an out-of-bounds index
+    /// selects a null address and the subsequent access traps through the
+    /// returned flags' trap code. A null address is used rather than an
+    /// explicit branch so the speculative execution does not continue with
+    /// the out-of-bounds address.
+    pub fn prepare_table_addr(
+        &self,
+        pos: &mut FunctionBuilder,
+        mut index: ir::Value,
+        addr_ty: ir::Type,
+        enable_table_access_spectre_mitigation: bool,
+    ) -> (ir::Value, cranelift_codegen::ir::MemFlagsData) {
+        let index_ty = pos.func.dfg.value_type(index);
 
-/// The `MemFlagsData` for a wasm table access: traps `TABLE_OUT_OF_BOUNDS`.
-pub fn table_access_flags() -> cranelift_codegen::ir::MemFlagsData {
-    cranelift_codegen::ir::MemFlagsData::new()
-        .with_trap_code(Some(user_trap(USER_TRAP_TABLE_OUT_OF_BOUNDS)))
+        // Start with the bounds check. Trap if `index + 1 > bound`.
+        let bound = self.bound.bound(pos.cursor(), index_ty);
+
+        // `index > bound - 1` is the same as `index >= bound`.
+        let oob = pos.ins().icmp(
+            ir::condcodes::IntCC::UnsignedGreaterThanOrEqual,
+            index,
+            bound,
+        );
+
+        if !enable_table_access_spectre_mitigation {
+            pos.ins()
+                .trapnz(oob, user_trap(USER_TRAP_TABLE_OUT_OF_BOUNDS));
+        }
+
+        // Convert `index` to `addr_ty`.
+        if index_ty != addr_ty {
+            index = pos.ins().uextend(addr_ty, index);
+        }
+
+        // Add the table base address base
+        let element_size = self.element_size;
+        let offset = if element_size == 1 {
+            index
+        } else if element_size.is_power_of_two() {
+            pos.ins()
+                .ishl_imm_u(index, i64::from(element_size.trailing_zeros()))
+        } else {
+            pos.ins().imul_imm_u(index, element_size as i64)
+        };
+
+        let element_addr = pos.ins().iadd(self.base, offset);
+
+        if enable_table_access_spectre_mitigation {
+            // Short-circuit the computed table element address to a null
+            // pointer when out-of-bounds. The consumer of this address will
+            // trap when trying to access it.
+            let zero = pos.ins().iconst(addr_ty, 0);
+            (
+                pos.ins().select_spectre_guard(oob, zero, element_addr),
+                table_access_flags(),
+            )
+        } else {
+            (element_addr, cranelift_codegen::ir::MemFlagsData::new())
+        }
+    }
 }
 
 impl<'info> FuncEnv<'info> {
@@ -1363,70 +1409,20 @@ impl<'info> FuncEnv<'info> {
     }
 }
 
-impl TableData {
-    /// Return a CLIF value containing a native pointer to the beginning of the
-    /// given index within this table, plus the flags to use for the access.
-    ///
-    /// The bounds check uses Spectre mitigation: an out-of-bounds index
-    /// selects a null address and the subsequent access traps through the
-    /// returned flags' trap code. A null address is used rather than an
-    /// explicit branch so the speculative execution does not continue with
-    /// the out-of-bounds address.
-    pub fn prepare_table_addr(
-        &self,
-        pos: &mut FunctionBuilder,
-        mut index: ir::Value,
-        addr_ty: ir::Type,
-        enable_table_access_spectre_mitigation: bool,
-    ) -> (ir::Value, cranelift_codegen::ir::MemFlagsData) {
-        let index_ty = pos.func.dfg.value_type(index);
+/// The `MemFlagsData` for a wasm linear-memory access: traps
+/// `HEAP_OUT_OF_BOUNDS`. WebAssembly alignment is a hint, not a guarantee, so
+/// the access is never marked aligned; the explicit bounds check
+/// (spectre-guarded null address) traps before the access, and a fault here is
+/// still mapped to the same trap by the runtime's signal handler.
+pub fn mem_access_flags() -> cranelift_codegen::ir::MemFlagsData {
+    cranelift_codegen::ir::MemFlagsData::new()
+        .with_trap_code(Some(ir::TrapCode::HEAP_OUT_OF_BOUNDS))
+}
 
-        // Start with the bounds check. Trap if `index + 1 > bound`.
-        let bound = self.bound.bound(pos.cursor(), index_ty);
-
-        // `index > bound - 1` is the same as `index >= bound`.
-        let oob = pos.ins().icmp(
-            ir::condcodes::IntCC::UnsignedGreaterThanOrEqual,
-            index,
-            bound,
-        );
-
-        if !enable_table_access_spectre_mitigation {
-            pos.ins()
-                .trapnz(oob, user_trap(USER_TRAP_TABLE_OUT_OF_BOUNDS));
-        }
-
-        // Convert `index` to `addr_ty`.
-        if index_ty != addr_ty {
-            index = pos.ins().uextend(addr_ty, index);
-        }
-
-        // Add the table base address base
-        let element_size = self.element_size;
-        let offset = if element_size == 1 {
-            index
-        } else if element_size.is_power_of_two() {
-            pos.ins()
-                .ishl_imm_u(index, i64::from(element_size.trailing_zeros()))
-        } else {
-            pos.ins().imul_imm_u(index, element_size as i64)
-        };
-
-        let element_addr = pos.ins().iadd(self.base, offset);
-
-        if enable_table_access_spectre_mitigation {
-            // Short-circuit the computed table element address to a null
-            // pointer when out-of-bounds. The consumer of this address will
-            // trap when trying to access it.
-            let zero = pos.ins().iconst(addr_ty, 0);
-            (
-                pos.ins().select_spectre_guard(oob, zero, element_addr),
-                table_access_flags(),
-            )
-        } else {
-            (element_addr, cranelift_codegen::ir::MemFlagsData::new())
-        }
-    }
+/// The `MemFlagsData` for a wasm table access: traps `TABLE_OUT_OF_BOUNDS`.
+pub fn table_access_flags() -> cranelift_codegen::ir::MemFlagsData {
+    cranelift_codegen::ir::MemFlagsData::new()
+        .with_trap_code(Some(user_trap(USER_TRAP_TABLE_OUT_OF_BOUNDS)))
 }
 
 /// Convert a translation failure into a compiler error.
@@ -1435,6 +1431,11 @@ pub fn translate_error(err: crate::translate::TranslateError) -> CompileError {
         crate::translate::TranslateError::Unsupported(msg) => CompileError::Unsupported(msg),
         other => CompileError::Translate(other.to_string()),
     }
+}
+
+/// Creates the `TrapCode` for a user trap constant.
+pub fn user_trap(code: u8) -> ir::TrapCode {
+    ir::TrapCode::unwrap_user(code)
 }
 
 /// The WebAssembly features enabled for this compiler.
@@ -1469,6 +1470,29 @@ pub fn wasm_features() -> WasmFeatures {
     // `funcref`/`externref` outright.
     features.set(WasmFeatures::GC_TYPES, true);
     features
+}
+
+/// Converts a wasm function type into a `vmctx`-augmented CLIF signature
+/// (used by the trampoline builder).
+pub fn wasm_func_type_to_sig(call_conv: CallConv, ty: &wasmparser::FuncType) -> Signature {
+    let mut sig = Signature::new(call_conv);
+    sig.params.extend(
+        ty.params()
+            .iter()
+            .map(|ty| AbiParam::new(crate::types::valtype_to_clif(*ty))),
+    );
+    sig.returns.extend(
+        ty.results()
+            .iter()
+            .map(|ty| AbiParam::new(crate::types::valtype_to_clif(*ty))),
+    );
+    sig
+}
+
+/// The native CLIF type used for each wasm value type (used by the trampoline
+/// builder too).
+pub fn wasm_type_to_clif(ty: ValType) -> ir::Type {
+    crate::types::valtype_to_clif(ty)
 }
 
 /// Loads a runtime libcall `(vmctx: ptr, ...u64) -> u64` from the context's
@@ -1537,27 +1561,4 @@ fn widen_u32(pos: &mut FuncCursor, value: Value, pointer_type: ir::Type) -> Valu
     } else {
         value
     }
-}
-
-/// The native CLIF type used for each wasm value type (used by the trampoline
-/// builder too).
-pub fn wasm_type_to_clif(ty: ValType) -> ir::Type {
-    crate::types::valtype_to_clif(ty)
-}
-
-/// Converts a wasm function type into a `vmctx`-augmented CLIF signature
-/// (used by the trampoline builder).
-pub fn wasm_func_type_to_sig(call_conv: CallConv, ty: &wasmparser::FuncType) -> Signature {
-    let mut sig = Signature::new(call_conv);
-    sig.params.extend(
-        ty.params()
-            .iter()
-            .map(|ty| AbiParam::new(crate::types::valtype_to_clif(*ty))),
-    );
-    sig.returns.extend(
-        ty.results()
-            .iter()
-            .map(|ty| AbiParam::new(crate::types::valtype_to_clif(*ty))),
-    );
-    sig
 }

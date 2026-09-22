@@ -12,29 +12,6 @@ use cranelift_codegen::ir;
 use cranelift_entity::entity_impl;
 use wasmparser::{GlobalType, HeapType, MemoryType, RefType, TableType, ValType};
 
-macro_rules! index_type {
-    ($name:ident) => {
-        #[doc = concat!("A wasm index of kind `", stringify!($name), "`.")]
-        #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-        pub struct $name(u32);
-
-        impl std::fmt::Debug for $name {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "{}({})", stringify!($name), self.0)
-            }
-        }
-
-        entity_impl!($name);
-    };
-}
-
-index_type!(FuncIndex);
-index_type!(TypeIndex);
-index_type!(TableIndex);
-index_type!(MemoryIndex);
-index_type!(GlobalIndex);
-index_type!(DefinedFuncIndex);
-
 /// A single linear-memory declaration, converted from [`wasmparser::MemoryType`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Memory {
@@ -48,24 +25,6 @@ pub struct Memory {
     pub page_size_log2: u32,
 }
 
-impl From<MemoryType> for Memory {
-    fn from(ty: MemoryType) -> Self {
-        Self {
-            minimum: ty.initial,
-            maximum: ty.maximum,
-            shared: ty.shared,
-            page_size_log2: ty.page_size_log2.unwrap_or(16),
-        }
-    }
-}
-
-impl Memory {
-    /// Maximum size in bytes, or `None` if unbounded.
-    pub fn maximum_byte_size(&self) -> Option<u64> {
-        self.maximum.map(|pages| pages << self.page_size_log2)
-    }
-}
-
 /// A single table declaration, converted from [`wasmparser::TableType`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Table {
@@ -77,16 +36,6 @@ pub struct Table {
     pub maximum: Option<u32>,
 }
 
-impl From<TableType> for Table {
-    fn from(ty: TableType) -> Self {
-        Self {
-            wasm_ty: ty.element_type,
-            minimum: ty.initial as u32,
-            maximum: ty.maximum.map(|max| max as u32),
-        }
-    }
-}
-
 /// A single global declaration, converted from [`wasmparser::GlobalType`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Global {
@@ -94,15 +43,6 @@ pub struct Global {
     pub wasm_ty: ValType,
     /// Whether the global is mutable.
     pub mutability: bool,
-}
-
-impl From<GlobalType> for Global {
-    fn from(ty: GlobalType) -> Self {
-        Self {
-            wasm_ty: ty.content_type,
-            mutability: ty.mutable,
-        }
-    }
 }
 
 /// One operation of a constant initialiser expression.
@@ -135,6 +75,43 @@ pub enum ConstOp {
 pub struct ConstExpr {
     /// The operations of the expression (without the trailing `end`).
     pub ops: Vec<ConstOp>,
+}
+
+impl Memory {
+    /// Maximum size in bytes, or `None` if unbounded.
+    pub fn maximum_byte_size(&self) -> Option<u64> {
+        self.maximum.map(|pages| pages << self.page_size_log2)
+    }
+}
+
+impl From<MemoryType> for Memory {
+    fn from(ty: MemoryType) -> Self {
+        Self {
+            minimum: ty.initial,
+            maximum: ty.maximum,
+            shared: ty.shared,
+            page_size_log2: ty.page_size_log2.unwrap_or(16),
+        }
+    }
+}
+
+impl From<TableType> for Table {
+    fn from(ty: TableType) -> Self {
+        Self {
+            wasm_ty: ty.element_type,
+            minimum: ty.initial as u32,
+            maximum: ty.maximum.map(|max| max as u32),
+        }
+    }
+}
+
+impl From<GlobalType> for Global {
+    fn from(ty: GlobalType) -> Self {
+        Self {
+            wasm_ty: ty.content_type,
+            mutability: ty.mutable,
+        }
+    }
 }
 
 impl ConstExpr {
@@ -175,35 +152,33 @@ impl ConstExpr {
     }
 }
 
-/// The CLIF type used to represent a wasm value type.
-pub fn valtype_to_clif(ty: ValType) -> ir::Type {
-    match ty {
-        ValType::I32 => ir::types::I32,
-        ValType::I64 => ir::types::I64,
-        ValType::F32 => ir::types::F32,
-        ValType::F64 => ir::types::F64,
-        ValType::V128 => ir::types::I8X16,
-        // Reference values are raw `u32` handles in wasmtiny.
-        ValType::Ref(_) => ir::types::I32,
-    }
+macro_rules! index_type {
+    ($name:ident) => {
+        #[doc = concat!("A wasm index of kind `", stringify!($name), "`.")]
+        #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub struct $name(u32);
+
+        impl std::fmt::Debug for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}({})", stringify!($name), self.0)
+            }
+        }
+
+        entity_impl!($name);
+    };
 }
 
-/// Encodes a wasm value type as its standard type byte.
-pub fn valtype_byte(ty: ValType) -> u8 {
-    match ty {
-        ValType::I32 => 0x7F,
-        ValType::I64 => 0x7E,
-        ValType::F32 => 0x7D,
-        ValType::F64 => 0x7C,
-        ValType::V128 => 0x7B,
-        ValType::Ref(reference) => ref_type_byte(reference),
-    }
-}
+index_type!(FuncIndex);
 
-/// Encodes a wasm reference type as its standard heap-type byte.
-pub fn ref_type_byte(ty: RefType) -> u8 {
-    ref_heap_type_byte(ty.heap_type())
-}
+index_type!(TypeIndex);
+
+index_type!(TableIndex);
+
+index_type!(MemoryIndex);
+
+index_type!(GlobalIndex);
+
+index_type!(DefinedFuncIndex);
 
 /// Encodes a wasm heap type as its standard byte.
 pub fn ref_heap_type_byte(hty: HeapType) -> u8 {
@@ -218,5 +193,35 @@ pub fn ref_heap_type_byte(hty: HeapType) -> u8 {
         // Concrete and exact heap types belong to the function-references /
         // custom-descriptors proposals, both rejected before translation.
         HeapType::Concrete(_) | HeapType::Exact(_) => 0x70,
+    }
+}
+
+/// Encodes a wasm reference type as its standard heap-type byte.
+pub fn ref_type_byte(ty: RefType) -> u8 {
+    ref_heap_type_byte(ty.heap_type())
+}
+
+/// Encodes a wasm value type as its standard type byte.
+pub fn valtype_byte(ty: ValType) -> u8 {
+    match ty {
+        ValType::I32 => 0x7F,
+        ValType::I64 => 0x7E,
+        ValType::F32 => 0x7D,
+        ValType::F64 => 0x7C,
+        ValType::V128 => 0x7B,
+        ValType::Ref(reference) => ref_type_byte(reference),
+    }
+}
+
+/// The CLIF type used to represent a wasm value type.
+pub fn valtype_to_clif(ty: ValType) -> ir::Type {
+    match ty {
+        ValType::I32 => ir::types::I32,
+        ValType::I64 => ir::types::I64,
+        ValType::F32 => ir::types::F32,
+        ValType::F64 => ir::types::F64,
+        ValType::V128 => ir::types::I8X16,
+        // Reference values are raw `u32` handles in wasmtiny.
+        ValType::Ref(_) => ir::types::I32,
     }
 }

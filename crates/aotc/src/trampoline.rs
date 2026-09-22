@@ -17,20 +17,6 @@ use wasmparser::ValType;
 
 use crate::environment::{LibCallOffsets, USER_TRAP_HOST, VmCtxOffsets, user_trap};
 
-/// A `TargetFrontendConfig` for the (stack-map-free) trampoline functions.
-fn trampoline_frontend_config(call_conv: CallConv) -> cranelift_codegen::isa::TargetFrontendConfig {
-    cranelift_codegen::isa::TargetFrontendConfig {
-        default_call_conv: call_conv,
-        pointer_width: target_lexicon::PointerWidth::U64,
-        page_size_align_log2: 12,
-    }
-}
-
-/// Returns the native CLIF type used for each wasm value type.
-fn value_clif_type(ty: ValType) -> ir::Type {
-    crate::types::valtype_to_clif(ty)
-}
-
 /// Builds an array-call entry trampoline for a callee with `callee_sig`
 /// (already `vmctx`-augmented) and `wasm_type`.
 ///
@@ -220,6 +206,20 @@ fn slot_to_value(builder: &mut FunctionBuilder, raw: ir::Value, ty: ir::Type) ->
         }
         other => unreachable!("unsupported bridging value type {other:?}"),
     }
+}
+
+/// A `TargetFrontendConfig` for the (stack-map-free) trampoline functions.
+fn trampoline_frontend_config(call_conv: CallConv) -> cranelift_codegen::isa::TargetFrontendConfig {
+    cranelift_codegen::isa::TargetFrontendConfig {
+        default_call_conv: call_conv,
+        pointer_width: target_lexicon::PointerWidth::U64,
+        page_size_align_log2: 12,
+    }
+}
+
+/// Returns the native CLIF type used for each wasm value type.
+fn value_clif_type(ty: ValType) -> ir::Type {
+    crate::types::valtype_to_clif(ty)
 }
 
 /// Converts a typed CLIF value into its 64-bit array-call slot.

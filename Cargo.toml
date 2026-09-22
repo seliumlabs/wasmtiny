@@ -11,7 +11,7 @@ license = "MPL-2.0"
 [workspace.dependencies]
 anyhow = { version = "1.0", default-features = false }
 clap = { version = "4.6", default-features = false }
-cranelift-codegen = { version = "0.111", default-features = false }
+cranelift-codegen = { version = "0.135", default-features = false }
 cranelift-entity = { version = "0.111", default-features = false }
 cranelift-frontend = { version = "0.111", default-features = false }
 cranelift-wasm = { version = "0.111", default-features = false }

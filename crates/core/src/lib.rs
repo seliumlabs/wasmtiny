@@ -25,6 +25,8 @@ pub use runtime::FunctionType;
 pub use runtime::Global;
 pub use runtime::GlobalType;
 pub use runtime::Instance;
+pub use runtime::InstanceMeter;
+pub use runtime::InstanceStats;
 pub use runtime::Memory;
 pub use runtime::MemoryType;
 pub use runtime::Module;

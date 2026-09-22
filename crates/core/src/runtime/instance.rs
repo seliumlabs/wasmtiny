@@ -4,8 +4,9 @@ use std::{
 };
 
 use super::{
-    ExportKind, FunctionType, Global, ImportKind, Memory, Module, RefType, Result,
-    SharedMemoryRegistry, SharedRegionId, Table, TrapCode, ValType, WasmError, WasmValue,
+    ExportKind, FunctionType, Global, ImportKind, InstanceMeter, InstanceStats, Memory, Module,
+    RefType, Result, SharedMemoryRegistry, SharedRegionId, Table, TrapCode, ValType, WasmError,
+    WasmValue,
 };
 use parking_lot::Mutex as ParkingMutex;
 
@@ -87,6 +88,11 @@ pub struct Instance {
     elem_segments_active: Vec<bool>,
     data_segments_active: Vec<bool>,
     func_ref_handles: Vec<u32>,
+    /// Per-instance instruction meter and configurable budgets. Shared (an
+    /// `Arc`) so the interpreter can charge it without holding the instance
+    /// lock, and reused across `invoke_function` calls via the cached
+    /// instance so counts accumulate over the instance's lifetime.
+    meter: Arc<InstanceMeter>,
 }
 
 /// The WebAssembly store.
@@ -264,6 +270,7 @@ impl Instance {
             elem_segments_active,
             data_segments_active,
             func_ref_handles: Vec::new(),
+            meter: Arc::new(InstanceMeter::new()),
         }
     }
 
@@ -837,11 +844,12 @@ impl Instance {
             .cloned()
             .ok_or_else(|| WasmError::Runtime(format!("memory {} out of bounds", idx)))?;
         let current_pages = self.total_memory_pages()?;
-        if current_pages.checked_add(delta).is_none() {
-            return Err(WasmError::Runtime(
-                "memory size exceeds maximum allowed".to_string(),
-            ));
-        };
+        let new_total = current_pages
+            .checked_add(delta)
+            .ok_or_else(|| WasmError::Runtime("memory size exceeds maximum allowed".to_string()))?;
+        // Enforce the memory budget before the underlying grow extends the
+        // accessible range; the budget failure is a distinct trap.
+        self.meter.ensure_memory_pages(new_total)?;
 
         memory.lock().map_err(poisoned_lock)?.grow(delta)
     }
@@ -860,6 +868,12 @@ impl Instance {
         if current_pages.checked_add(delta).is_none() {
             return Ok(-1);
         };
+
+        // Enforce the memory budget before the underlying grow extends the
+        // accessible range. Unlike the module's own declared-maximum failure
+        // (which the wasm-level grow reports as -1), a budget overrun is a
+        // distinct trap.
+        self.meter.ensure_memory_pages(current_pages + delta)?;
 
         match memory.lock().map_err(poisoned_lock)?.grow(delta) {
             Ok(old_size) => Ok(old_size as i32),
@@ -1126,7 +1140,7 @@ impl Instance {
             .count()
     }
 
-    fn total_memory_pages(&self) -> Result<u32> {
+    pub(crate) fn total_memory_pages(&self) -> Result<u32> {
         self.memories.iter().try_fold(0u32, |acc, memory| {
             let pages = memory.lock().map_err(poisoned_lock)?.size();
             acc.checked_add(pages)
@@ -1137,6 +1151,37 @@ impl Instance {
     /// Returns the list of attached region IDs.
     pub fn attached_regions(&self) -> &[SharedRegionId] {
         &self.attached_regions
+    }
+
+    /// Returns the per-instance meter (crate-internal).
+    ///
+    /// The embedder-facing query/set API is [`stats`](Self::stats),
+    /// [`set_execution_budget`](Self::set_execution_budget) and
+    /// [`set_memory_budget`](Self::set_memory_budget).
+    pub(crate) fn meter(&self) -> &Arc<InstanceMeter> {
+        &self.meter
+    }
+
+    /// Returns a snapshot of the instance's metering data: executed guest
+    /// instructions and committed owned memory pages (shared-region pages
+    /// excluded).
+    pub fn stats(&self) -> Result<InstanceStats> {
+        let pages = self.total_memory_pages()?;
+        Ok(self.meter.snapshot(pages))
+    }
+
+    /// Sets or resets the per-instance execution budget (maximum instruction
+    /// count); `None` means unbounded. The new budget is enforced from the
+    /// next executed instruction onward.
+    pub fn set_execution_budget(&self, budget: Option<u64>) -> Result<()> {
+        self.meter.set_execution_budget(budget)
+    }
+
+    /// Sets or resets the per-instance memory budget (maximum committed page
+    /// count); `None` means unbounded. The new budget is enforced from the
+    /// next growth onward.
+    pub fn set_memory_budget(&self, budget: Option<u32>) -> Result<()> {
+        self.meter.set_memory_budget(budget)
     }
 }
 
@@ -2245,5 +2290,98 @@ mod tests {
             shared_val, final_val,
             "Shared memory should match atomic counter"
         );
+    }
+
+    #[test]
+    fn test_metering_memory_gauge_excludes_shared_regions() {
+        use crate::memory::{PAGE_SIZE_BYTES, RegionProt};
+
+        let module = Arc::new(module_with_memory());
+        let mut instance = Instance::new(module).unwrap();
+
+        assert_eq!(instance.stats().unwrap().memory_pages, 1);
+
+        // Owned growth reflects in the gauge.
+        instance.grow_memory(0, 2).unwrap();
+        assert_eq!(instance.stats().unwrap().memory_pages, 3);
+
+        // Attaching a shared region must not inflate the owned-page gauge.
+        let (region_id, _page_offset) = instance
+            .allocate_shared_region(PAGE_SIZE_BYTES, RegionProt::ReadWrite)
+            .unwrap();
+        assert_eq!(instance.stats().unwrap().memory_pages, 3);
+
+        // Detaching leaves the gauge unchanged as well.
+        instance.detach_shared_region(region_id).unwrap();
+        assert_eq!(instance.stats().unwrap().memory_pages, 3);
+    }
+
+    #[test]
+    fn test_metering_memory_budget_enforced_at_grow() {
+        let module = Arc::new(module_with_memory());
+        let mut instance = Instance::new(module).unwrap();
+        instance.set_memory_budget(Some(2)).unwrap();
+
+        // Grow within the budget.
+        assert_eq!(instance.grow_memory(0, 1).unwrap(), 1);
+
+        // Grow beyond the budget fails with the distinct memory-limit trap
+        // and leaves memory untouched.
+        let error = instance.grow_memory(0, 1).unwrap_err();
+        assert_eq!(error, WasmError::Trap(TrapCode::MemoryLimitExceeded));
+        assert_eq!(instance.stats().unwrap().memory_pages, 2);
+    }
+
+    #[test]
+    fn test_metering_budgets_resettable_mid_life() {
+        use crate::runtime::Func;
+
+        let mut module = Module::new();
+        module.types.push(FunctionType::new(
+            vec![],
+            vec![ValType::Num(crate::runtime::NumType::I32)],
+        ));
+        module.funcs.push(Func {
+            type_idx: 0,
+            locals: vec![],
+            body: vec![0x41, 0x2A, 0x0B],
+        });
+
+        let module = Arc::new(module);
+        let instance = Arc::new(Mutex::new(Instance::new(module.clone()).unwrap()));
+
+        // Unbounded by default: the first invocation completes.
+        let mut interp = crate::interpreter::Interpreter::with_instance(instance.clone());
+        interp.execute_function(&module, 0, &[]).unwrap();
+        let first_count = instance
+            .lock()
+            .unwrap()
+            .stats()
+            .unwrap()
+            .executed_instructions;
+
+        // Reset the execution budget mid-life to a new ceiling; the next
+        // invocation completes under it.
+        instance
+            .lock()
+            .unwrap()
+            .set_execution_budget(Some(first_count + 2))
+            .unwrap();
+        let mut interp = crate::interpreter::Interpreter::with_instance(instance.clone());
+        interp.execute_function(&module, 0, &[]).unwrap();
+
+        // Reset to `None` (unbounded) mid-life.
+        instance.lock().unwrap().set_execution_budget(None).unwrap();
+        let mut interp = crate::interpreter::Interpreter::with_instance(instance.clone());
+        interp.execute_function(&module, 0, &[]).unwrap();
+
+        // The count never decreased through any of the resets.
+        let final_count = instance
+            .lock()
+            .unwrap()
+            .stats()
+            .unwrap()
+            .executed_instructions;
+        assert!(final_count > first_count);
     }
 }

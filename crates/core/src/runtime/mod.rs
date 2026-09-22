@@ -28,6 +28,7 @@ pub use instance::{
     Extern, GuestFuncBinding, HostCaller, HostFunc, Instance, SharedGlobal, SharedMemory,
     SharedTable, Store,
 };
+pub use metering::{InstanceMeter, InstanceStats};
 pub use module::{DataKind, DataSegment, ElemKind, ElemSegment, Func, Local, Module};
 pub use shared_memory::{
     HostWaitSupport, RegionWaiter, SharedMemoryRegistry, SharedRegion, SharedRegionId, WakeOutcome,
@@ -43,6 +44,7 @@ mod error;
 mod export;
 mod import;
 mod instance;
+mod metering;
 mod module;
 pub mod os_wake;
 mod shared_memory;

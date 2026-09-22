@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 use crate::{
     interpreter::{ControlFrame, ControlStack, FrameKind, OperandStack},
     runtime::{
-        FunctionType, Instance, Module, NumType, RefType, Result, TrapCode, ValType, WasmError,
-        WasmValue,
+        FunctionType, Instance, InstanceMeter, Module, NumType, RefType, Result, TrapCode, ValType,
+        WasmError, WasmValue,
     },
 };
 
@@ -32,6 +32,20 @@ pub struct Interpreter {
     pub instance: Option<Arc<Mutex<Instance>>>,
     /// Local variables for the current function.
     pub locals: Vec<WasmValue>,
+    /// Instruction charges accumulated since the last flush to the instance
+    /// meter. Charging amortises the shared-meter write: the counter
+    /// increments here per executed instruction and is flushed at
+    /// control-flow and host-call boundaries and on function return.
+    pending_charge: u64,
+    /// Authoritative executed-instruction count as of the last meter sync
+    /// (invocation seed or flush). Paired with `meter_budget` to bound
+    /// budget overshoot between flushes.
+    meter_count: u64,
+    /// Cached execution-budget snapshot as of the last meter sync. The
+    /// snapshot is checked per instruction so execution stops at the budget
+    /// boundary even inside a long straight-line block; the shared meter
+    /// remains authoritative at every flush.
+    meter_budget: Option<u64>,
 }
 
 impl Interpreter {
@@ -42,6 +56,9 @@ impl Interpreter {
             control_stack: ControlStack::new(),
             instance: None,
             locals: Vec::new(),
+            pending_charge: 0,
+            meter_count: 0,
+            meter_budget: None,
         }
     }
 
@@ -52,6 +69,9 @@ impl Interpreter {
             control_stack: ControlStack::new(),
             instance: Some(instance),
             locals: Vec::new(),
+            pending_charge: 0,
+            meter_count: 0,
+            meter_budget: None,
         }
     }
 
@@ -80,6 +100,19 @@ impl Interpreter {
     }
 
     fn run(&mut self, module: &Module) -> Result<Vec<WasmValue>> {
+        // Seed the interpreter-local meter snapshot so a budget configured
+        // before the invocation is enforced from the first executed
+        // instruction, not from the first flush boundary.
+        self.seed_meter()?;
+        let result = self.run_loop(module);
+        // Commit any pending instruction charges so the meter reflects every
+        // executed instruction even when execution stopped early. Never
+        // override the outcome of the run itself.
+        let _ = self.flush_meter();
+        result
+    }
+
+    fn run_loop(&mut self, module: &Module) -> Result<Vec<WasmValue>> {
         loop {
             let should_finish = match self.control_stack.last() {
                 Some(frame) => frame.position >= frame.code.len(),
@@ -94,6 +127,7 @@ impl Interpreter {
             }
 
             let opcode = self.read_u8_immediate()?;
+            self.charge_instruction()?;
             match opcode {
                 0x0B => {
                     if let Some(results) = self.finish_frame()? {
@@ -1399,6 +1433,8 @@ impl Interpreter {
     }
 
     fn call_function(&mut self, module: &Module, func_idx: u32) -> Result<()> {
+        // Function calls are control-flow boundaries: commit pending charges.
+        self.flush_meter()?;
         if self
             .control_stack
             .frames()
@@ -1422,10 +1458,15 @@ impl Interpreter {
             .count() as u32;
 
         if func_idx < import_func_count {
+            // Flush before and after the host dispatch: only decoded guest
+            // instructions are charged, never host-function execution, and
+            // the meter lock is never held across the call.
+            self.flush_meter()?;
             let instance = self.instance_ref()?;
             let mut instance = instance.lock().map_err(poisoned_lock)?;
             let results = instance.call(func_idx, &args)?;
             drop(instance);
+            self.flush_meter()?;
 
             for value in results {
                 self.operand_stack.push(value)?;
@@ -1445,6 +1486,9 @@ impl Interpreter {
             Local(u32),
             Native(u32),
         }
+
+        // `call_indirect` is a control-flow boundary: commit pending charges.
+        self.flush_meter()?;
 
         let expected_type = module
             .type_at(type_idx)
@@ -1518,11 +1562,15 @@ impl Interpreter {
                 } else if &func_type != expected_type {
                     return Err(WasmError::Trap(TrapCode::IndirectCallTypeMismatch));
                 }
+                // Flush before and after the host dispatch: only decoded guest
+                // instructions are charged, never host-function execution.
+                self.flush_meter()?;
                 let results = {
                     let instance = self.instance_ref()?;
                     let instance = instance.lock().map_err(poisoned_lock)?;
                     instance.call_cloned_host_func(func, &args)?
                 };
+                self.flush_meter()?;
                 for value in results {
                     self.operand_stack.push(value)?;
                 }
@@ -1594,6 +1642,7 @@ impl Interpreter {
     }
 
     fn enter_block(&mut self, module: &Module, kind: FrameKind) -> Result<()> {
+        self.flush_meter()?;
         let signature = self.read_block_signature(module)?;
         let split = {
             let frame = self.current_frame()?;
@@ -1627,6 +1676,7 @@ impl Interpreter {
     }
 
     fn enter_if(&mut self, module: &Module) -> Result<()> {
+        self.flush_meter()?;
         let signature = self.read_block_signature(module)?;
         let condition = self.operand_stack.pop_i32()?;
         let split = {
@@ -1661,6 +1711,8 @@ impl Interpreter {
     }
 
     fn finish_frame(&mut self) -> Result<Option<Vec<WasmValue>>> {
+        // A block or function boundary: commit pending instruction charges.
+        self.flush_meter()?;
         let frame = self
             .control_stack
             .pop_frame()
@@ -1694,10 +1746,12 @@ impl Interpreter {
     }
 
     fn return_from_function(&mut self) -> Result<Option<Vec<WasmValue>>> {
-        // `return` exits the innermost function: collect its result values
-        // from the top of the operand stack, unwind all frames up to and
-        // including the function frame, and resume the caller. When no caller
-        // remains, execution is complete.
+        // `return` exits the innermost function: commit pending instruction
+        // charges, collect its result values from the top of the operand
+        // stack, unwind all frames up to and including the function frame,
+        // and resume the caller. When no caller remains, execution is
+        // complete.
+        self.flush_meter()?;
         let function_frame = self
             .control_stack
             .frames()
@@ -1737,6 +1791,7 @@ impl Interpreter {
     }
 
     fn branch(&mut self, depth: u32) -> Result<Option<Vec<WasmValue>>> {
+        self.flush_meter()?;
         let len = self.control_stack.len();
         let target_index = len
             .checked_sub(depth as usize + 1)
@@ -2787,6 +2842,68 @@ impl Interpreter {
             .as_ref()
             .ok_or_else(|| WasmError::Runtime("no instance available".to_string()))
     }
+
+    /// Charges one executed guest instruction into the interpreter-local
+    /// accumulator. The accumulator is flushed to the shared instance meter at
+    /// control-flow and host-call boundaries and on function return, so the
+    /// hot loop stays a saturating addition and a comparison rather than a
+    /// lock per instruction.
+    ///
+    /// The cached budget snapshot additionally bounds budget overshoot per
+    /// instruction: when the next instruction would take the count past the
+    /// locally known budget, the accumulated charges are committed
+    /// immediately so the shared meter — the authority — can trap before
+    /// that instruction's effects execute. A long straight-line block
+    /// therefore cannot run past the budget until the next control-flow
+    /// boundary.
+    fn charge_instruction(&mut self) -> Result<()> {
+        self.pending_charge = self.pending_charge.saturating_add(1);
+        if let Some(budget) = self.meter_budget
+            && self.meter_count.saturating_add(self.pending_charge) > budget
+        {
+            // Committing lets the meter decide: it traps if the budget still
+            // holds, or refreshes the local snapshot (and execution
+            // continues) if the budget was raised concurrently.
+            self.flush_meter()?;
+        }
+        Ok(())
+    }
+
+    /// Flushes the accumulated instruction charges into the instance meter,
+    /// enforcing the execution budget at the flush point, and refreshes the
+    /// interpreter-local snapshot of the meter's authoritative count and
+    /// budget. Without an instance (unit-execution mode) the accumulator is
+    /// discarded.
+    fn flush_meter(&mut self) -> Result<()> {
+        if self.pending_charge == 0 {
+            return Ok(());
+        }
+        let units = std::mem::take(&mut self.pending_charge);
+        let Some(instance) = self.instance.as_ref() else {
+            return Ok(());
+        };
+        let meter = instance.lock().map_err(poisoned_lock)?.meter().clone();
+        meter.charge(units)?;
+        self.sync_meter_state(&meter);
+        Ok(())
+    }
+
+    /// Seeds the interpreter-local meter snapshot (authoritative count and
+    /// budget) from the instance at the start of each invocation. Without an
+    /// instance (unit-execution mode) the snapshot stays unset and no local
+    /// enforcement applies.
+    fn seed_meter(&mut self) -> Result<()> {
+        let Some(instance) = self.instance.as_ref() else {
+            return Ok(());
+        };
+        let meter = instance.lock().map_err(poisoned_lock)?.meter().clone();
+        self.sync_meter_state(&meter);
+        Ok(())
+    }
+
+    fn sync_meter_state(&mut self, meter: &InstanceMeter) {
+        (self.meter_count, self.meter_budget) = meter.execution_state();
+    }
 }
 
 impl Default for Interpreter {
@@ -3413,5 +3530,241 @@ mod tests {
         let returned = result.unwrap();
         assert_eq!(returned.len(), 1);
         assert_eq!(returned[0], WasmValue::I32(10));
+    }
+
+    #[test]
+    fn test_metering_counts_cumulative_across_invocations() {
+        let mut module = Module::new();
+        module
+            .types
+            .push(FunctionType::new(vec![], vec![ValType::Num(NumType::I32)]));
+        module.funcs.push(Func {
+            type_idx: 0,
+            locals: vec![],
+            body: vec![0x41, 0x2A, 0x0B],
+        });
+
+        let module = Arc::new(module);
+        let instance = Arc::new(Mutex::new(Instance::new(module.clone()).unwrap()));
+
+        let mut first = Interpreter::with_instance(instance.clone());
+        let results = first.execute_function(&module, 0, &[]).unwrap();
+        assert_eq!(results, vec![WasmValue::I32(42)]);
+        let count_1 = instance
+            .lock()
+            .unwrap()
+            .stats()
+            .unwrap()
+            .executed_instructions;
+        assert!(count_1 > 0, "executed instructions must be nonzero");
+
+        // A fresh interpreter on the same instance accumulates one lifetime
+        // count: strictly cumulative across invocations.
+        let mut second = Interpreter::with_instance(instance.clone());
+        let results = second.execute_function(&module, 0, &[]).unwrap();
+        assert_eq!(results, vec![WasmValue::I32(42)]);
+        let count_2 = instance
+            .lock()
+            .unwrap()
+            .stats()
+            .unwrap()
+            .executed_instructions;
+        assert!(
+            count_2 > count_1,
+            "count must be strictly cumulative, got {count_1} then {count_2}"
+        );
+    }
+
+    #[test]
+    fn test_metering_excludes_host_execution() {
+        let mut module = Module::new();
+        module.types.push(FunctionType::new(vec![], vec![]));
+        module.imports.push(crate::runtime::Import {
+            module: "env".to_string(),
+            name: "host".to_string(),
+            kind: crate::runtime::ImportKind::Func(0),
+        });
+        module.funcs.push(Func {
+            type_idx: 0,
+            locals: vec![],
+            // call $host; end — exactly two decoded guest instructions.
+            body: vec![0x10, 0x00, 0x0B],
+        });
+
+        let module = Arc::new(module);
+        let instance = Arc::new(Mutex::new(
+            Instance::with_imports(
+                module.clone(),
+                &[(
+                    "env",
+                    "host",
+                    crate::runtime::Extern::HostFunc(Arc::new(
+                        |_: &mut crate::runtime::HostCaller<'_>, _: &[WasmValue]| {
+                            // Host-side "work" that must never be charged to
+                            // the guest's instruction count.
+                            let mut acc = 0u64;
+                            for i in 0..10_000u64 {
+                                acc = acc.wrapping_add(i);
+                            }
+                            let _ = acc;
+                            Ok(vec![])
+                        },
+                    )),
+                )],
+            )
+            .unwrap(),
+        ));
+
+        let mut interp = Interpreter::with_instance(instance.clone());
+        // Function 0 is the imported host function; function 1 is the defined
+        // guest function that calls it.
+        interp.execute_function(&module, 1, &[]).unwrap();
+
+        let stats = instance.lock().unwrap().stats().unwrap();
+        assert_eq!(
+            stats.executed_instructions, 2,
+            "host execution must not be counted; only the decoded guest instructions"
+        );
+    }
+
+    #[test]
+    fn test_metering_overrun_traps_distinctly() {
+        let mut module = Module::new();
+        module.types.push(FunctionType::new(vec![], vec![]));
+        // Infinite loop: `loop { br 0 }`.
+        module.funcs.push(Func {
+            type_idx: 0,
+            locals: vec![],
+            body: vec![0x03, 0x40, 0x0C, 0x00, 0x0B, 0x0B],
+        });
+
+        let module = Arc::new(module);
+        let instance = Arc::new(Mutex::new(Instance::new(module.clone()).unwrap()));
+        instance
+            .lock()
+            .unwrap()
+            .set_execution_budget(Some(5))
+            .unwrap();
+
+        let mut interp = Interpreter::with_instance(instance.clone());
+        let error = interp.execute_function(&module, 0, &[]).unwrap_err();
+        assert_eq!(error, WasmError::Trap(TrapCode::ExecutionBudgetExceeded));
+
+        let stats = instance.lock().unwrap().stats().unwrap();
+        assert!(stats.executed_instructions > 0);
+    }
+
+    #[test]
+    fn test_metering_under_budget_completes_normally() {
+        let mut module = Module::new();
+        module
+            .types
+            .push(FunctionType::new(vec![], vec![ValType::Num(NumType::I32)]));
+        // Counts down from 3 to 0 (same body as test_loop_with_br_and_br_if).
+        module.funcs.push(Func {
+            type_idx: 0,
+            locals: vec![Local {
+                count: 1,
+                type_: ValType::Num(NumType::I32),
+            }],
+            body: vec![
+                0x41, 0x03, 0x21, 0x00, 0x02, 0x40, 0x03, 0x40, 0x20, 0x00, 0x45, 0x0D, 0x01, 0x20,
+                0x00, 0x41, 0x01, 0x6B, 0x21, 0x00, 0x0C, 0x00, 0x0B, 0x0B, 0x20, 0x00, 0x0B,
+            ],
+        });
+
+        let module = Arc::new(module);
+        let instance = Arc::new(Mutex::new(Instance::new(module.clone()).unwrap()));
+        instance
+            .lock()
+            .unwrap()
+            .set_execution_budget(Some(1_000))
+            .unwrap();
+
+        let mut interp = Interpreter::with_instance(instance.clone());
+        let results = interp.execute_function(&module, 0, &[]).unwrap();
+        assert_eq!(results, vec![WasmValue::I32(0)]);
+        assert!(
+            instance
+                .lock()
+                .unwrap()
+                .stats()
+                .unwrap()
+                .executed_instructions
+                > 0,
+            "under-budget execution still charges the meter"
+        );
+    }
+
+    #[test]
+    fn test_metering_budget_bounds_straight_line_overshoot() {
+        let mut module = Module::new();
+        module.types.push(FunctionType::new(vec![], vec![]));
+        module.memories.push(MemoryType::new(Limits::Min(1)));
+        // One straight-line block (no control flow, no calls — no flush
+        // boundary until `end`):
+        //   i32.const 0; i32.const 42; i32.store      (mem[0] = 42)
+        //   i32.const 4; i32.const 7; i32.store      (mem[4] = 7)
+        //   i32.const 1; i32.const 1; i32.add; drop
+        module.funcs.push(Func {
+            type_idx: 0,
+            locals: vec![],
+            body: vec![
+                0x41, 0x00, 0x41, 0x2A, 0x36, 0x02, 0x00, // i32.store offset 0
+                0x41, 0x04, 0x41, 0x07, 0x36, 0x02, 0x04, // i32.store offset 4
+                0x41, 0x01, 0x41, 0x01, 0x6A, 0x1A, 0x0B,
+            ],
+        });
+
+        let module = Arc::new(module);
+        let instance = Arc::new(Mutex::new(Instance::new(module.clone()).unwrap()));
+        // Budget covers the first five instructions; the second store (the
+        // sixth) exceeds it.
+        instance
+            .lock()
+            .unwrap()
+            .set_execution_budget(Some(5))
+            .unwrap();
+
+        let mut interp = Interpreter::with_instance(instance.clone());
+        let error = interp.execute_function(&module, 0, &[]).unwrap_err();
+        assert_eq!(error, WasmError::Trap(TrapCode::ExecutionBudgetExceeded));
+
+        // The tripping charge still lands in the monotonic count.
+        let stats = instance.lock().unwrap().stats().unwrap();
+        assert_eq!(stats.executed_instructions, 6);
+
+        // The over-budget store never executed: its effect is absent while
+        // the in-budget store's effect is present.
+        let memory = instance.lock().unwrap().memory(0).unwrap().clone();
+        let mut word = [0u8; 4];
+        memory.lock().unwrap().read(0, &mut word).unwrap();
+        assert_eq!(word, [42, 0, 0, 0]);
+        memory.lock().unwrap().read(4, &mut word).unwrap();
+        assert_eq!(word, [0, 0, 0, 0], "over-budget store must not execute");
+    }
+
+    #[test]
+    fn test_metering_guest_memory_grow_traps_over_budget() {
+        let mut module = Module::new();
+        module.types.push(FunctionType::new(vec![], vec![]));
+        module.memories.push(MemoryType::new(Limits::Min(1)));
+        // i32.const 1; memory.grow; drop
+        module.funcs.push(Func {
+            type_idx: 0,
+            locals: vec![],
+            body: vec![0x41, 0x01, 0x40, 0x00, 0x1A, 0x0B],
+        });
+
+        let module = Arc::new(module);
+        let instance = Arc::new(Mutex::new(Instance::new(module.clone()).unwrap()));
+        instance.lock().unwrap().set_memory_budget(Some(1)).unwrap();
+
+        let mut interp = Interpreter::with_instance(instance.clone());
+        let error = interp.execute_function(&module, 0, &[]).unwrap_err();
+        assert_eq!(error, WasmError::Trap(TrapCode::MemoryLimitExceeded));
+
+        // The failed grow must not have extended memory.
+        assert_eq!(instance.lock().unwrap().stats().unwrap().memory_pages, 1);
     }
 }

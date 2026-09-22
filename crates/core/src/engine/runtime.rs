@@ -220,6 +220,44 @@ impl LoadedModule {
         }
     }
 
+    /// Returns a snapshot of the cached instance's metering data: executed
+    /// guest instructions and committed owned memory pages.
+    pub fn stats(&self) -> Result<crate::runtime::InstanceStats> {
+        self.ensure_initialised()?;
+        self.require_cached_instance()?
+            .lock()
+            .map_err(poisoned_lock)?
+            .stats()
+    }
+
+    /// Sets or resets the cached instance's execution budget (maximum
+    /// instruction count); `None` means unbounded.
+    pub fn set_execution_budget(&self, budget: Option<u64>) -> Result<()> {
+        self.ensure_initialised()?;
+        self.require_cached_instance()?
+            .lock()
+            .map_err(poisoned_lock)?
+            .set_execution_budget(budget)
+    }
+
+    /// Sets or resets the cached instance's memory budget (maximum committed
+    /// page count); `None` means unbounded.
+    pub fn set_memory_budget(&self, budget: Option<u32>) -> Result<()> {
+        self.ensure_initialised()?;
+        self.require_cached_instance()?
+            .lock()
+            .map_err(poisoned_lock)?
+            .set_memory_budget(budget)
+    }
+
+    fn require_cached_instance(&self) -> Result<&Arc<Mutex<Instance>>> {
+        self.cached_instance.as_ref().ok_or_else(|| {
+            WasmError::Runtime(
+                "module instance is not initialised; call instantiate first".to_string(),
+            )
+        })
+    }
+
     /// Registers import.
     pub fn register_import(&mut self, module: &str, name: &str, extern_: Extern) -> Result<()> {
         self.ensure_initialised()?;
@@ -600,6 +638,7 @@ impl LoadedModule {
         self.ensure_initialised()?;
         self.ensure_jit_inactive_for_external_mutation()?;
         self.resolve_memory_growth_target(memory_idx)?;
+        self.ensure_instance_memory_budget(delta)?;
 
         if let Some(memory) = self.imported_memory(memory_idx) {
             return memory.lock().map_err(poisoned_lock)?.grow(delta);
@@ -622,6 +661,7 @@ impl LoadedModule {
         let Ok(delta) = u32::try_from(delta) else {
             return Ok(-1);
         };
+        self.ensure_instance_memory_budget(delta)?;
 
         let imported_memories = self.import_counts().0 as u32;
         if memory_idx < imported_memories {
@@ -686,6 +726,21 @@ impl LoadedModule {
                 .map(|_| ())
                 .ok_or_else(|| WasmError::Runtime("memory not found".to_string()))
         }
+    }
+
+    /// Enforces the cached instance's memory budget before a host-side grow
+    /// extends the accessible range. Without a cached instance there is no
+    /// meter to enforce against (the guest path enforces via the instance).
+    fn ensure_instance_memory_budget(&self, delta: u32) -> Result<()> {
+        let Some(instance) = self.cached_instance.as_ref() else {
+            return Ok(());
+        };
+        let instance = instance.lock().map_err(poisoned_lock)?;
+        let current_pages = instance.total_memory_pages()?;
+        let new_total = current_pages
+            .checked_add(delta)
+            .ok_or_else(|| WasmError::Runtime("memory page count overflowed".to_string()))?;
+        instance.meter().ensure_memory_pages(new_total)
     }
 
     fn import_counts(&self) -> (usize, usize, usize) {
@@ -2342,5 +2397,58 @@ mod tests {
 
         let new_value = runtime.get_global_value(module_idx, 0).unwrap();
         assert_eq!(new_value, WasmValue::I32(200));
+    }
+
+    #[test]
+    fn test_metering_counts_persist_across_invocations() {
+        let mut module = Module::new();
+        module
+            .types
+            .push(FunctionType::new(vec![], vec![ValType::Num(NumType::I32)]));
+        module.funcs.push(crate::runtime::Func {
+            type_idx: 0,
+            locals: vec![],
+            body: vec![0x41, 0x2A, 0x0B],
+        });
+
+        let mut aot_module = LoadedModule::from_module(&module);
+        aot_module.instantiate().unwrap();
+
+        assert_eq!(aot_module.stats().unwrap().executed_instructions, 0);
+
+        let result = aot_module.invoke_function(0, &[]).unwrap();
+        assert_eq!(result, vec![WasmValue::I32(42)]);
+        let first = aot_module.stats().unwrap();
+        assert!(first.executed_instructions > 0);
+
+        // The cached instance is reused: the lifetime count accumulates.
+        let result = aot_module.invoke_function(0, &[]).unwrap();
+        assert_eq!(result, vec![WasmValue::I32(42)]);
+        let second = aot_module.stats().unwrap();
+        assert!(
+            second.executed_instructions > first.executed_instructions,
+            "count must persist across repeated invocations of the same loaded module"
+        );
+
+        // Query/set API is reachable between invocations.
+        aot_module.set_execution_budget(Some(1_000)).unwrap();
+        aot_module.set_execution_budget(None).unwrap();
+        aot_module.set_memory_budget(Some(16)).unwrap();
+        aot_module.set_memory_budget(None).unwrap();
+    }
+
+    #[test]
+    fn test_metering_public_api_smoke() {
+        // The metering types are re-exported from the crate root for
+        // embedders (Selium) that read stats and set budgets.
+        let meter: crate::InstanceMeter = crate::InstanceMeter::new();
+        meter.set_execution_budget(Some(100)).unwrap();
+        meter.set_memory_budget(Some(8)).unwrap();
+        let stats: crate::InstanceStats = meter.snapshot(1);
+        assert_eq!(stats.executed_instructions, 0);
+        assert_eq!(stats.memory_pages, 1);
+        assert_eq!(stats.memory_bytes, crate::memory::PAGE_SIZE_BYTES as u64);
+        meter.charge(1).unwrap();
+        assert_eq!(meter.snapshot(1).executed_instructions, 1);
     }
 }

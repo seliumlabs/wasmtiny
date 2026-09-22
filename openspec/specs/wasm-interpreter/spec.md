@@ -5,7 +5,7 @@ The interpreter execution mode for WebAssembly bytecode, using a stack-based vir
 ## Requirements
 
 ### Requirement: Classic interpreter execution
-The interpreter SHALL execute WebAssembly bytecode using a stack-based virtual machine with operand and control stacks. It SHALL be available in every build alongside the AOT execution path (no longer the only execution mode). It SHALL NOT contain safepoint, suspension, or per-instruction metering hooks (those subsystems are removed), and it SHALL NOT dispatch host calls through a pending/outcome protocol — host functions return results or errors synchronously.
+The interpreter SHALL execute WebAssembly bytecode using a stack-based virtual machine with operand and control stacks. It SHALL be available in every build alongside the AOT execution path (no longer the only execution mode). It SHALL charge each executed instruction against the executing instance's instruction meter (see `instance-metering`), and SHALL NOT contain safepoint or suspension hooks. It SHALL NOT dispatch host calls through a pending/outcome protocol — host functions return results or errors synchronously.
 
 #### Scenario: Bytecode executes via operand and control stacks
 - **WHEN** a function is invoked through the interpreter
@@ -18,6 +18,10 @@ The interpreter SHALL execute WebAssembly bytecode using a stack-based virtual m
 #### Scenario: Wasm modules execute via the interpreter
 - **WHEN** a `.wasm` module is loaded and its function invoked through the interpreter
 - **THEN** it executes and host calls complete synchronously
+
+#### Scenario: Instructions charged to the instance meter
+- **WHEN** an instance executes a function through the interpreter
+- **THEN** each executed instruction SHALL be charged to that instance's instruction meter
 
 ### Requirement: Instruction coverage
 The interpreter SHALL implement all WebAssembly MVP instructions including control flow, memory, numeric, and parametric operations.

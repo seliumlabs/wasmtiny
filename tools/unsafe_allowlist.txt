@@ -6,15 +6,21 @@
 # this list. Any off-list occurrence, any count drift, or any file
 # missing here fails the gate.
 #
+# Re-sync the counts with scripts/update_unsafe_allowlist.sh; it preserves
+# these reasons, appends new files with an UNAUDITED placeholder, and
+# lists every change so the new sites can be audited. Never let an
+# UNAUDITED marker stand — replace it with a real rationale.
+#
 # Guests (tests/corpus) are EXEMPT by design: they are hostile
 # binaries/fixtures, not wasmtiny code. No static gate applies to
 # guest payloads (docs/threat-model.md).
 crates/core/src/aot/code.rs 11 W^X executable-code mapping: mmap + byte copy + mprotect flip to RX + munmap, icache flush, and raw-pointer Send/Sync for the owned mapping; every site carries a SAFETY comment
 crates/core/src/aot/context.rs 2 unsafe Send/Sync for FuncDesc, whose raw pointers reference store-owned code images and vmctx that outlive the store; the struct layout is the ABI contract with wasmtiny-aotc
-crates/core/src/aot/exec.rs 21 native ABI boundary: transmuting loader-validated image entries to fn pointers, dereferencing vmctx/dispatch pointers behind compiled-call and libcall contracts with SAFETY comments
+crates/core/src/aot/exec.rs 22 native ABI boundary: transmuting loader-validated image entries to fn pointers, dereferencing vmctx/dispatch pointers behind compiled-call and libcall contracts with SAFETY comments
 crates/core/src/aot/store.rs 2 unsafe Send/Sync for AotTable, whose published base points at capacity-reserved cell storage that is never reallocated and is only read by compiled code under the documented concurrency contract
 crates/core/src/aot/traps.rs 41 signal-based trap recovery: sigaction/sigaltstack/mmap installation, sigsetjmp/siglongjmp boundary, lock-free raw-pointer trap registry, ucontext PC/SP extraction, and per-thread stack-base comparison to disambiguate native stack exhaustion from guest guard-page faults; every site carries a SAFETY comment
-crates/core/src/memory.rs 23 mmap-backed linear memory: raw pointer arithmetic, mprotect/munmap on mappings, and slice views over mmap regions; every site carries a SAFETY comment
+crates/core/src/memory.rs 24 mmap-backed linear memory: raw pointer arithmetic, mprotect/munmap on mappings, and slice views over mmap regions; every site carries a SAFETY comment
 crates/core/src/runtime/shared_memory.rs 12 shm_open/mmap/ftruncate for shared regions and raw mapping teardown; every site carries a SAFETY comment
 crates/core/src/runtime/os_wake.rs 5 platform wake-word primitives (futex/_umtx_op/WaitOnAddress) on raw pointers behind cfg(os)
 crates/core/src/security_test.rs 3 testing build only: signal handler install, alarm write(2)/_exit(2), and setrlimit — libc calls with no safe wrapper; feature-gated, absent from shipped builds
+crates/core/src/runtime/metering.rs 2 tests only: raw `*const MeterCells` views over a live InstanceMeter's atomics, asserting the offset contract (executed at 0, budget at 8) the AOT compiler charges against; each site carries a SAFETY comment and lives in #[cfg(test)]

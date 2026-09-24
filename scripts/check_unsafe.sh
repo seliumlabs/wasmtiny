@@ -45,10 +45,10 @@ while IFS= read -r file; do
     actual="$(count_unsafe "$file")"
     allowed="$(grep -E "^${rel//\\/\\\\}[[:space:]]" "$ALLOWLIST" | awk '{print $2}' || true)"
     if [[ -z "$allowed" ]]; then
-        echo "FAIL: $rel has $actual unsafe item(s) but is NOT in the allowlist"
+        echo "FAIL: $rel has $actual unsafe item(s) but is NOT in the allowlist — run scripts/update_unsafe_allowlist.sh (then audit)"
         status=1
     elif [[ "$actual" != "$allowed" ]]; then
-        echo "FAIL: $rel has $actual unsafe item(s), allowlist says $allowed — update tools/unsafe_allowlist.txt (with audit)"
+        echo "FAIL: $rel has $actual unsafe item(s), allowlist says $allowed — update tools/unsafe_allowlist.txt (with audit); run scripts/update_unsafe_allowlist.sh"
         status=1
     fi
 done < <(grep -rlE 'unsafe[[:space:]]*(\{|fn|impl)' "$SRC_ROOT" --include='*.rs' | sort)

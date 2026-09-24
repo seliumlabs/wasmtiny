@@ -600,7 +600,10 @@ impl TableData {
 }
 
 impl<'info> FuncEnv<'info> {
-    pub(crate) fn new(mod_info: &'info ModuleInfo, stack_pointer_override: Option<GlobalIndex>) -> Self {
+    pub(crate) fn new(
+        mod_info: &'info ModuleInfo,
+        stack_pointer_override: Option<GlobalIndex>,
+    ) -> Self {
         Self {
             mod_info,
             stack_pointer_override,

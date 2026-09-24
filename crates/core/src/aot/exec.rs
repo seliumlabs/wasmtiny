@@ -7,8 +7,6 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use parking_lot::Mutex as ParkingMutex;
-
 use super::{
     code::ExecutableCode,
     context::{FuncDesc, MemoryDesc, TableCells, VmCtx},
@@ -16,13 +14,16 @@ use super::{
     store::{AotExtern, AotStore, AotTable, SharedAotStore},
     traps,
 };
+use parking_lot::Mutex as ParkingMutex;
 
-use crate::memory::RegionProt;
-use crate::runtime::{
-    DataKind, ElemKind, ExportKind, ExportType, FunctionType, Global, GlobalType, HostCaller,
-    HostFunc, ImportKind, InstanceMeter, InstanceStats, Memory, NumType, RefType, Result,
-    SharedMemoryRegistry, SharedRegionId, Store, TrapCode, ValType, WasmError, WasmValue,
-    evaluate_const_expr,
+use crate::{
+    memory::RegionProt,
+    runtime::{
+        DataKind, ElemKind, ExportKind, ExportType, FunctionType, Global, GlobalType, HostCaller,
+        HostFunc, ImportKind, InstanceMeter, InstanceStats, Memory, NumType, RefType, Result,
+        SharedMemoryRegistry, SharedRegionId, Store, TrapCode, ValType, WasmError, WasmValue,
+        evaluate_const_expr,
+    },
 };
 
 /// The fixed shape of an array-call entry trampoline:
@@ -30,25 +31,21 @@ use crate::runtime::{
 type ArrayCall = unsafe extern "C" fn(*const VmCtx, *const u8, *const u64, *mut u64);
 type SharedTableTag = Arc<Mutex<AotTable>>;
 
-/// Packed trap sentinel shifted into the high word of a libcall result.
-const LIBCALL_TRAP: u64 = 1 << 32;
-
 /// Byte size of one wasm global cell in the vmctx globals array.
 const GLOBAL_CELL_SIZE: usize = 8;
-
+/// Packed trap sentinel shifted into the high word of a libcall result.
+const LIBCALL_TRAP: u64 = 1 << 32;
+const MAX_STACK_SIZE: usize = 16 * 1024 * 1024;
+/// Budget of host stack (in bytes) granted to wasm recursion before the
+/// entry-time stack check traps.
+const MAX_WASM_STACK: usize = 256 * 1024;
 /// Floor and ceiling for a per-invocation shadow-stack slot (see
 /// `AotInstance::invoke_shared`).
 const MIN_STACK_SIZE: usize = 64 * 1024;
-const MAX_STACK_SIZE: usize = 16 * 1024 * 1024;
-
 /// Guard between the initial shadow-stack pointer and the top of its slot, so
 /// an access at the entry stack pointer stays inside the memory's addressable
 /// bound.
 const STACK_TOP_GUARD: u32 = 4096;
-
-/// Budget of host stack (in bytes) granted to wasm recursion before the
-/// entry-time stack check traps.
-const MAX_WASM_STACK: usize = 256 * 1024;
 
 /// Per-instance options affecting shadow-stack support.
 #[derive(Clone, Copy, Debug, Default)]
@@ -685,10 +682,13 @@ impl AotInstance {
         // shared context's stack pointer keeps the module's initial value for
         // the single-threaded `invoke` path.
         let stack_pointer_global = module.stack_pointer_global.or_else(|| {
-            instance.exports.iter().find_map(|export| match &export.kind {
-                ExportKind::Global(index) if export.name == "__stack_pointer" => Some(*index),
-                _ => None,
-            })
+            instance
+                .exports
+                .iter()
+                .find_map(|export| match &export.kind {
+                    ExportKind::Global(index) if export.name == "__stack_pointer" => Some(*index),
+                    _ => None,
+                })
         });
         instance.stack_pointer_global = stack_pointer_global.map(|index| index as usize);
         if let Some(index) = stack_pointer_global {
@@ -706,16 +706,18 @@ impl AotInstance {
             // it), the top address alone is the fallback — for the rustc/LLD
             // layout the stack sits at the top of linear memory, so the top
             // over-estimates rather than under-estimates the region.
-            let heap_base = instance.exports.iter().find_map(|export| match &export.kind {
-                ExportKind::Global(index) if export.name == "__heap_base" => {
-                    let cell = *index as usize * GLOBAL_CELL_SIZE;
-                    instance
-                        ._globals
-                        .get(cell..cell + 4)
-                        .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-                }
-                _ => None,
-            });
+            let heap_base = instance
+                .exports
+                .iter()
+                .find_map(|export| match &export.kind {
+                    ExportKind::Global(index) if export.name == "__heap_base" => {
+                        let cell = *index as usize * GLOBAL_CELL_SIZE;
+                        instance._globals.get(cell..cell + 4).map(|bytes| {
+                            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+                        })
+                    }
+                    _ => None,
+                });
             let reserved = heap_base
                 .and_then(|heap| init.checked_sub(heap))
                 .filter(|size| *size > 0)

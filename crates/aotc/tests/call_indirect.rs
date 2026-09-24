@@ -35,6 +35,43 @@ fn call_indirect_dispatches_through_a_table() {
     assert_eq!(results, vec![WasmValue::I32(40)]);
 }
 
+/// Regression: `call_indirect` in two sibling control-flow blocks used to
+/// reuse the table base `Value` memoised on first use. The first lowering's
+/// block does not dominate the second block, so Cranelift's verifier rejected
+/// the function with a "non-dominating" dominance error. Each access must
+/// re-materialise its own vmctx loads.
+#[test]
+fn call_indirect_in_distinct_blocks_compiles() {
+    let module = load(
+        "(module
+           (type $t (func (param i32) (result i32)))
+           (func $inc (type $t) (param i32) (result i32)
+             (i32.add (local.get 0) (i32.const 1)))
+           (func $dec (type $t) (param i32) (result i32)
+             (i32.sub (local.get 0) (i32.const 1)))
+           (table 2 funcref)
+           (elem (i32.const 0) $inc $dec)
+           (func (export \"pick\") (param i32 i32) (result i32)
+             (local.get 0)
+             (if (result i32)
+               (then (call_indirect (type $t) (local.get 1) (i32.const 0)))
+               (else (call_indirect (type $t) (local.get 1) (i32.const 1))))))",
+    );
+
+    let mut instance = AotInstance::new(&module).expect("instantiation");
+
+    // `pick(cond, value)`: cond true -> inc(value), false -> dec(value).
+    let results = instance
+        .invoke(2, &[WasmValue::I32(1), WasmValue::I32(41)])
+        .expect("then branch dispatches");
+    assert_eq!(results, vec![WasmValue::I32(42)]);
+
+    let results = instance
+        .invoke(2, &[WasmValue::I32(0), WasmValue::I32(41)])
+        .expect("else branch dispatches");
+    assert_eq!(results, vec![WasmValue::I32(40)]);
+}
+
 #[test]
 fn cross_module_function_import_dispatches_to_provider() {
     let module_a = load(
@@ -88,43 +125,6 @@ fn inline_table_initializer_dispatches() {
     let results = instance
         .invoke(2, &[WasmValue::I32(1), WasmValue::I32(41)])
         .expect("dec via inline-initialized slot 1");
-    assert_eq!(results, vec![WasmValue::I32(40)]);
-}
-
-/// Regression: `call_indirect` in two sibling control-flow blocks used to
-/// reuse the table base `Value` memoised on first use. The first lowering's
-/// block does not dominate the second block, so Cranelift's verifier rejected
-/// the function with a "non-dominating" dominance error. Each access must
-/// re-materialise its own vmctx loads.
-#[test]
-fn call_indirect_in_distinct_blocks_compiles() {
-    let module = load(
-        "(module
-           (type $t (func (param i32) (result i32)))
-           (func $inc (type $t) (param i32) (result i32)
-             (i32.add (local.get 0) (i32.const 1)))
-           (func $dec (type $t) (param i32) (result i32)
-             (i32.sub (local.get 0) (i32.const 1)))
-           (table 2 funcref)
-           (elem (i32.const 0) $inc $dec)
-           (func (export \"pick\") (param i32 i32) (result i32)
-             (local.get 0)
-             (if (result i32)
-               (then (call_indirect (type $t) (local.get 1) (i32.const 0)))
-               (else (call_indirect (type $t) (local.get 1) (i32.const 1))))))",
-    );
-
-    let mut instance = AotInstance::new(&module).expect("instantiation");
-
-    // `pick(cond, value)`: cond true -> inc(value), false -> dec(value).
-    let results = instance
-        .invoke(2, &[WasmValue::I32(1), WasmValue::I32(41)])
-        .expect("then branch dispatches");
-    assert_eq!(results, vec![WasmValue::I32(42)]);
-
-    let results = instance
-        .invoke(2, &[WasmValue::I32(0), WasmValue::I32(41)])
-        .expect("else branch dispatches");
     assert_eq!(results, vec![WasmValue::I32(40)]);
 }
 

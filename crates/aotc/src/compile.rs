@@ -386,14 +386,12 @@ pub fn compile_module(wasm: &[u8], config: &CompilerConfig) -> CompileResult<Com
 
     // The shadow-stack pointer global: the compiler-config override wins over
     // export-based detection (recorded in the artifact for the runtime).
-    let stack_pointer_global = config
-        .shadow_stack_global
-        .or_else(|| {
-            translator
-                .info
-                .shadow_stack_pointer()
-                .map(|index| index.as_u32())
-        });
+    let stack_pointer_global = config.shadow_stack_global.or_else(|| {
+        translator
+            .info
+            .shadow_stack_pointer()
+            .map(|index| index.as_u32())
+    });
 
     Ok(CompiledModule {
         target: config.target.clone(),

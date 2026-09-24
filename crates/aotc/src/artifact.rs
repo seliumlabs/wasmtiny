@@ -613,6 +613,15 @@ fn section_memories(info: &ModuleInfo) -> Vec<u8> {
     out
 }
 
+/// The shadow-stack pointer global index: `u32::MAX` when the module has no
+/// shadow stack. The runtime gives each concurrent invocation a private
+/// stack slot only when this is present (see the `VmCtx` docs).
+fn section_stack_pointer(compiled: &CompiledModule) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_u32(&mut out, compiled.stack_pointer_global.unwrap_or(u32::MAX));
+    out
+}
+
 /// The optional start-function section: a presence byte then, when present,
 /// the function index.
 fn section_start(compiled: &CompiledModule) -> Vec<u8> {
@@ -624,15 +633,6 @@ fn section_start(compiled: &CompiledModule) -> Vec<u8> {
         }
         None => out.push(0),
     }
-    out
-}
-
-/// The shadow-stack pointer global index: `u32::MAX` when the module has no
-/// shadow stack. The runtime gives each concurrent invocation a private
-/// stack slot only when this is present (see the `VmCtx` docs).
-fn section_stack_pointer(compiled: &CompiledModule) -> Vec<u8> {
-    let mut out = Vec::new();
-    push_u32(&mut out, compiled.stack_pointer_global.unwrap_or(u32::MAX));
     out
 }
 

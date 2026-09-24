@@ -74,12 +74,11 @@ use wasmtiny::{
 };
 use wasmtiny_aotc::{CompilerConfig, compile_artifact};
 
-/// The prebuilt real-Rust-module bytes (see `mt_rust_atomics/README.md`).
-const RUST_MODULE: &[u8] = include_bytes!("mt_rust_atomics.wasm");
-
 /// Guest park timeout backstop (ns): a regression must fail the assertion,
 /// not hang the suite.
 const PARK_BACKSTOP_NS: i64 = 5_000_000_000;
+/// The prebuilt real-Rust-module bytes (see `mt_rust_atomics/README.md`).
+const RUST_MODULE: &[u8] = include_bytes!("mt_rust_atomics.wasm");
 
 struct Fixture {
     instance: Arc<AotInstance>,
@@ -161,95 +160,10 @@ impl Fixture {
     }
 }
 
-/// Spike finding 1 + 5: the guest worker pool — N workers park on ONE shared
-/// wake word, a dispatcher `worker_wake(N)` must release N distinct waiters.
-///
-/// Reproduces the 2-worker hang against the real Rust module: with the old
-/// single-flag registry, `notify(N)` woke at most one waiter and the
-/// surplus slept out the backstop (returning 2). Runs 10 times with 2 and 4
-/// workers.
-#[test]
-fn smp_rust_worker_pool_wakes_all() {
-    for run in 0..10 {
-        for workers in [2usize, 4] {
-            let fx = Fixture::new();
-            let handles: Vec<_> = (0..workers)
-                .map(|_| {
-                    let instance = fx.instance.clone();
-                    std::thread::spawn(move || {
-                        instance.invoke_shared(fx.park, &[WasmValue::I64(PARK_BACKSTOP_NS)])
-                    })
-                })
-                .collect();
-
-            // Wait until every worker has registered as parked before waking,
-            // so the drain below has real waiters to release.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while fx.parked_count() < workers as u32 {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "run {run}/{workers}: workers never all parked (parked={})",
-                    fx.parked_count()
-                );
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-
-            // Drain until every worker has returned; each worker's join
-            // asserts it was woken (0), not timed out (2).
-            fx.drain_wake(workers as u32);
-
-            for handle in handles {
-                let result = handle.join().expect("worker thread survives");
-                assert_eq!(
-                    result,
-                    Ok(vec![WasmValue::I32(0)]),
-                    "run {run}/{workers}: every parked worker must be woken (0), not time out (2)"
-                );
-            }
-
-            // Reset the wake word for the next round.
-            fx.call(fx.reset, &[]);
-            assert_eq!(fx.parked_count(), 0, "run {run}/{workers}: pool reset");
-        }
-    }
-}
-
-/// Spike finding 5: std lock contention — two host threads run guest
-/// `std::sync::Mutex` (futex-backed) accumulate into one shared u64. Every
-/// update must land: the final value equals the sum, proving the futex
-/// wait/notify path loses neither wakes nor lock handoffs.
-#[test]
-fn smp_rust_std_lock_contention() {
-    for run in 0..10 {
-        let fx = Fixture::new();
-        const ITERS: u32 = 2000;
-
-        let a = {
-            let instance = fx.instance.clone();
-            std::thread::spawn(move || {
-                instance.invoke_shared(fx.lock_storm, &[WasmValue::I32(ITERS as i32)])
-            })
-        };
-        let b = {
-            let instance = fx.instance.clone();
-            std::thread::spawn(move || {
-                instance.invoke_shared(fx.lock_storm, &[WasmValue::I32(ITERS as i32)])
-            })
-        };
-
-        // No lost updates: each lock()/unlock() critical section is serialised by
-        // the guest futex, so the shared accumulator is exact. (Each thread's
-        // *returned* sum is interleaving-dependent — it accumulates the
-        // running counter — so only the shared final value is asserted.)
-        a.join().expect("thread A survives").expect("A lock_storm");
-        b.join().expect("thread B survives").expect("B lock_storm");
-        let value = fx.call(fx.lock_value, &[]);
-        assert_eq!(
-            value,
-            vec![WasmValue::I64(2 * ITERS as i64)],
-            "run {run}: no lost lock updates"
-        );
-    }
+fn load_rust_module() -> AotModule {
+    let bytes =
+        compile_artifact(RUST_MODULE, &CompilerConfig::host()).expect("compilation succeeds");
+    AotLoader::new().load(&bytes).expect("artifact loads")
 }
 
 /// Spike finding 2 + 5: concurrent `memory.grow` from the real module. Each
@@ -307,6 +221,76 @@ fn smp_rust_concurrent_memory_grow() {
             extra == SLOT_PAGES || extra == 2 * SLOT_PAGES,
             "run {run}: grown size {size} must be the guest's 80 grows plus 1-2 engine stack slots \
              (17 pages each), got extra {extra}"
+        );
+    }
+}
+
+/// Spike finding 5: atomic RMWs from two host threads over the real module
+/// must not lose updates (the memory.atomic.rmw.add path).
+#[test]
+fn smp_rust_rmw_no_lost_updates() {
+    for run in 0..10 {
+        let fx = Fixture::new();
+        const ITERS: u32 = 2000;
+
+        let a = {
+            let instance = fx.instance.clone();
+            std::thread::spawn(move || {
+                for _ in 0..ITERS {
+                    instance.invoke_shared(fx.rmw_bump, &[]).expect("A bump");
+                }
+            })
+        };
+        let b = {
+            let instance = fx.instance.clone();
+            std::thread::spawn(move || {
+                for _ in 0..ITERS {
+                    instance.invoke_shared(fx.rmw_bump, &[]).expect("B bump");
+                }
+            })
+        };
+        a.join().expect("A survives");
+        b.join().expect("B survives");
+
+        let total = fx.call_i32(fx.rmw_read, &[]) as u32;
+        assert_eq!(total, 2 * ITERS, "run {run}: no lost RMWs");
+    }
+}
+
+/// Spike finding 5: std lock contention — two host threads run guest
+/// `std::sync::Mutex` (futex-backed) accumulate into one shared u64. Every
+/// update must land: the final value equals the sum, proving the futex
+/// wait/notify path loses neither wakes nor lock handoffs.
+#[test]
+fn smp_rust_std_lock_contention() {
+    for run in 0..10 {
+        let fx = Fixture::new();
+        const ITERS: u32 = 2000;
+
+        let a = {
+            let instance = fx.instance.clone();
+            std::thread::spawn(move || {
+                instance.invoke_shared(fx.lock_storm, &[WasmValue::I32(ITERS as i32)])
+            })
+        };
+        let b = {
+            let instance = fx.instance.clone();
+            std::thread::spawn(move || {
+                instance.invoke_shared(fx.lock_storm, &[WasmValue::I32(ITERS as i32)])
+            })
+        };
+
+        // No lost updates: each lock()/unlock() critical section is serialised by
+        // the guest futex, so the shared accumulator is exact. (Each thread's
+        // *returned* sum is interleaving-dependent — it accumulates the
+        // running counter — so only the shared final value is asserted.)
+        a.join().expect("thread A survives").expect("A lock_storm");
+        b.join().expect("thread B survives").expect("B lock_storm");
+        let value = fx.call(fx.lock_value, &[]);
+        assert_eq!(
+            value,
+            vec![WasmValue::I64(2 * ITERS as i64)],
+            "run {run}: no lost lock updates"
         );
     }
 }
@@ -379,40 +363,55 @@ fn smp_rust_wait_notify_storm() {
     }
 }
 
-/// Spike finding 5: atomic RMWs from two host threads over the real module
-/// must not lose updates (the memory.atomic.rmw.add path).
+/// Spike finding 1 + 5: the guest worker pool — N workers park on ONE shared
+/// wake word, a dispatcher `worker_wake(N)` must release N distinct waiters.
+///
+/// Reproduces the 2-worker hang against the real Rust module: with the old
+/// single-flag registry, `notify(N)` woke at most one waiter and the
+/// surplus slept out the backstop (returning 2). Runs 10 times with 2 and 4
+/// workers.
 #[test]
-fn smp_rust_rmw_no_lost_updates() {
+fn smp_rust_worker_pool_wakes_all() {
     for run in 0..10 {
-        let fx = Fixture::new();
-        const ITERS: u32 = 2000;
+        for workers in [2usize, 4] {
+            let fx = Fixture::new();
+            let handles: Vec<_> = (0..workers)
+                .map(|_| {
+                    let instance = fx.instance.clone();
+                    std::thread::spawn(move || {
+                        instance.invoke_shared(fx.park, &[WasmValue::I64(PARK_BACKSTOP_NS)])
+                    })
+                })
+                .collect();
 
-        let a = {
-            let instance = fx.instance.clone();
-            std::thread::spawn(move || {
-                for _ in 0..ITERS {
-                    instance.invoke_shared(fx.rmw_bump, &[]).expect("A bump");
-                }
-            })
-        };
-        let b = {
-            let instance = fx.instance.clone();
-            std::thread::spawn(move || {
-                for _ in 0..ITERS {
-                    instance.invoke_shared(fx.rmw_bump, &[]).expect("B bump");
-                }
-            })
-        };
-        a.join().expect("A survives");
-        b.join().expect("B survives");
+            // Wait until every worker has registered as parked before waking,
+            // so the drain below has real waiters to release.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while fx.parked_count() < workers as u32 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "run {run}/{workers}: workers never all parked (parked={})",
+                    fx.parked_count()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
 
-        let total = fx.call_i32(fx.rmw_read, &[]) as u32;
-        assert_eq!(total, 2 * ITERS, "run {run}: no lost RMWs");
+            // Drain until every worker has returned; each worker's join
+            // asserts it was woken (0), not timed out (2).
+            fx.drain_wake(workers as u32);
+
+            for handle in handles {
+                let result = handle.join().expect("worker thread survives");
+                assert_eq!(
+                    result,
+                    Ok(vec![WasmValue::I32(0)]),
+                    "run {run}/{workers}: every parked worker must be woken (0), not time out (2)"
+                );
+            }
+
+            // Reset the wake word for the next round.
+            fx.call(fx.reset, &[]);
+            assert_eq!(fx.parked_count(), 0, "run {run}/{workers}: pool reset");
+        }
     }
-}
-
-fn load_rust_module() -> AotModule {
-    let bytes =
-        compile_artifact(RUST_MODULE, &CompilerConfig::host()).expect("compilation succeeds");
-    AotLoader::new().load(&bytes).expect("artifact loads")
 }

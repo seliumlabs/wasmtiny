@@ -179,15 +179,6 @@ thread_local! {
     static LAST_TRAP_PC: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
-/// Returns the faulting PC of the most recent trap on this thread.
-///
-/// Diagnostic aid: map the PC through [`crate::aot::AotInstance::last_trap_site`]
-/// to recover the function index and code offset. `None` when no trap has
-/// fired on this thread (or the last invocation succeeded).
-pub fn last_trap_pc() -> Option<usize> {
-    LAST_TRAP_PC.with(|pc| pc.get())
-}
-
 /// Runs `body` with a recovery boundary: if native code faults, the signal
 /// handler transfers control back here and this returns `Err(Trap(code))`.
 #[inline(never)]
@@ -245,6 +236,15 @@ pub fn ensure_installed() -> std::result::Result<(), String> {
     static HANDLERS: OnceLock<std::result::Result<(), String>> = OnceLock::new();
     HANDLERS.get_or_init(install_handlers).clone()?;
     ensure_thread_altstack()
+}
+
+/// Returns the faulting PC of the most recent trap on this thread.
+///
+/// Diagnostic aid: map the PC through [`crate::aot::AotInstance::last_trap_site`]
+/// to recover the function index and code offset. `None` when no trap has
+/// fired on this thread (or the last invocation succeeded).
+pub fn last_trap_pc() -> Option<usize> {
+    LAST_TRAP_PC.with(|pc| pc.get())
 }
 
 /// Returns the lowest stack address native code may use on this thread.

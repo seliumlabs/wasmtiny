@@ -54,30 +54,6 @@ pub struct SharedRegion {
     waiters: WaiterMap,
 }
 
-/// A per-address queue of parked waiters.
-///
-/// One [`WaiterNode`] per parked thread: a notify pops up to `n` nodes and
-/// wakes each, so several threads can park on the same word and a
-/// `notify(n)` releases up to `n` distinct waiters (threads proposal). The
-/// queue itself never holds a parked thread — waiting happens on the node's
-/// own mutex/condvar, so a parked waiter never blocks a notifier.
-#[derive(Debug)]
-pub(crate) struct WaiterQueue {
-    inner: ParkingMutex<VecDeque<Arc<WaiterNode>>>,
-}
-
-/// A single parked thread's wake state.
-///
-/// `notified` is set by a notify that popped this node out of its queue
-/// (under the node's mutex), so a notify landing after the node was
-/// registered but before the owner parked is latched: the park observes the
-/// flag and returns immediately instead of sleeping through the timeout.
-#[derive(Debug)]
-pub(crate) struct WaiterNode {
-    pub(crate) notified: ParkingMutex<bool>,
-    pub(crate) condvar: Condvar,
-}
-
 /// Outcome of a host-side [`RegionWaiter::wait`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WakeOutcome {
@@ -119,6 +95,30 @@ pub struct RegionWaiter {
     map: WaiterMap,
     offset: u32,
     node: Arc<WaiterNode>,
+}
+
+/// A single parked thread's wake state.
+///
+/// `notified` is set by a notify that popped this node out of its queue
+/// (under the node's mutex), so a notify landing after the node was
+/// registered but before the owner parked is latched: the park observes the
+/// flag and returns immediately instead of sleeping through the timeout.
+#[derive(Debug)]
+pub(crate) struct WaiterNode {
+    pub(crate) notified: ParkingMutex<bool>,
+    pub(crate) condvar: Condvar,
+}
+
+/// A per-address queue of parked waiters.
+///
+/// One [`WaiterNode`] per parked thread: a notify pops up to `n` nodes and
+/// wakes each, so several threads can park on the same word and a
+/// `notify(n)` releases up to `n` distinct waiters (threads proposal). The
+/// queue itself never holds a parked thread — waiting happens on the node's
+/// own mutex/condvar, so a parked waiter never blocks a notifier.
+#[derive(Debug)]
+pub(crate) struct WaiterQueue {
+    inner: ParkingMutex<VecDeque<Arc<WaiterNode>>>,
 }
 
 /// Shared memory registry.
@@ -726,22 +726,6 @@ impl Default for SharedMemoryRegistry {
     }
 }
 
-/// Registers a fresh waiter node in the queue for `key` and returns it.
-///
-/// The node sits in the queue from registration until either a notify pops
-/// it (the owner is then woken) or the owner removes it via
-/// [`unregister_waiter`] (timeout or drop). Registration is done under the
-/// map write lock so a concurrent unregister can never remove the queue out
-/// from under a just-pushed node — the register → re-check → wait idiom
-/// stays lost-wake-free.
-pub(crate) fn register_waiter(waiters: &WaiterMap, key: u32) -> Arc<WaiterNode> {
-    let node = WaiterNode::new();
-    let mut map = waiters.write();
-    let queue = map.entry(key).or_insert_with(WaiterQueue::new).clone();
-    queue.inner.lock().push_back(node.clone());
-    node
-}
-
 /// Re-joins `node` to the queue for `key` unless it is already queued.
 ///
 /// Used by [`RegionWaiter::wait`] so a handle whose node was popped by a
@@ -758,26 +742,44 @@ pub(crate) fn ensure_waiter_registered(waiters: &WaiterMap, key: u32, node: &Arc
     }
 }
 
-/// Removes `node` from the queue for `key` if it is still queued.
+/// Wakes up to `n` distinct threads parked in the queue for `key`; returns
+/// the number of wake attempts delivered (zero when no waiter is queued).
 ///
-/// A node already popped by a notify is left alone. When the last node of a
-/// queue is removed the queue entry itself is dropped, so addresses that are
-/// no longer waited on leave no stale state behind. Serialised with
-/// [`register_waiter`] on the map write lock, so a node can never be pushed
-/// into a queue that a concurrent unregister has already discarded.
-pub(crate) fn unregister_waiter(waiters: &WaiterMap, key: u32, node: &Arc<WaiterNode>) {
-    let mut map = waiters.write();
-    let Some(queue) = map.get(&key).cloned() else {
-        return;
-    };
-    let mut inner = queue.inner.lock();
-    inner.retain(|candidate| !Arc::ptr_eq(candidate, node));
-    if inner.is_empty() {
-        // The queue is empty and we hold the map write lock: no concurrent
-        // register can be pushing into it, so removing the entry is safe.
-        drop(inner);
-        map.remove(&key);
+/// Nodes are popped under the queue's own lock and woken *after* it is
+/// dropped, so a notifier never holds the queue lock while another thread
+/// registers or deregisters. `n == 0` notifies nobody (threads proposal).
+pub(crate) fn notify_queue(waiters: &WaiterMap, key: u32, n: u32) -> u32 {
+    if n == 0 {
+        return 0;
     }
+    let queue = {
+        let map = waiters.read();
+        map.get(&key).cloned()
+    };
+    let Some(queue) = queue else {
+        return 0;
+    };
+
+    let mut woken = Vec::new();
+    {
+        let mut inner = queue.inner.lock();
+        while woken.len() < n as usize {
+            match inner.pop_front() {
+                Some(node) => woken.push(node),
+                None => break,
+            }
+        }
+    }
+
+    let count = woken.len() as u32;
+    for node in woken {
+        let mut notified = node.notified.lock();
+        *notified = true;
+        drop(notified);
+        node.condvar.notify_one();
+    }
+    // `n` bounds the loop; woken.len() is at most n, so the count fits u32.
+    count
 }
 
 /// Parks the calling thread on an already-registered `node` until notified
@@ -825,42 +827,40 @@ pub(crate) fn park_node(
     }
 }
 
-/// Wakes up to `n` distinct threads parked in the queue for `key`; returns
-/// the number of wake attempts delivered (zero when no waiter is queued).
+/// Registers a fresh waiter node in the queue for `key` and returns it.
 ///
-/// Nodes are popped under the queue's own lock and woken *after* it is
-/// dropped, so a notifier never holds the queue lock while another thread
-/// registers or deregisters. `n == 0` notifies nobody (threads proposal).
-pub(crate) fn notify_queue(waiters: &WaiterMap, key: u32, n: u32) -> u32 {
-    if n == 0 {
-        return 0;
-    }
-    let queue = {
-        let map = waiters.read();
-        map.get(&key).cloned()
-    };
-    let Some(queue) = queue else {
-        return 0;
-    };
+/// The node sits in the queue from registration until either a notify pops
+/// it (the owner is then woken) or the owner removes it via
+/// [`unregister_waiter`] (timeout or drop). Registration is done under the
+/// map write lock so a concurrent unregister can never remove the queue out
+/// from under a just-pushed node — the register → re-check → wait idiom
+/// stays lost-wake-free.
+pub(crate) fn register_waiter(waiters: &WaiterMap, key: u32) -> Arc<WaiterNode> {
+    let node = WaiterNode::new();
+    let mut map = waiters.write();
+    let queue = map.entry(key).or_insert_with(WaiterQueue::new).clone();
+    queue.inner.lock().push_back(node.clone());
+    node
+}
 
-    let mut woken = Vec::new();
-    {
-        let mut inner = queue.inner.lock();
-        while woken.len() < n as usize {
-            match inner.pop_front() {
-                Some(node) => woken.push(node),
-                None => break,
-            }
-        }
+/// Removes `node` from the queue for `key` if it is still queued.
+///
+/// A node already popped by a notify is left alone. When the last node of a
+/// queue is removed the queue entry itself is dropped, so addresses that are
+/// no longer waited on leave no stale state behind. Serialised with
+/// [`register_waiter`] on the map write lock, so a node can never be pushed
+/// into a queue that a concurrent unregister has already discarded.
+pub(crate) fn unregister_waiter(waiters: &WaiterMap, key: u32, node: &Arc<WaiterNode>) {
+    let mut map = waiters.write();
+    let Some(queue) = map.get(&key).cloned() else {
+        return;
+    };
+    let mut inner = queue.inner.lock();
+    inner.retain(|candidate| !Arc::ptr_eq(candidate, node));
+    if inner.is_empty() {
+        // The queue is empty and we hold the map write lock: no concurrent
+        // register can be pushing into it, so removing the entry is safe.
+        drop(inner);
+        map.remove(&key);
     }
-
-    let count = woken.len() as u32;
-    for node in woken {
-        let mut notified = node.notified.lock();
-        *notified = true;
-        drop(notified);
-        node.condvar.notify_one();
-    }
-    // `n` bounds the loop; woken.len() is at most n, so the count fits u32.
-    count
 }

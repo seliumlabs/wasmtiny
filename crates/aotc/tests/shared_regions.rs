@@ -17,10 +17,6 @@ use wasmtiny::{
 };
 use wasmtiny_aotc::{CompilerConfig, compile_artifact};
 
-/// Byte offset of the test word within the region.
-const OFFSET: u32 = 64;
-const PAGE_BYTES: u32 = 65536;
-
 /// Guest module with a shared memory exposing wait32/notify and load/store
 /// helpers that take the guest address as a parameter. `wait32` bumps an
 /// **atomic** guest-visible parked counter (owned address 4) on entry and
@@ -48,6 +44,9 @@ const GUEST: &str = r#"(module
         (i32.store (local.get 0) (local.get 1)))
     (func (export "load") (param i32) (result i32)
         (i32.load (local.get 0))))"#;
+/// Byte offset of the test word within the region.
+const OFFSET: u32 = 64;
+const PAGE_BYTES: u32 = 65536;
 
 struct Fixture {
     instance: Arc<AotInstance>,
@@ -70,23 +69,39 @@ impl Fixture {
     }
 }
 
-fn instantiate_guest() -> Arc<AotInstance> {
-    Arc::new(AotInstance::new(&load(GUEST)).expect("instantiation succeeds"))
-}
+/// Finding 4: detach unmaps the region (guest access traps `MemoryOutOfBounds`)
+/// and the registry then allows `destroy_region`.
+#[test]
+fn aot_shared_region_detach_unmaps_and_destroy_works() {
+    let fx = setup();
+    let addr = fx.guest_addr();
 
-/// A fresh fixture: instance + one attached read/write region.
-fn setup() -> Fixture {
-    let instance = instantiate_guest();
-    let registry = instance.shared_memory_registry();
-    let (region_id, page_offset) = instance
-        .allocate_shared_region(PAGE_BYTES, RegionProt::ReadWrite)
-        .expect("allocate and attach shared region");
-    Fixture {
-        instance,
-        registry,
-        region_id,
-        page_offset,
-    }
+    // Sanity: the region is accessible before detach.
+    fx.invoke("store", &[WasmValue::I32(addr), WasmValue::I32(7)]);
+    assert_eq!(
+        fx.invoke("load", &[WasmValue::I32(addr)]),
+        vec![WasmValue::I32(7)]
+    );
+
+    // Detach: the guest's mapping is restored to PROT_NONE, so guest access
+    // to the region's address traps.
+    fx.instance
+        .detach_shared_region(fx.region_id)
+        .expect("detach succeeds");
+    let result = fx.instance.invoke_shared(
+        fx.instance.export_func_index("load").expect("load"),
+        &[WasmValue::I32(addr)],
+    );
+    assert!(
+        matches!(result, Err(WasmError::Trap(TrapCode::MemoryOutOfBounds))),
+        "guest access to a detached region must trap, got {result:?}"
+    );
+
+    // With zero attachments the registry can destroy the region.
+    fx.registry
+        .lock()
+        .destroy_region(fx.region_id)
+        .expect("destroy after detach succeeds");
 }
 
 /// Finding 4: the AOT instance can allocate and attach a shared region, the
@@ -168,95 +183,29 @@ fn aot_shared_region_guest_wait_notify_and_host_interop() {
     );
 }
 
-/// Finding 4: two AOT instances sharing one registry observe each other's
-/// writes through their own guest mappings of the same attached region.
-#[test]
-fn two_aot_instances_share_attached_region_bytes() {
-    let shared_store = wasmtiny::aot::AotStore::shared();
-    let registry = Arc::new(ParkingMutex::new(SharedMemoryRegistry::default()));
-    let a = Arc::new(
-        AotInstance::instantiate_with_registry(&shared_store, &load(GUEST), &[], registry.clone())
-            .expect("A instantiates"),
-    );
-    let b = Arc::new(
-        AotInstance::instantiate_with_registry(&shared_store, &load(GUEST), &[], registry.clone())
-            .expect("B instantiates"),
-    );
-
-    let (region_id, _page_a) = a
-        .allocate_shared_region(PAGE_BYTES, RegionProt::ReadWrite)
-        .expect("A allocates and attaches");
-    let page_b = b
-        .attach_shared_region(region_id, RegionProt::ReadWrite, None)
-        .expect("B attaches the same region");
-    let page_a = a
-        .memory_handle(0)
-        .expect("A memory")
-        .lock()
-        .expect("lock")
-        .shared_ranges()
-        .iter()
-        .find(|r| r.region_id == region_id)
-        .map(|r| r.page_offset)
-        .expect("A has the region mapped");
-
-    // A writes through its guest mapping; B reads through its own.
-    let word = |page: u32| (page * PAGE_BYTES + OFFSET) as i32;
-    let invoke = |instance: &AotInstance, name: &str, args: &[WasmValue]| {
-        let index = instance.export_func_index(name).expect("export");
-        instance
-            .invoke_shared(index, args)
-            .expect("invocation succeeds")
-    };
-    invoke(
-        &a,
-        "store",
-        &[
-            WasmValue::I32(word(page_a)),
-            WasmValue::I32(0xABCD1234u32 as i32),
-        ],
-    );
-    let read = invoke(&b, "load", &[WasmValue::I32(word(page_b))]);
-    assert_eq!(
-        read,
-        vec![WasmValue::I32(0xABCD1234u32 as i32)],
-        "writes through instance A must be visible through instance B's mapping"
-    );
+fn instantiate_guest() -> Arc<AotInstance> {
+    Arc::new(AotInstance::new(&load(GUEST)).expect("instantiation succeeds"))
 }
 
-/// Finding 4: detach unmaps the region (guest access traps `MemoryOutOfBounds`)
-/// and the registry then allows `destroy_region`.
-#[test]
-fn aot_shared_region_detach_unmaps_and_destroy_works() {
-    let fx = setup();
-    let addr = fx.guest_addr();
+fn load(source: &str) -> AotModule {
+    let wasm = wat::parse_str(source).expect("wat parses");
+    let bytes = compile_artifact(&wasm, &CompilerConfig::host()).expect("compilation succeeds");
+    AotLoader::new().load(&bytes).expect("artifact loads")
+}
 
-    // Sanity: the region is accessible before detach.
-    fx.invoke("store", &[WasmValue::I32(addr), WasmValue::I32(7)]);
-    assert_eq!(
-        fx.invoke("load", &[WasmValue::I32(addr)]),
-        vec![WasmValue::I32(7)]
-    );
-
-    // Detach: the guest's mapping is restored to PROT_NONE, so guest access
-    // to the region's address traps.
-    fx.instance
-        .detach_shared_region(fx.region_id)
-        .expect("detach succeeds");
-    let result = fx.instance.invoke_shared(
-        fx.instance.export_func_index("load").expect("load"),
-        &[WasmValue::I32(addr)],
-    );
-    assert!(
-        matches!(result, Err(WasmError::Trap(TrapCode::MemoryOutOfBounds))),
-        "guest access to a detached region must trap, got {result:?}"
-    );
-
-    // With zero attachments the registry can destroy the region.
-    fx.registry
-        .lock()
-        .destroy_region(fx.region_id)
-        .expect("destroy after detach succeeds");
+/// A fresh fixture: instance + one attached read/write region.
+fn setup() -> Fixture {
+    let instance = instantiate_guest();
+    let registry = instance.shared_memory_registry();
+    let (region_id, page_offset) = instance
+        .allocate_shared_region(PAGE_BYTES, RegionProt::ReadWrite)
+        .expect("allocate and attach shared region");
+    Fixture {
+        instance,
+        registry,
+        region_id,
+        page_offset,
+    }
 }
 
 /// Finding 4 + spike finding 1: N *concurrently invoked* guest threads park
@@ -326,8 +275,58 @@ fn shared_region_multi_waiter_notify_releases_all() {
     }
 }
 
-fn load(source: &str) -> AotModule {
-    let wasm = wat::parse_str(source).expect("wat parses");
-    let bytes = compile_artifact(&wasm, &CompilerConfig::host()).expect("compilation succeeds");
-    AotLoader::new().load(&bytes).expect("artifact loads")
+/// Finding 4: two AOT instances sharing one registry observe each other's
+/// writes through their own guest mappings of the same attached region.
+#[test]
+fn two_aot_instances_share_attached_region_bytes() {
+    let shared_store = wasmtiny::aot::AotStore::shared();
+    let registry = Arc::new(ParkingMutex::new(SharedMemoryRegistry::default()));
+    let a = Arc::new(
+        AotInstance::instantiate_with_registry(&shared_store, &load(GUEST), &[], registry.clone())
+            .expect("A instantiates"),
+    );
+    let b = Arc::new(
+        AotInstance::instantiate_with_registry(&shared_store, &load(GUEST), &[], registry.clone())
+            .expect("B instantiates"),
+    );
+
+    let (region_id, _page_a) = a
+        .allocate_shared_region(PAGE_BYTES, RegionProt::ReadWrite)
+        .expect("A allocates and attaches");
+    let page_b = b
+        .attach_shared_region(region_id, RegionProt::ReadWrite, None)
+        .expect("B attaches the same region");
+    let page_a = a
+        .memory_handle(0)
+        .expect("A memory")
+        .lock()
+        .expect("lock")
+        .shared_ranges()
+        .iter()
+        .find(|r| r.region_id == region_id)
+        .map(|r| r.page_offset)
+        .expect("A has the region mapped");
+
+    // A writes through its guest mapping; B reads through its own.
+    let word = |page: u32| (page * PAGE_BYTES + OFFSET) as i32;
+    let invoke = |instance: &AotInstance, name: &str, args: &[WasmValue]| {
+        let index = instance.export_func_index(name).expect("export");
+        instance
+            .invoke_shared(index, args)
+            .expect("invocation succeeds")
+    };
+    invoke(
+        &a,
+        "store",
+        &[
+            WasmValue::I32(word(page_a)),
+            WasmValue::I32(0xABCD1234u32 as i32),
+        ],
+    );
+    let read = invoke(&b, "load", &[WasmValue::I32(word(page_b))]);
+    assert_eq!(
+        read,
+        vec![WasmValue::I32(0xABCD1234u32 as i32)],
+        "writes through instance A must be visible through instance B's mapping"
+    );
 }

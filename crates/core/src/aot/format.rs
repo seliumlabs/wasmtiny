@@ -44,9 +44,9 @@ pub const SECTION_GLOBALS: u32 = 6;
 pub const SECTION_IMPORTS: u32 = 2;
 pub const SECTION_INTEGRITY: u32 = 13;
 pub const SECTION_MEMORIES: u32 = 4;
-pub const SECTION_START: u32 = 12;
 /// Shadow-stack pointer global index (`u32::MAX` = none). ABI v2.
 pub const SECTION_STACK_POINTER: u32 = 14;
+pub const SECTION_START: u32 = 12;
 pub const SECTION_TABLES: u32 = 5;
 /// Section identifiers.
 pub const SECTION_TYPES: u32 = 1;

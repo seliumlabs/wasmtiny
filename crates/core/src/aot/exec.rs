@@ -2,10 +2,12 @@
 //! trampoline, dispatching imported host functions, and wiring the shared
 //! store-wide function/table state used by `call_indirect`.
 
-use std::cell::Cell;
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    cell::Cell,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use super::{
@@ -179,33 +181,6 @@ struct InvocationMeter {
     /// *another* instance never drains this invocation's fuel into that
     /// instance's meter.
     owner: *const InstanceMeter,
-}
-
-thread_local! {
-    /// The innermost AOT invocation on this thread, restored on return so
-    /// host-initiated re-entry into the same instance nests correctly.
-    static INVOCATION_METER: Cell<Option<InvocationMeter>> = const { Cell::new(None) };
-}
-
-/// Drains this thread's invocation-local fuel cell into `meter` when `meter`
-/// is the authoritative meter of the invocation the thread is running.
-///
-/// Called at the host-call boundary so a host function observes a count that
-/// includes the guest work done since the last flush, and so a budget raised
-/// (or reset) between invocations takes effect for the remainder of a running
-/// invocation. A no-op when the thread is not inside an AOT invocation, or
-/// when the host call belongs to a different instance.
-fn drain_invocation_meter(meter: &InstanceMeter) {
-    let Some(scope) = INVOCATION_METER.with(Cell::get) else {
-        return;
-    };
-    if !std::ptr::eq(scope.owner, meter) || scope.local.is_null() {
-        return;
-    }
-    // SAFETY: `scope.local` points at the local fuel cell of the invocation
-    // this thread is currently running; the scope is cleared when that
-    // invocation returns, so the cell outlives this call.
-    meter.drain_invocation_cells(unsafe { &*scope.local });
 }
 
 impl AotInstance {
@@ -1366,6 +1341,12 @@ impl LibcallTable {
     }
 }
 
+thread_local! {
+    /// The innermost AOT invocation on this thread, restored on return so
+    /// host-initiated re-entry into the same instance nests correctly.
+    static INVOCATION_METER: Cell<Option<InvocationMeter>> = const { Cell::new(None) };
+}
+
 /// `memory.atomic.notify`: wakes waiters at `addr` in memory `mem_idx`.
 unsafe extern "C" fn atomic_notify(ctx: *const u8, mem_idx: u64, addr: u64, count: u64) -> u64 {
     match memory_notify(ctx, mem_idx, addr, count) {
@@ -1474,6 +1455,27 @@ fn dispatch_table(ctx: *const u8, table_idx: u64) -> Result<Arc<Mutex<AotTable>>
         .get(table_idx as usize)
         .cloned()
         .ok_or_else(|| WasmError::Runtime(format!("table {table_idx} not found")))
+}
+
+/// Drains this thread's invocation-local fuel cell into `meter` when `meter`
+/// is the authoritative meter of the invocation the thread is running.
+///
+/// Called at the host-call boundary so a host function observes a count that
+/// includes the guest work done since the last flush, and so a budget raised
+/// (or reset) between invocations takes effect for the remainder of a running
+/// invocation. A no-op when the thread is not inside an AOT invocation, or
+/// when the host call belongs to a different instance.
+fn drain_invocation_meter(meter: &InstanceMeter) {
+    let Some(scope) = INVOCATION_METER.with(Cell::get) else {
+        return;
+    };
+    if !std::ptr::eq(scope.owner, meter) || scope.local.is_null() {
+        return;
+    }
+    // SAFETY: `scope.local` points at the local fuel cell of the invocation
+    // this thread is currently running; the scope is cleared when that
+    // invocation returns, so the cell outlives this call.
+    meter.drain_invocation_cells(unsafe { &*scope.local });
 }
 
 /// `elem.drop`: marks element segment `seg_idx` no longer available.

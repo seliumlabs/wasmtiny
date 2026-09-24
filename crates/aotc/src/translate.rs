@@ -126,6 +126,23 @@ pub enum ControlStackFrame {
     },
 }
 
+/// Contains information passed along during a function's translation: the
+/// current value and control stacks, and the reachability of the current
+/// position.
+#[derive(Debug)]
+pub struct FuncTranslationState {
+    /// A stack of values corresponding to the active values in the input wasm
+    /// function at this point.
+    stack: Vec<Value>,
+    /// A stack of active control flow operations.
+    control_stack: Vec<ControlStackFrame>,
+    /// Is the current translation state still reachable?
+    reachable: bool,
+    /// Static fuel sizing for the function being translated (see
+    /// [`FuelSizing`]).
+    fuel: FuelSizing,
+}
+
 /// Static fuel sizing for one function, computed by a pre-pass over the
 /// operator stream *before* the real translation pass emits charges.
 ///
@@ -143,39 +160,6 @@ struct FuelSizing {
     loop_body_sizes: Vec<u64>,
     /// The ordinal of the next `Loop` operator encountered during translation.
     loop_cursor: usize,
-}
-
-impl FuelSizing {
-    /// The static charge for the next loop encountered, advancing the cursor.
-    ///
-    /// Returns 0 when the sizing is exhausted (defensive: the pre-pass and the
-    /// translation pass walk the same operator stream, so this cannot happen).
-    fn next_loop_charge(&mut self) -> u64 {
-        let charge = self
-            .loop_body_sizes
-            .get(self.loop_cursor)
-            .copied()
-            .unwrap_or(0);
-        self.loop_cursor += 1;
-        charge
-    }
-}
-
-/// Contains information passed along during a function's translation: the
-/// current value and control stacks, and the reachability of the current
-/// position.
-#[derive(Debug)]
-pub struct FuncTranslationState {
-    /// A stack of values corresponding to the active values in the input wasm
-    /// function at this point.
-    stack: Vec<Value>,
-    /// A stack of active control flow operations.
-    control_stack: Vec<ControlStackFrame>,
-    /// Is the current translation state still reachable?
-    reachable: bool,
-    /// Static fuel sizing for the function being translated (see
-    /// [`FuelSizing`]).
-    fuel: FuelSizing,
 }
 
 /// WebAssembly to Cranelift IR function translator.
@@ -486,6 +470,22 @@ impl FuncTranslationState {
             consequent_ends_reachable: None,
             blocktype,
         });
+    }
+}
+
+impl FuelSizing {
+    /// The static charge for the next loop encountered, advancing the cursor.
+    ///
+    /// Returns 0 when the sizing is exhausted (defensive: the pre-pass and the
+    /// translation pass walk the same operator stream, so this cannot happen).
+    fn next_loop_charge(&mut self) -> u64 {
+        let charge = self
+            .loop_body_sizes
+            .get(self.loop_cursor)
+            .copied()
+            .unwrap_or(0);
+        self.loop_cursor += 1;
+        charge
     }
 }
 
@@ -927,6 +927,46 @@ fn canonicalise_then_jump(
 ) -> ir::Inst {
     let args: Vec<BlockArg> = params.iter().copied().map(BlockArg::from).collect();
     builder.ins().jump(destination, &args)
+}
+
+/// Computes the static fuel sizing for a function body: the total instruction
+/// count and the static instruction count of each loop body (loops in
+/// operator order).
+///
+/// This is a lightweight pre-pass mirroring the translator's control-stack
+/// handling: it counts every operator, tracks the nesting of `block`/`loop`/
+/// `if` frames, and, when a `loop` frame closes, records how many operators
+/// lie strictly between the `loop` and its matching `end`. It is purely
+/// static, so charge emission stays deterministic.
+fn compute_fuel_sizing(body: &FunctionBody<'_>) -> TranslateResult<FuelSizing> {
+    let mut sizing = FuelSizing::default();
+    // Per open control frame: (is_loop, instruction count at the frame's open,
+    // loop ordinal). The count is taken *after* the opening operator is
+    // counted, so a loop's body size is `count_at_end - count_at_open - 1`.
+    let mut frames: Vec<(bool, u64, usize)> = Vec::new();
+
+    let ops = body.get_operators_reader()?;
+    for op in ops {
+        let op = op?;
+        sizing.function_size += 1;
+        match op {
+            Operator::Block { .. } => frames.push((false, 0, 0)),
+            Operator::Loop { .. } => {
+                let ordinal = sizing.loop_body_sizes.len();
+                sizing.loop_body_sizes.push(0);
+                frames.push((true, sizing.function_size, ordinal));
+            }
+            Operator::If { .. } => frames.push((false, 0, 0)),
+            Operator::End => {
+                if let Some((true, open, ordinal)) = frames.pop() {
+                    sizing.loop_body_sizes[ordinal] = sizing.function_size - open - 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(sizing)
 }
 
 /// Extracts `(base_global, constant_offset)` from an active segment's offset
@@ -1402,46 +1442,6 @@ fn translate_fcvt_to_uint_sat(
 ) {
     let val = state.pop1();
     state.push1(builder.ins().fcvt_to_uint_sat(result_ty, val));
-}
-
-/// Computes the static fuel sizing for a function body: the total instruction
-/// count and the static instruction count of each loop body (loops in
-/// operator order).
-///
-/// This is a lightweight pre-pass mirroring the translator's control-stack
-/// handling: it counts every operator, tracks the nesting of `block`/`loop`/
-/// `if` frames, and, when a `loop` frame closes, records how many operators
-/// lie strictly between the `loop` and its matching `end`. It is purely
-/// static, so charge emission stays deterministic.
-fn compute_fuel_sizing(body: &FunctionBody<'_>) -> TranslateResult<FuelSizing> {
-    let mut sizing = FuelSizing::default();
-    // Per open control frame: (is_loop, instruction count at the frame's open,
-    // loop ordinal). The count is taken *after* the opening operator is
-    // counted, so a loop's body size is `count_at_end - count_at_open - 1`.
-    let mut frames: Vec<(bool, u64, usize)> = Vec::new();
-
-    let ops = body.get_operators_reader()?;
-    for op in ops {
-        let op = op?;
-        sizing.function_size += 1;
-        match op {
-            Operator::Block { .. } => frames.push((false, 0, 0)),
-            Operator::Loop { .. } => {
-                let ordinal = sizing.loop_body_sizes.len();
-                sizing.loop_body_sizes.push(0);
-                frames.push((true, sizing.function_size, ordinal));
-            }
-            Operator::If { .. } => frames.push((false, 0, 0)),
-            Operator::End => {
-                if let Some((true, open, ordinal)) = frames.pop() {
-                    sizing.loop_body_sizes[ordinal] = sizing.function_size - open - 1;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    Ok(sizing)
 }
 
 /// Translates one defined function body into CLIF and stores it.

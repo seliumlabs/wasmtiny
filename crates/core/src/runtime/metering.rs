@@ -91,17 +91,6 @@ pub struct InstanceMeter {
     saturation_logged: AtomicBool,
 }
 
-impl Default for InstanceMeter {
-    fn default() -> Self {
-        Self {
-            executed: AtomicU64::new(0),
-            execution_budget: AtomicU64::new(UNBOUNDED_BUDGET),
-            memory_budget: AtomicU32::new(UNBOUNDED_MEMORY_BUDGET),
-            saturation_logged: AtomicBool::new(false),
-        }
-    }
-}
-
 impl InstanceMeter {
     /// Creates a new meter with no budgets configured (unbounded).
     pub fn new() -> Self {
@@ -295,6 +284,17 @@ impl InstanceMeter {
     #[cfg(test)]
     fn saturation_logged(&self) -> bool {
         self.saturation_logged.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for InstanceMeter {
+    fn default() -> Self {
+        Self {
+            executed: AtomicU64::new(0),
+            execution_budget: AtomicU64::new(UNBOUNDED_BUDGET),
+            memory_budget: AtomicU32::new(UNBOUNDED_MEMORY_BUDGET),
+            saturation_logged: AtomicBool::new(false),
+        }
     }
 }
 

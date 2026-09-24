@@ -31,22 +31,6 @@ fn abi_version_skew_is_refused() {
     assert!(message.contains("ABI version"), "got {message}");
 }
 
-/// The ABI bumped 2 -> 3 when the vmctx gained the `meter` field. A v2
-/// artifact must be refused (and the error must name the version and the
-/// remedy), so it can never be executed against the v3 layout.
-#[test]
-fn previous_abi_version_is_refused() {
-    let mut bytes = compile(&host_target());
-    let at = HEADER_ABI_VERSION_OFFSET;
-    bytes[at..at + 4].copy_from_slice(&2u32.to_le_bytes());
-    let message = refuse(&bytes);
-    assert!(message.contains("ABI version 2"), "got {message}");
-    assert!(
-        message.contains("regenerate"),
-        "the ABI error must name the remedy, got {message}"
-    );
-}
-
 #[test]
 fn bad_magic_is_refused() {
     let mut bytes = compile(&host_target());
@@ -203,6 +187,22 @@ fn pointer_size_mismatch_is_refused() {
     bytes[at..at + 4].copy_from_slice(&4u32.to_le_bytes());
     let message = refuse(&bytes);
     assert!(message.contains("pointer size"), "got {message}");
+}
+
+/// The ABI bumped 2 -> 3 when the vmctx gained the `meter` field. A v2
+/// artifact must be refused (and the error must name the version and the
+/// remedy), so it can never be executed against the v3 layout.
+#[test]
+fn previous_abi_version_is_refused() {
+    let mut bytes = compile(&host_target());
+    let at = HEADER_ABI_VERSION_OFFSET;
+    bytes[at..at + 4].copy_from_slice(&2u32.to_le_bytes());
+    let message = refuse(&bytes);
+    assert!(message.contains("ABI version 2"), "got {message}");
+    assert!(
+        message.contains("regenerate"),
+        "the ABI error must name the remedy, got {message}"
+    );
 }
 
 /// Loads `bytes`; returns the error message on refusal.

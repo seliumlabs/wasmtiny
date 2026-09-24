@@ -37,7 +37,7 @@ use wasmparser::ValType;
 use crate::{
     compile::CompiledModule,
     environment::{
-        DataSegKind, ElemSegKind, ModuleInfo, USER_TRAP_BAD_SIGNATURE,
+        DataSegKind, ElemSegKind, ModuleInfo, USER_TRAP_BAD_SIGNATURE, USER_TRAP_BUDGET,
         USER_TRAP_CALL_INDIRECT_NULL, USER_TRAP_HOST, USER_TRAP_MEMORY_LIMIT,
         USER_TRAP_NULL_REFERENCE, USER_TRAP_TABLE_OUT_OF_BOUNDS, USER_TRAP_UNREACHABLE,
         wasm_features,
@@ -51,7 +51,11 @@ use crate::{
 /// and shadow-stack routing changed (see `environment::VmCtxOffsets`); the
 /// artifact also records the shadow-stack pointer global index in
 /// [`SECTION_STACK_POINTER`].
-pub const ABI_VERSION: u32 = 2;
+///
+/// v3: the vmctx gained a `meter` field (a `*const MeterCells`) and compiled
+/// code charges size-weighted fuel at function entry and each loop back-edge.
+/// Existing v2 artifacts are refused by the loader and must be regenerated.
+pub const ABI_VERSION: u32 = 3;
 /// Endianness marker: little-endian.
 pub const ENDIANNESS_LITTLE: u32 = 0;
 /// Export kinds (wasm external-kind values).
@@ -117,6 +121,7 @@ pub const SECTION_TYPES: u32 = 1;
 /// Byte length of a SHA512 digest.
 pub const SHA512_LEN: usize = 64;
 pub const TRAP_CALL_INDIRECT_NULL: u8 = 5;
+pub const TRAP_EXECUTION_BUDGET_EXCEEDED: u8 = 13;
 pub const TRAP_HOST: u8 = 11;
 pub const TRAP_INDIRECT_CALL_TYPE_MISMATCH: u8 = 4;
 pub const TRAP_INTEGER_DIVISION_BY_ZERO: u8 = 8;
@@ -172,6 +177,7 @@ pub fn trap_code_byte(code: ClifTrapCode) -> u8 {
         USER_TRAP_NULL_REFERENCE => TRAP_NULL_REFERENCE,
         USER_TRAP_HOST => TRAP_HOST,
         USER_TRAP_MEMORY_LIMIT => TRAP_MEMORY_LIMIT_EXCEEDED,
+        USER_TRAP_BUDGET => TRAP_EXECUTION_BUDGET_EXCEEDED,
         _ => TRAP_HOST,
     }
 }
@@ -693,4 +699,36 @@ fn write_section(out: &mut Vec<u8>, id: u32, payload: &[u8]) {
     push_u32(out, id);
     push_u32(out, payload.len() as u32);
     out.extend_from_slice(payload);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::environment::user_trap;
+
+    #[test]
+    fn budget_trap_maps_to_its_own_artifact_byte() {
+        // The inline fuel charge emits `USER_TRAP_BUDGET`; it must serialise to
+        // the dedicated budget-exhausted byte, distinct from every other trap.
+        let byte = trap_code_byte(user_trap(USER_TRAP_BUDGET));
+        assert_eq!(byte, TRAP_EXECUTION_BUDGET_EXCEEDED);
+        assert_ne!(byte, TRAP_MEMORY_LIMIT_EXCEEDED);
+        assert_ne!(byte, TRAP_HOST);
+    }
+
+    #[test]
+    fn existing_trap_mappings_are_unchanged() {
+        assert_eq!(
+            trap_code_byte(user_trap(USER_TRAP_UNREACHABLE)),
+            TRAP_UNREACHABLE
+        );
+        assert_eq!(
+            trap_code_byte(user_trap(USER_TRAP_MEMORY_LIMIT)),
+            TRAP_MEMORY_LIMIT_EXCEEDED
+        );
+        assert_eq!(
+            trap_code_byte(ClifTrapCode::STACK_OVERFLOW),
+            TRAP_STACK_OVERFLOW
+        );
+    }
 }

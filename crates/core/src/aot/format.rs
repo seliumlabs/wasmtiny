@@ -11,7 +11,11 @@ use crate::runtime::TrapCode;
 ///
 /// v2: the vmctx gained a `stack_pointer` field and the artifact carries the
 /// shadow-stack pointer global index in [`SECTION_STACK_POINTER`].
-pub const ABI_VERSION: u32 = 2;
+///
+/// v3: the vmctx gained a `meter` field (`*const MeterCells`) and compiled
+/// code charges size-weighted fuel at function entry and each loop back-edge.
+/// v2 artifacts are refused; regenerate them with the matching compiler.
+pub const ABI_VERSION: u32 = 3;
 /// Little-endian marker.
 pub const ENDIANNESS_LITTLE: u32 = 0;
 /// Export kinds (wasm external-kind values).
@@ -53,6 +57,7 @@ pub const SECTION_TYPES: u32 = 1;
 /// Byte length of a SHA512 digest.
 pub const SHA512_LEN: usize = 64;
 pub const TRAP_CALL_INDIRECT_NULL: u8 = 5;
+pub const TRAP_EXECUTION_BUDGET_EXCEEDED: u8 = 13;
 pub const TRAP_HOST: u8 = 11;
 pub const TRAP_INDIRECT_CALL_TYPE_MISMATCH: u8 = 4;
 pub const TRAP_INTEGER_DIVISION_BY_ZERO: u8 = 8;
@@ -83,8 +88,35 @@ pub fn trap_code_from_byte(byte: u8) -> Option<TrapCode> {
         TRAP_INVALID_CONVERSION_TO_INT => TrapCode::InvalidConversionToInt,
         TRAP_NULL_REFERENCE => TrapCode::NullReference,
         TRAP_MEMORY_LIMIT_EXCEEDED => TrapCode::MemoryLimitExceeded,
+        TRAP_EXECUTION_BUDGET_EXCEEDED => TrapCode::ExecutionBudgetExceeded,
         TRAP_HOST => TrapCode::HostTrap,
         TRAP_INVALID => return None,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn budget_trap_byte_maps_to_the_budget_trap_code() {
+        // Byte 13 (written by the compiler's inline fuel charge) loads as the
+        // distinct budget-exhausted trap.
+        assert_eq!(
+            trap_code_from_byte(TRAP_EXECUTION_BUDGET_EXCEEDED),
+            Some(TrapCode::ExecutionBudgetExceeded)
+        );
+        // It must not collide with the memory-limit trap.
+        assert_eq!(
+            trap_code_from_byte(TRAP_MEMORY_LIMIT_EXCEEDED),
+            Some(TrapCode::MemoryLimitExceeded)
+        );
+    }
+
+    #[test]
+    fn unknown_trap_byte_is_refused() {
+        assert_eq!(trap_code_from_byte(14), None);
+        assert_eq!(trap_code_from_byte(TRAP_INVALID), None);
+    }
 }

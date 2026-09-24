@@ -631,6 +631,7 @@ dependencies = [
  "anyhow",
  "clap",
  "libc",
+ "log",
  "parking_lot",
  "sha2",
  "thiserror",

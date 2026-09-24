@@ -28,7 +28,7 @@ pub use instance::{
     Extern, GuestFuncBinding, HostCaller, HostFunc, Instance, SharedGlobal, SharedMemory,
     SharedTable, Store,
 };
-pub use metering::{InstanceMeter, InstanceStats};
+pub use metering::{InstanceMeter, InstanceStats, MeterCells};
 pub use module::{DataKind, DataSegment, ElemKind, ElemSegment, Func, Local, Module};
 pub use shared_memory::{
     HostWaitSupport, RegionWaiter, SharedMemoryRegistry, SharedRegion, SharedRegionId, WakeOutcome,

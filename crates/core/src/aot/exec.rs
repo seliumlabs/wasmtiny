@@ -2,6 +2,7 @@
 //! trampoline, dispatching imported host functions, and wiring the shared
 //! store-wide function/table state used by `call_indirect`.
 
+use std::cell::Cell;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -20,9 +21,9 @@ use crate::{
     memory::RegionProt,
     runtime::{
         DataKind, ElemKind, ExportKind, ExportType, FunctionType, Global, GlobalType, HostCaller,
-        HostFunc, ImportKind, InstanceMeter, InstanceStats, Memory, NumType, RefType, Result,
-        SharedMemoryRegistry, SharedRegionId, Store, TrapCode, ValType, WasmError, WasmValue,
-        evaluate_const_expr,
+        HostFunc, ImportKind, InstanceMeter, InstanceStats, Memory, MeterCells, NumType, RefType,
+        Result, SharedMemoryRegistry, SharedRegionId, Store, TrapCode, ValType, WasmError,
+        WasmValue, evaluate_const_expr,
     },
 };
 
@@ -144,9 +145,67 @@ struct AotDispatchState {
     /// `data_available` for the concurrency contract.
     elem_available: Vec<AtomicBool>,
     /// Per-instance meter. The memory-page budget is enforced inside the
-    /// `memory.grow` critical section so concurrent grows cannot exceed it;
-    /// the AOT path does not charge executed instructions.
+    /// `memory.grow` critical section so concurrent grows cannot exceed it.
+    ///
+    /// The execution budget is enforced by the inline fuel charge emitted at
+    /// function entry and each loop back-edge. That charge writes to an
+    /// *invocation-local* cell — a per-invocation copy of `vmctx.meter`, so
+    /// concurrent invocations never ping-pong one shared cache line — whose
+    /// budget field is seeded from this meter's remaining allowance. The
+    /// runtime drains the local cell back into this meter at flush points
+    /// (host-call boundaries and invocation end); see
+    /// `AotInstance::invoke_with_local_meter`.
+    ///
+    /// The meter itself is the instance-wide authority, shared by both
+    /// execution paths.
     meter: Arc<InstanceMeter>,
+}
+
+/// The invocation-local fuel cell of the current thread, when that thread is
+/// inside an AOT invocation (see `AotInstance::invoke_with_local_meter`).
+///
+/// The host-call libcall reads this to flush the invocation's accumulated fuel
+/// into the authoritative meter at a host boundary. It is a thread-local
+/// rather than a vmctx field because imported functions — including the
+/// compiled host-call stubs — receive the *shared* instance context, which is
+/// deliberately identical for every invocation; only the invocation's own
+/// direct callees see the per-invocation context copy.
+#[derive(Clone, Copy)]
+struct InvocationMeter {
+    /// The current invocation's local fuel cell.
+    local: *const MeterCells,
+    /// The authoritative meter of the instance that owns `local`. Compared
+    /// against the meter a host call dispatches through, so a native call into
+    /// *another* instance never drains this invocation's fuel into that
+    /// instance's meter.
+    owner: *const InstanceMeter,
+}
+
+thread_local! {
+    /// The innermost AOT invocation on this thread, restored on return so
+    /// host-initiated re-entry into the same instance nests correctly.
+    static INVOCATION_METER: Cell<Option<InvocationMeter>> = const { Cell::new(None) };
+}
+
+/// Drains this thread's invocation-local fuel cell into `meter` when `meter`
+/// is the authoritative meter of the invocation the thread is running.
+///
+/// Called at the host-call boundary so a host function observes a count that
+/// includes the guest work done since the last flush, and so a budget raised
+/// (or reset) between invocations takes effect for the remainder of a running
+/// invocation. A no-op when the thread is not inside an AOT invocation, or
+/// when the host call belongs to a different instance.
+fn drain_invocation_meter(meter: &InstanceMeter) {
+    let Some(scope) = INVOCATION_METER.with(Cell::get) else {
+        return;
+    };
+    if !std::ptr::eq(scope.owner, meter) || scope.local.is_null() {
+        return;
+    }
+    // SAFETY: `scope.local` points at the local fuel cell of the invocation
+    // this thread is currently running; the scope is cleared when that
+    // invocation returns, so the cell outlives this call.
+    meter.drain_invocation_cells(unsafe { &*scope.local });
 }
 
 impl AotInstance {
@@ -646,6 +705,10 @@ impl AotInstance {
         };
         ctx.libcalls = &*libcalls as *const LibcallTable as *const u8;
         ctx.dispatch = (&*dispatch as *const AotDispatchState) as *mut core::ffi::c_void;
+        // Point compiled code at the instance's lock-free meter cells. The
+        // `Arc<InstanceMeter>` lives inside `dispatch` (moved into `_dispatch`
+        // below) for the instance's lifetime, so the raw pointer stays valid.
+        ctx.meter = dispatch.meter.cells();
 
         let mut instance = Self {
             image,
@@ -949,8 +1012,13 @@ impl AotInstance {
     ///
     /// Single-threaded entry; see [`invoke_export`](Self::invoke_export).
     pub fn invoke(&mut self, func_idx: u32, args: &[WasmValue]) -> Result<Vec<WasmValue>> {
+        // The shared context's stack limit is refreshed for indirect and
+        // imported callees, which read it from the shared context (their
+        // `FuncDesc` carries it); the invocation itself runs on a copy that
+        // also carries its own fuel cell.
         self.ctx.stack_limit = traps::thread_stack_limit(MAX_WASM_STACK);
-        self.invoke_with_context(func_idx, args, &self.ctx)
+        let context = *self.ctx;
+        self.invoke_with_local_meter(func_idx, args, &context)
     }
 
     /// Invokes the function `func_idx` natively on a shared instance.
@@ -960,14 +1028,14 @@ impl AotInstance {
     /// # Per-invocation context copy
     ///
     /// Each invocation runs on a *copy* of the instance context with this
-    /// thread's stack bound — never the shared context — so concurrent
-    /// invocations from many threads cannot race on it. The copy is shallow:
-    /// only `stack_limit` and, for a module with a shadow stack, the
-    /// `stack_pointer` value differ; the memory, table, function, dispatch and
-    /// globals pointers are shared (see the `VmCtx` docs for the full
-    /// contract). Because the copy lives on the invoking thread's stack and
-    /// the callee receives its address directly, no cross-thread publication
-    /// of the copy is ever needed.
+    /// thread's stack bound and its own fuel cell — never the shared context —
+    /// so concurrent invocations from many threads cannot race on it. The copy
+    /// is shallow: only `stack_limit`, `meter` and, for a module with a shadow
+    /// stack, the `stack_pointer` value differ; the memory, table, function,
+    /// dispatch and globals pointers are shared (see the `VmCtx` docs for the
+    /// full contract). Because the copy lives on the invoking thread's stack
+    /// and the callee receives its address directly, no cross-thread
+    /// publication of the copy is ever needed.
     ///
     /// # Shadow stacks
     ///
@@ -990,7 +1058,7 @@ impl AotInstance {
 
         if self.stack_pointer_global.is_none() {
             // No shadow stack: shared globals and stack pointer, as before.
-            return self.invoke_with_context(func_idx, args, &context);
+            return self.invoke_with_local_meter(func_idx, args, &context);
         }
 
         // Reserve a private stack slot and point this invocation's stack
@@ -1006,9 +1074,58 @@ impl AotInstance {
             .wrapping_sub(STACK_TOP_GUARD);
         context.stack_pointer = stack_top;
 
-        let result = self.invoke_with_context(func_idx, args, &context);
+        let result = self.invoke_with_local_meter(func_idx, args, &context);
 
         self.release_stack_slot(slot_base);
+        result
+    }
+
+    /// Runs one native invocation against its own invocation-local fuel cell.
+    ///
+    /// `context` already carries the invocation's stack bound (and shadow
+    /// stack pointer); this adds the fuel cell, records the invocation on the
+    /// calling thread (so the host-call boundary can flush it), and drains the
+    /// cell into the authoritative instance meter when the invocation ends —
+    /// on the trapping path too, so charges made before a trap still land.
+    ///
+    /// The local cell is what keeps concurrent invocations of one instance
+    /// from ping-ponging a single shared cache line: compiled code's per-loop
+    /// atomic add stays on a line only this invocation touches, and the shared
+    /// counter is written once per host call and once per invocation. Its
+    /// budget field is the *remaining* allowance, so the inline check traps
+    /// when this invocation alone exhausts the budget the instance had left
+    /// (the interpreter's model: a cached `(count, budget)` snapshot,
+    /// refreshed at flush points).
+    fn invoke_with_local_meter(
+        &self,
+        func_idx: u32,
+        args: &[WasmValue],
+        context: &VmCtx,
+    ) -> Result<Vec<WasmValue>> {
+        let meter = &self._dispatch.meter;
+        let local = meter.invocation_cells();
+
+        let mut context = *context;
+        context.meter = &local as *const MeterCells;
+
+        // Publish the cell for the host-call boundary; restore the previous
+        // scope on the way out so host-initiated re-entry into this instance
+        // (a nested invocation on the same thread) cannot unset an outer
+        // invocation's scope.
+        let previous = INVOCATION_METER.with(|slot| {
+            slot.replace(Some(InvocationMeter {
+                local: &local as *const MeterCells,
+                owner: Arc::as_ptr(meter),
+            }))
+        });
+
+        let result = self.invoke_with_context(func_idx, args, &context);
+
+        // Drain while the cell is still live (it lives in this frame), before
+        // the scope is restored.
+        let _ = meter.drain_invocation_cells(&local);
+        INVOCATION_METER.with(|slot| slot.set(previous));
+
         result
     }
 
@@ -1117,10 +1234,30 @@ impl AotInstance {
         self._dispatch.meter.set_memory_budget(budget)
     }
 
+    /// Sets or resets the instance's execution budget (maximum metering
+    /// units); `None` means unbounded.
+    ///
+    /// Enforced by the inline fuel charge emitted at function entry and each
+    /// loop back-edge. Each invocation charges an invocation-local cell whose
+    /// budget field is the allowance left in the instance meter, so a charge
+    /// traps [`TrapCode::ExecutionBudgetExceeded`] when the invocation alone
+    /// exhausts what the instance had left; the counter may overshoot the
+    /// budget by at most one charge (plus, under concurrent invocations, the
+    /// units not yet flushed by the other threads — the budget is advisory
+    /// across threads, as on the interpreter path).
+    ///
+    /// The allowance is snapshotted when the invocation starts and refreshed
+    /// at each flush point (a host-call boundary and invocation end), so a
+    /// reset between invocations takes effect on the next invocation and a
+    /// reset made while one runs takes effect at its next host call — the same
+    /// granularity as the interpreter's cached `(count, budget)` snapshot.
+    pub fn set_execution_budget(&self, budget: Option<u64>) -> Result<()> {
+        self._dispatch.meter.set_execution_budget(budget)
+    }
+
     /// Returns a snapshot of the instance's metering data: committed owned
-    /// memory pages (shared-region pages excluded) and executed-instruction
-    /// count. The AOT path does not charge instructions, so the count is
-    /// always zero; the page count is authoritative.
+    /// memory pages (shared-region pages excluded) and the executed metering
+    /// units charged on the AOT path (size-weighted fuel).
     pub fn stats(&self) -> Result<InstanceStats> {
         let pages = self._memories.iter().try_fold(0u32, |acc, memory| {
             let pages = memory.lock().map_err(|_| poisoned_lock())?.size();
@@ -1167,9 +1304,10 @@ impl AotInstance {
 // descriptor arrays and the shared store are immutable after instantiation;
 // memory and table mutations are serialised behind their mutexes; the dispatch
 // state's mutable segment-availability flags are atomics; and each concurrent
-// invocation uses a per-invocation context copy, never writing the shared
-// context. (`invoke`/`invoke_export` mutate the shared context's stack limit
-// but require `&mut self`, so they cannot race with shared invocations.)
+// invocation uses a per-invocation context copy with its own fuel cell, never
+// writing the shared context. (`invoke`/`invoke_export` mutate the shared
+// context's stack limit but require `&mut self`, so they cannot race with
+// shared invocations.)
 unsafe impl Send for AotInstance {}
 
 unsafe impl Sync for AotInstance {}
@@ -1386,6 +1524,13 @@ unsafe extern "C" fn host_call(
         };
         let func_type = &dispatch.host_types[ordinal as usize];
 
+        // Host boundary: commit the fuel this invocation has accumulated in
+        // its local cell into the authoritative meter and refresh its
+        // allowance, so the guest continues against an up-to-date budget (a
+        // raise or reset mid-invocation is seen here) and a host function that
+        // queries the meter sees the guest work done so far.
+        drain_invocation_meter(&dispatch.meter);
+
         let wasm_args: Vec<WasmValue> = func_type
             .params
             .iter()
@@ -1400,6 +1545,10 @@ unsafe extern "C" fn host_call(
             let mut caller = HostCaller::new(&mut store, &dispatch.memories);
             func.call(&mut caller, &wasm_args)
         };
+
+        // Refresh again: the host function may have re-entered this instance,
+        // and that nested invocation's fuel is already committed.
+        drain_invocation_meter(&dispatch.meter);
 
         match result {
             Ok(values) => {

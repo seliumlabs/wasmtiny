@@ -54,7 +54,15 @@ Infinite loops, deep recursion, `memory.grow` spam, stack exhaustion —
 attempts to exhaust runner CPU, memory, or wall-clock budget.
 **Expected containment:** configured limits enforced; guest terminated
 within the configured budget (fuel/depth trap, allocation failure, or
-budget timer).
+budget timer). On the AOT path the execution budget is enforced by the
+inline fuel charge at function entry and each loop back-edge, which traps
+`ExecutionBudgetExceeded`. The charge targets an invocation-local cell
+whose budget field is the allowance remaining in the instance meter at the
+invocation's most recent flush point (host call or invocation start), so a
+runaway loop cannot outrun the budget by more than one charge between
+flushes; the shared counter is written once per host call and once per
+invocation, so concurrent invocations of one instance do not contend on
+one cache line.
 
 ### TM-06: Shared-region boundary probing
 Guests attempting to access shared regions beyond granted bounds:

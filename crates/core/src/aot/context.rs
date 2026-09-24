@@ -5,6 +5,8 @@
 //! `environment::VmCtxOffsets` there); it is duplicated here by design because
 //! the runtime never links the compiler.
 
+use crate::runtime::MeterCells;
+
 /// A linear-memory descriptor, as seen by compiled code.
 #[repr(C)]
 pub struct MemoryDesc {
@@ -65,7 +67,7 @@ pub struct FuncDesc {
 /// The hidden per-instance context. Pointer-sized fields for 64-bit targets.
 ///
 /// `Copy` because a concurrent invocation clones the context (adjusting only
-/// the per-invocation stack limit) instead of writing the shared one.
+/// the per-invocation fields below) instead of writing the shared one.
 ///
 /// # Per-invocation copies (concurrent execution contract)
 ///
@@ -85,6 +87,15 @@ pub struct FuncDesc {
 ///   stack slot by writing `stack_pointer`; the shared context keeps the
 ///   module's initial value for the single-threaded [`invoke`]
 ///   (crate::aot::AotInstance::invoke) path.
+/// - **`meter` is per-invocation.** The copy points at a fuel cell owned by
+///   the invocation (on the invoking thread's stack), so compiled code's
+///   per-loop charge stays on a cache line no other thread touches; the
+///   runtime drains the cell into the authoritative instance meter at flush
+///   points (host calls and invocation end). Only the runtime reaches the
+///   instance meter through `dispatch`; the shared context keeps pointing at
+///   that meter's own cells, which is what an invocation that never enters
+///   through `invoke`/`invoke_shared` (e.g. a cross-instance native call)
+///   charges.
 /// - **`globals` is always shared by pointer.** Ordinary mutable globals are
 ///   read and written in place through the one array — identical
 ///   unsynchronised-shared semantics to modules without a shadow stack, so
@@ -93,6 +104,16 @@ pub struct FuncDesc {
 /// - **Everything else is shared by pointer.** The copy carries the same
 ///   `memories`, `tables`, `funcs`, `store_funcs`, `type_ids`, `libcalls`,
 ///   `dispatch` and `refs` pointers as the shared context.
+///
+/// Note that `call_indirect` and imported-function calls load the callee's
+/// context from its [`FuncDesc`] — the *shared* context for this instance's
+/// own functions — so only direct same-module calls propagate the
+/// per-invocation fields. That is deliberate: a callee's context must identify
+/// the instance that owns it, and for cross-instance calls that instance is a
+/// different one. The consequences are bounded and documented: an
+/// indirect callee's fuel lands in the shared instance meter (correctly
+/// attributed, just not on a private cache line), and indirect-callee stack
+/// overflow relies on the thread's guard page rather than the entry check.
 ///
 /// A rustc-compiled module uses the `__stack_pointer` shadow-stack global for
 /// every frame; the per-invocation stack slot above is what lets several host
@@ -133,6 +154,14 @@ pub struct VmCtx {
     /// read/write this field; per-invocation on the concurrent path (see the
     /// struct docs), the module's initial value on the shared context.
     pub stack_pointer: u32,
+    /// Pointer to [`MeterCells`], charged by compiled code at function entry
+    /// and each loop back-edge (fuel metering).
+    ///
+    /// On the shared context this is the stable address of the instance's own
+    /// meter cells; a Rust-level invocation runs on a copy pointing at an
+    /// invocation-local cell instead (see the struct docs). Either way the
+    /// pointee is a `MeterCells` and outlives the native calls that reach it.
+    pub meter: *const MeterCells,
 }
 
 // SAFETY: `FuncDesc` stores raw pointers into instance-owned code/images that
@@ -161,6 +190,7 @@ impl VmCtx {
             dispatch: std::ptr::null_mut(),
             refs: dangling.cast(),
             stack_pointer: 0,
+            meter: dangling.cast(),
         }
     }
 }

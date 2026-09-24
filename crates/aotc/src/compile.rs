@@ -596,3 +596,39 @@ fn translate(
 
     Ok(translator)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The inline fuel charge must (a) record the budget trap site and (b)
+    /// contain the cold wrap-clamp path: an atomic `umax` that pins the
+    /// executed cell back to `u64::MAX` after a wrapping add, so the
+    /// observable counter never decreases and a finite budget still traps.
+    #[test]
+    fn fuel_charge_records_the_trap_and_clamps_on_wrap() {
+        let wasm = wat::parse_str("(module (func (export \"f\") (result i32) (i32.const 42)))")
+            .expect("wat parses");
+        let config = CompilerConfig::host();
+        let isa = build_isa(&config).expect("isa builds");
+        let translator = translate(&wasm, &config, &*isa).expect("translation succeeds");
+
+        let func = translator
+            .info
+            .function_bodies
+            .iter()
+            .next()
+            .expect("one defined function body")
+            .1;
+
+        let clif = func.to_string();
+        assert!(
+            clif.contains("atomic_rmw") && clif.contains("umax"),
+            "the fuel charge must clamp the meter cell on wrap; got:\n{clif}"
+        );
+        assert!(
+            clif.contains("trapnz") && clif.contains("user8"),
+            "the fuel charge must record the budget trap site; got:\n{clif}"
+        );
+    }
+}

@@ -56,6 +56,10 @@ pub use crate::types::{DefinedFuncIndex, FuncIndex, TypeIndex};
 /// Size in bytes of a single global cell.
 pub const GLOBAL_CELL_SIZE: i32 = 8;
 pub const USER_TRAP_BAD_SIGNATURE: u8 = 4;
+/// Emitted by the inline AOT fuel charge when the executed count exceeds the
+/// configured execution budget; mapped to the artifact's budget-exhausted trap
+/// byte by `artifact::trap_code_byte`.
+pub const USER_TRAP_BUDGET: u8 = 8;
 pub const USER_TRAP_CALL_INDIRECT_NULL: u8 = 3;
 pub const USER_TRAP_HOST: u8 = 6;
 pub const USER_TRAP_MEMORY_LIMIT: u8 = 7;
@@ -94,6 +98,9 @@ pub const USER_TRAP_UNREACHABLE: u8 = 1;
 ///                    can give every thread its own stack by copying the
 ///                    context and adjusting only this field (see the runtime
 ///                    `VmCtx` docs for the full contract).
+///  88: meter       — pointer to the instance's `MeterCells` (see
+///                    `MeterCellsOffsets`). Compiled code charges fuel through
+///                    it at function entry and each loop back-edge.
 /// ```
 pub struct VmCtxOffsets;
 
@@ -138,6 +145,28 @@ pub struct TableSlotOffsets;
 /// creation and never reallocated; only `len` mutates. Loads of `len` must
 /// not be marked readonly: `table.grow` can change it mid-function.
 pub struct TableCellsOffsets;
+
+/// Layout of the fuel meter cells (size 16 bytes), reached through
+/// `vmctx.meter` (see [`VmCtxOffsets::METER`]).
+///
+/// ```text
+///   0: executed — AtomicU64: monotonically increasing fuel consumed
+///   8: budget   — AtomicU64: the execution budget; `u64::MAX` means unbounded
+/// ```
+///
+/// Compiled code, at each charge point, does an atomic add of a static
+/// instruction count on `executed` and traps (`USER_TRAP_BUDGET`) when the
+/// result exceeds `budget`. The `budget` load must not be marked readonly:
+/// the runtime refreshes it at the invocation's flush points.
+///
+/// Which cells `vmctx.meter` points at is the runtime's business, and the
+/// emitted code is identical either way: the runtime may point a given
+/// invocation at invocation-local cells (so concurrent invocations of one
+/// instance never contend on one cache line) and drain them into the
+/// authoritative instance meter later. A `budget` of `u64::MAX` still means
+/// "never trap", and `executed` still only ever grows for as long as the
+/// cells are live.
+pub struct MeterCellsOffsets;
 
 /// A function import declaration.
 pub struct FuncImport {
@@ -368,6 +397,13 @@ impl VmCtxOffsets {
     /// for modules with a `__stack_pointer` global (see the `VmCtxOffsets`
     /// layout docs).
     pub const STACK_POINTER: i32 = 80;
+    /// Pointer to the fuel meter cells ([`MeterCellsOffsets`]) charged by
+    /// compiled code at function entry and each loop back-edge. Stable for the
+    /// instance's lifetime on the shared context; a Rust-level invocation
+    /// carries a per-invocation copy of the context whose pointer targets
+    /// invocation-local cells (the runtime drains those into the authoritative
+    /// meter), which is transparent to the emitted charge.
+    pub const METER: i32 = 88;
 }
 
 impl LibCallOffsets {
@@ -437,6 +473,15 @@ impl TableCellsOffsets {
     pub const BASE: i32 = 0;
     /// Current element count (u32).
     pub const LEN: i32 = 8;
+}
+
+impl MeterCellsOffsets {
+    /// Byte size of the meter cells.
+    pub const SIZE: i32 = 16;
+    /// Fuel consumed so far (AtomicU64).
+    pub const EXECUTED: i32 = 0;
+    /// Execution budget (AtomicU64); `u64::MAX` means unbounded.
+    pub const BUDGET: i32 = 8;
 }
 
 impl ModuleInfo {
@@ -1060,6 +1105,93 @@ impl<'info> FuncEnv<'info> {
                 .icmp(ir::condcodes::IntCC::UnsignedLessThan, stack_pointer, limit);
         builder.ins().trapnz(overflow, ir::TrapCode::STACK_OVERFLOW);
         Ok(())
+    }
+
+    /// Emits an inline fuel charge of `units` against the meter cells reached
+    /// through `vmctx.meter`, trapping `USER_TRAP_BUDGET` when the running
+    /// total exceeds the configured budget.
+    ///
+    /// The charge is a single lock-free atomic add reached through
+    /// `vmctx.meter` — no function call per charge — followed by an unsigned
+    /// budget compare and a `trapnz`. `units` is a compile-time constant, so
+    /// emission is deterministic. A `units` of zero emits nothing.
+    ///
+    /// The cells are opaque to this code: the runtime may point the invocation
+    /// at its own local cells (drained into the authoritative instance meter
+    /// later) so that concurrent invocations of one instance never contend on
+    /// a single cache line. `budget` there is the allowance remaining at the
+    /// invocation's last flush point, so the comparison still bounds the
+    /// instance's total consumption to within one charge of the allowance.
+    ///
+    /// The budget is `u64::MAX` when unbounded, against which the comparison
+    /// is never true, so unbudgeted execution never traps here.
+    ///
+    /// Wrap-around: the atomic add wraps rather than saturates, so the add
+    /// result is compared (unsigned) against the previous value. On wrap —
+    /// only possible after ~2^64 metering units — the cell is clamped back to
+    /// `u64::MAX` with an atomic `umax` (so the observable counter never
+    /// decreases) and the budget check uses the clamped total, so a finite
+    /// budget still traps exactly as the runtime's saturating helper does.
+    /// The clamp sits on a cold, predicted-not-taken branch.
+    pub fn emit_fuel_charge(&mut self, builder: &mut FunctionBuilder, units: u64) {
+        if units == 0 {
+            return;
+        }
+        let pointer_type = self.pointer_type();
+        // The meter pointer itself is a trusted, readonly vmctx field (it
+        // never changes while the function executes).
+        let meter = self.vmctx_load(builder, VmCtxOffsets::METER, pointer_type);
+        let units_value = builder.ins().iconst(pointer_type, units as i64);
+
+        // prev = atomic_rmw add [meter + EXECUTED], units
+        let flags = cranelift_codegen::ir::MemFlagsData::new();
+        let previous = builder.ins().atomic_rmw(
+            pointer_type,
+            flags,
+            ir::AtomicRmwOp::Add,
+            meter,
+            units_value,
+        );
+        let next = builder.ins().iadd_imm_u(previous, units as i64);
+
+        // The add wrapped iff next < prev (unsigned). On wrap, pin the cell
+        // at u64::MAX and use the pinned total for the budget check, matching
+        // the runtime helper's saturating `charge` (a finite budget traps; an
+        // unbounded one never does).
+        let wrapped = builder
+            .ins()
+            .icmp(ir::condcodes::IntCC::UnsignedLessThan, next, previous);
+        let max = builder.ins().iconst(pointer_type, u64::MAX as i64);
+        let effective = builder.ins().select(wrapped, max, next);
+
+        let clamp_block = builder.create_block();
+        let continue_block = builder.create_block();
+        builder
+            .ins()
+            .brif(wrapped, clamp_block, &[], continue_block, &[]);
+        builder.switch_to_block(clamp_block);
+        builder
+            .ins()
+            .atomic_rmw(pointer_type, flags, ir::AtomicRmwOp::Umax, meter, max);
+        builder.ins().jump(continue_block, &[]);
+        builder.switch_to_block(continue_block);
+        // Both blocks' predecessors are known (the charge site and the
+        // clamp block); seal them here so no later machinery has to.
+        builder.seal_block(clamp_block);
+        builder.seal_block(continue_block);
+
+        // The budget cell is read fresh (never readonly): the runtime can
+        // refresh it (between invocations, or at an invocation's flush point).
+        let budget = builder.ins().load(
+            pointer_type,
+            flags,
+            meter,
+            Offset32::new(MeterCellsOffsets::BUDGET),
+        );
+        let over = builder
+            .ins()
+            .icmp(ir::condcodes::IntCC::UnsignedGreaterThan, effective, budget);
+        builder.ins().trapnz(over, user_trap(USER_TRAP_BUDGET));
     }
 
     /// Translates `memory.grow`.

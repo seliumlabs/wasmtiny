@@ -1,8 +1,6 @@
-## Purpose
+# Spec Delta
 
-Per-instance metering of executed WebAssembly instructions and memory usage, with configurable execution and memory budgets that surface exhaustion distinctly so embaders can enforce and bill against them.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Per-Instance Instruction Accounting
 
@@ -46,15 +44,6 @@ rather than wrap, on both execution paths.
 - **WHEN** the metering counter reaches its maximum value
 - **THEN** subsequent charges keep it pinned at that value rather than wrapping it to a smaller value, and the runtime reports the saturation once at error level
 
-### Requirement: Memory Usage Reporting
-
-The runtime SHALL report an instance's committed linear-memory usage as its owned pages (excluding shared-region pages), observable through the metering interface.
-
-#### Scenario: Growth reflected
-
-- **WHEN** an instance grows its linear memory
-- **THEN** the instance's reported memory usage SHALL reflect the additional committed pages
-
 ### Requirement: Configurable Execution Budget
 
 The runtime SHALL allow an embedder to set and reset a per-instance execution
@@ -97,12 +86,3 @@ flushed. With no budget set, execution SHALL be unbounded.
 
 - **WHEN** an AOT invocation ends in a trap
 - **THEN** the metering units it charged before the trap SHALL be reflected in the instance counter
-
-### Requirement: Configurable Memory Budget
-
-The runtime SHALL allow an embedder to set a per-instance memory budget (a maximum committed page count). A memory growth that would exceed the budget SHALL fail with a memory-limit outcome distinct from other faults.
-
-#### Scenario: Growth beyond budget fails
-
-- **WHEN** an instance attempts to grow memory beyond its configured memory budget
-- **THEN** the growth SHALL fail with the memory-limit trap code

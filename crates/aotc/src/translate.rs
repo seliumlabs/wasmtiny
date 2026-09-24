@@ -126,6 +126,41 @@ pub enum ControlStackFrame {
     },
 }
 
+/// Static fuel sizing for one function, computed by a pre-pass over the
+/// operator stream *before* the real translation pass emits charges.
+///
+/// Fuel is size-weighted: a function's total instruction count is charged at
+/// its entry, and a loop body's static instruction count at the loop header
+/// (so it is charged once on entry and once per iteration). The pre-pass
+/// mirrors the translator's control-stack handling just far enough to match
+/// `Loop` operators to their `End`.
+#[derive(Debug, Default)]
+struct FuelSizing {
+    /// Total instruction count of the function body.
+    function_size: u64,
+    /// Static instruction count of each loop body, indexed by loop ordinal
+    /// (loops in operator order, matching the translation pass).
+    loop_body_sizes: Vec<u64>,
+    /// The ordinal of the next `Loop` operator encountered during translation.
+    loop_cursor: usize,
+}
+
+impl FuelSizing {
+    /// The static charge for the next loop encountered, advancing the cursor.
+    ///
+    /// Returns 0 when the sizing is exhausted (defensive: the pre-pass and the
+    /// translation pass walk the same operator stream, so this cannot happen).
+    fn next_loop_charge(&mut self) -> u64 {
+        let charge = self
+            .loop_body_sizes
+            .get(self.loop_cursor)
+            .copied()
+            .unwrap_or(0);
+        self.loop_cursor += 1;
+        charge
+    }
+}
+
 /// Contains information passed along during a function's translation: the
 /// current value and control stacks, and the reachability of the current
 /// position.
@@ -138,6 +173,9 @@ pub struct FuncTranslationState {
     control_stack: Vec<ControlStackFrame>,
     /// Is the current translation state still reachable?
     reachable: bool,
+    /// Static fuel sizing for the function being translated (see
+    /// [`FuelSizing`]).
+    fuel: FuelSizing,
 }
 
 /// WebAssembly to Cranelift IR function translator.
@@ -297,6 +335,7 @@ impl FuncTranslationState {
             stack: Vec::new(),
             control_stack: Vec::new(),
             reachable: true,
+            fuel: FuelSizing::default(),
         }
     }
 
@@ -304,6 +343,7 @@ impl FuncTranslationState {
         debug_assert!(self.stack.is_empty());
         debug_assert!(self.control_stack.is_empty());
         self.reachable = true;
+        self.fuel = FuelSizing::default();
     }
 
     /// Initialize the state for compiling a function with the given signature.
@@ -496,6 +536,13 @@ impl FuncTranslator {
         environ
             .before_translate_function(&mut builder)
             .map_err(|e| TranslateError::Other(e.to_string()))?;
+
+        // Static sizing pre-pass: compute the function's total instruction
+        // count and each loop body's count before translating, so the charges
+        // can be emitted at the prologue and at every loop header.
+        self.state.fuel = compute_fuel_sizing(&body)?;
+        let entry_charge = self.state.fuel.function_size;
+        environ.emit_fuel_charge(&mut builder, entry_charge);
 
         let ops = body.get_operators_reader()?;
         for op in ops {
@@ -1357,6 +1404,46 @@ fn translate_fcvt_to_uint_sat(
     state.push1(builder.ins().fcvt_to_uint_sat(result_ty, val));
 }
 
+/// Computes the static fuel sizing for a function body: the total instruction
+/// count and the static instruction count of each loop body (loops in
+/// operator order).
+///
+/// This is a lightweight pre-pass mirroring the translator's control-stack
+/// handling: it counts every operator, tracks the nesting of `block`/`loop`/
+/// `if` frames, and, when a `loop` frame closes, records how many operators
+/// lie strictly between the `loop` and its matching `end`. It is purely
+/// static, so charge emission stays deterministic.
+fn compute_fuel_sizing(body: &FunctionBody<'_>) -> TranslateResult<FuelSizing> {
+    let mut sizing = FuelSizing::default();
+    // Per open control frame: (is_loop, instruction count at the frame's open,
+    // loop ordinal). The count is taken *after* the opening operator is
+    // counted, so a loop's body size is `count_at_end - count_at_open - 1`.
+    let mut frames: Vec<(bool, u64, usize)> = Vec::new();
+
+    let ops = body.get_operators_reader()?;
+    for op in ops {
+        let op = op?;
+        sizing.function_size += 1;
+        match op {
+            Operator::Block { .. } => frames.push((false, 0, 0)),
+            Operator::Loop { .. } => {
+                let ordinal = sizing.loop_body_sizes.len();
+                sizing.loop_body_sizes.push(0);
+                frames.push((true, sizing.function_size, ordinal));
+            }
+            Operator::If { .. } => frames.push((false, 0, 0)),
+            Operator::End => {
+                if let Some((true, open, ordinal)) = frames.pop() {
+                    sizing.loop_body_sizes[ordinal] = sizing.function_size - open - 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(sizing)
+}
+
 /// Translates one defined function body into CLIF and stores it.
 fn translate_function_body(
     translator: &mut Translator,
@@ -1509,6 +1596,11 @@ fn translate_operator(
                 .extend_from_slice(builder.block_params(loop_body));
 
             builder.switch_to_block(loop_body);
+
+            // Fuel: charge the loop body's static instruction count at the
+            // header, so it is charged once on entry and once per iteration.
+            let charge = state.fuel.next_loop_charge();
+            environ.emit_fuel_charge(builder, charge);
         }
         Operator::If { blockty } => {
             let val = state.pop1();
@@ -2798,6 +2890,12 @@ fn translate_unreachable_operator(
             );
         }
         Operator::Loop { blockty: _ } | Operator::Block { blockty: _ } => {
+            // Keep the fuel cursor aligned with the pre-pass: every `Loop`
+            // operator advances it, reachable or not, so the recorded sizing
+            // indices line up. No charge is emitted in unreachable code.
+            if matches!(op, Operator::Loop { .. }) {
+                let _ = state.fuel.next_loop_charge();
+            }
             state.push_block(ir::Block::reserved_value(), 0, 0);
         }
         Operator::Else => {
@@ -2910,4 +3008,68 @@ fn translate_unreachable_operator(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasmparser::{Parser, Payload};
+
+    /// Sizes the first function body of a `wat` module.
+    fn first_function_sizing(wat: &str) -> FuelSizing {
+        let wasm = wat::parse_str(wat).expect("wat parses");
+        for payload in Parser::new(0).parse_all(&wasm) {
+            if let Payload::CodeSectionEntry(body) = payload.expect("payload parses") {
+                return compute_fuel_sizing(&body).expect("sizing succeeds");
+            }
+        }
+        panic!("module has no function body");
+    }
+
+    #[test]
+    fn single_loop_sizing_is_computed() {
+        // Body operators: block, loop, local.get, i32.const, i32.add,
+        // local.set, local.get, local.get, i32.lt_s, br_if, end(loop),
+        // end(block), local.get, end(func) => 14 total; the loop body
+        // (between `loop` and its `end`) is 8 operators.
+        let sizing = first_function_sizing(
+            "(module (func (export \"f\") (param i32) (result i32) (local $i i32)
+               (block $b
+                 (loop $l
+                   (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                   (br_if $l (i32.lt_s (local.get $i) (local.get 0)))))
+               (local.get $i)))",
+        );
+        assert_eq!(sizing.function_size, 14);
+        assert_eq!(sizing.loop_body_sizes, vec![8]);
+    }
+
+    #[test]
+    fn nested_loop_sizing_is_computed() {
+        // Outer body: 14 operators (loop $outer .. end); inner body: 4
+        // operators (local.get, i32.const, i32.add, local.set); function
+        // total: 18.
+        let sizing = first_function_sizing(
+            "(module (func (export \"f\") (param i32) (result i32) (local $i i32)
+               (loop $outer
+                 (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                 (loop $inner
+                   (local.set $i (i32.add (local.get $i) (i32.const 1))))
+                 (br_if $outer (i32.lt_s (local.get $i) (local.get 0))))
+               (local.get $i)))",
+        );
+        assert_eq!(sizing.function_size, 18);
+        // Loops are indexed in open order: outer first, then inner.
+        assert_eq!(sizing.loop_body_sizes, vec![14, 4]);
+    }
+
+    #[test]
+    fn loop_free_function_has_no_loop_sizes() {
+        let sizing = first_function_sizing(
+            "(module (func (export \"f\") (param i32 i32) (result i32)
+               (i32.add (local.get 0) (local.get 1))))",
+        );
+        assert!(sizing.loop_body_sizes.is_empty());
+        assert!(sizing.function_size > 0);
+    }
 }

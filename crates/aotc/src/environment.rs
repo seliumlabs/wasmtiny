@@ -87,6 +87,13 @@ pub const USER_TRAP_UNREACHABLE: u8 = 1;
 ///  64: dispatch    — opaque per-instance pointer (owned by the runtime)
 ///  72: refs        — pointer to an array of store-native funcref handles,
 ///                    one `u32` per function index (imports first)
+///  80: stack_pointer — u32: the shadow-stack pointer. Compiled
+///                    `global.get`/`global.set` of the module's
+///                    `__stack_pointer` global read/write this field directly
+///                    instead of the globals array, so a concurrent invocation
+///                    can give every thread its own stack by copying the
+///                    context and adjusting only this field (see the runtime
+///                    `VmCtx` docs for the full contract).
 /// ```
 pub struct VmCtxOffsets;
 
@@ -274,6 +281,10 @@ pub struct Translator {
     pub info: ModuleInfo,
     /// Function body translator.
     pub trans: crate::translate::FuncTranslator,
+    /// Global index to treat as the shadow-stack pointer even when the module
+    /// does not export `__stack_pointer` (see
+    /// [`CompilerConfig::shadow_stack_global`](crate::CompilerConfig)).
+    pub stack_pointer_override: Option<GlobalIndex>,
 }
 
 /// A runtime-facing global variable: the base pointer plus per-cell offset.
@@ -325,6 +336,9 @@ pub struct TableData {
 /// loads at its own insertion point instead.
 pub struct FuncEnv<'info> {
     mod_info: &'info ModuleInfo,
+    /// Global index to treat as the shadow-stack pointer even when the module
+    /// does not export `__stack_pointer`.
+    stack_pointer_override: Option<GlobalIndex>,
     indirect_sigs: HashMap<TypeIndex, (ir::SigRef, usize)>,
     direct_funcs: HashMap<FuncIndex, (ir::FuncRef, usize)>,
 }
@@ -350,6 +364,10 @@ impl VmCtxOffsets {
     pub const DISPATCH: i32 = 64;
     /// Pointer to the store-native funcref-handle array (u32 per func index).
     pub const REFS: i32 = 72;
+    /// The shadow-stack pointer (u32), written per invocation by the runtime
+    /// for modules with a `__stack_pointer` global (see the `VmCtxOffsets`
+    /// layout docs).
+    pub const STACK_POINTER: i32 = 80;
 }
 
 impl LibCallOffsets {
@@ -467,6 +485,26 @@ impl ModuleInfo {
     pub fn imported_global_count(&self) -> usize {
         self.imported_globals.len()
     }
+
+    /// Whether `index` is the module's shadow-stack pointer global (the
+    /// `__stack_pointer` export). The compiler routes this global's
+    /// `get`/`set` through the vmctx `stack_pointer` field instead of the
+    /// globals array so the runtime can give each concurrent invocation its
+    /// own stack (see [`VmCtxOffsets::STACK_POINTER`]).
+    pub fn is_shadow_stack_pointer(&self, index: GlobalIndex) -> bool {
+        self.global_exports
+            .iter()
+            .any(|(exported, name)| *exported == index && name == "__stack_pointer")
+    }
+
+    /// The module's shadow-stack pointer global index, when it exports
+    /// `__stack_pointer`.
+    pub fn shadow_stack_pointer(&self) -> Option<GlobalIndex> {
+        self.global_exports
+            .iter()
+            .find(|(_, name)| name == "__stack_pointer")
+            .map(|(index, _)| *index)
+    }
 }
 
 impl Translator {
@@ -475,12 +513,13 @@ impl Translator {
         Self {
             info: ModuleInfo::new(config, call_conv),
             trans: crate::translate::FuncTranslator::new(),
+            stack_pointer_override: None,
         }
     }
 
     /// Returns a shared func-environment for translating one function.
     pub fn func_env(&self) -> FuncEnv<'_> {
-        FuncEnv::new(&self.info)
+        FuncEnv::new(&self.info, self.stack_pointer_override)
     }
 }
 
@@ -561,9 +600,10 @@ impl TableData {
 }
 
 impl<'info> FuncEnv<'info> {
-    pub(crate) fn new(mod_info: &'info ModuleInfo) -> Self {
+    pub(crate) fn new(mod_info: &'info ModuleInfo, stack_pointer_override: Option<GlobalIndex>) -> Self {
         Self {
             mod_info,
+            stack_pointer_override,
             indirect_sigs: HashMap::new(),
             direct_funcs: HashMap::new(),
         }
@@ -647,6 +687,14 @@ impl<'info> FuncEnv<'info> {
     /// The base pointer is re-loaded at the current insertion point on every
     /// call. Caching the loaded `Value` across blocks would be invalid: the
     /// defining block does not necessarily dominate later uses.
+    ///
+    /// The module's shadow-stack pointer (`__stack_pointer`) is special: its
+    /// `get`/`set` read/write the vmctx `stack_pointer` field directly
+    /// instead of a globals-array cell. The runtime gives every concurrent
+    /// invocation a private stack by copying the context and adjusting only
+    /// that field; ordinary globals stay genuinely shared through the
+    /// `vmctx.globals` array. Only i32 stack pointers are routed (memory64 is
+    /// disabled); anything else keeps the plain-cell behaviour.
     pub fn make_global(
         &mut self,
         builder: &mut FunctionBuilder,
@@ -660,6 +708,18 @@ impl<'info> FuncEnv<'info> {
             ValType::V128 => types::I8X16,
             ValType::Ref(_) => types::I32,
         };
+        if ty == types::I32
+            && (self.stack_pointer_override == Some(index)
+                || self.mod_info.is_shadow_stack_pointer(index))
+        {
+            // The shadow-stack pointer lives in the vmctx itself; the
+            // translator's `base + offset` load/store shape works unchanged.
+            return Ok(GlobalVar {
+                base: self.vmctx_value(builder.func),
+                offset: Offset32::new(VmCtxOffsets::STACK_POINTER),
+                ty: types::I32,
+            });
+        }
         // Global `index` lives in the 8-byte cell at
         // `vmctx.globals + index * 8`. The base is the loaded `vmctx.globals`
         // pointer; the translator then adds the per-cell offset and
@@ -1361,10 +1421,15 @@ impl<'info> FuncEnv<'info> {
         mut pos: FuncCursor,
         index: MemoryIndex,
         addr: Value,
+        offset: u64,
         expected: Value,
         timeout: Value,
     ) -> crate::error::CompileResult<Value> {
         let pointer_type = self.pointer_type();
+        // Fold the memarg offset into the effective address with a wrapping
+        // i32 add (memory32 semantics), exactly as loads/stores do — the
+        // runtime compares and registers the waiter against this address.
+        let addr = pos.ins().iadd_imm_s(addr, offset as i64);
         // The translator leaves the expected value at its native width: i32 for
         // `wait32`, i64 for `wait64`. The runtime compares sign-extended i32s,
         // so sign-extend the narrower value before the libcall.
@@ -1399,9 +1464,13 @@ impl<'info> FuncEnv<'info> {
         mut pos: FuncCursor,
         index: MemoryIndex,
         addr: Value,
+        offset: u64,
         count: Value,
     ) -> crate::error::CompileResult<Value> {
         let pointer_type = self.pointer_type();
+        // Fold the memarg offset into the effective address (see
+        // `translate_atomic_wait`).
+        let addr = pos.ins().iadd_imm_s(addr, offset as i64);
         let addr64 = pos.ins().uextend(pointer_type, addr);
         let count64 = pos.ins().uextend(pointer_type, count);
         let mem_idx = pos.ins().iconst(pointer_type, i64::from(index.as_u32()));

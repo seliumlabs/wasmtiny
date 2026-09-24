@@ -21,15 +21,17 @@
 
 use std::sync::Arc;
 
-use parking_lot::{Condvar, Mutex, RwLock};
+use parking_lot::RwLock;
 
 use crate::{
     runtime::{MemoryType, Result, SharedRegionId, TrapCode, WaiterMap, WasmError},
-    runtime::{ensure_shared_waiter, os_wake, shared_notify, shared_wait},
+    runtime::{WaiterNode, WaiterQueue, notify_queue, os_wake, park_node, register_waiter},
 };
 
-/// The local (owned-memory) waiter registry: address -> waiter.
-pub(crate) type LocalWaiterMap = Arc<RwLock<std::collections::HashMap<u32, Arc<Waiter>>>>;
+/// The local (owned-memory) waiter registry: address -> queue of parked
+/// waiters. Same shape as the shared [`WaiterMap`]; one node per parked
+/// thread so `notify(n)` can release up to `n` distinct waiters.
+pub(crate) type LocalWaiterMap = Arc<RwLock<std::collections::HashMap<u32, Arc<WaiterQueue>>>>;
 
 /// PROT_NONE tail reserved past the accessible capacity of every memory.
 ///
@@ -52,11 +54,14 @@ pub const PAGE_SIZE_BYTES: u32 = 65536;
 /// The registry owns the waiter references (and, for shared ranges, the
 /// region's waiter map), so the memory lock can be dropped before parking:
 /// a parked waiter therefore never blocks a notifier on another thread.
+/// The carried [`WaiterNode`] was pushed onto the address's queue under the
+/// memory lock, so a notify landing after the lock drops is latched in the
+/// node instead of being lost.
 pub(crate) enum WaiterRegistry {
     /// Owned-memory waiter on the local registry.
-    Local(LocalWaiterMap, u32),
+    Local(LocalWaiterMap, u32, Arc<WaiterNode>),
     /// Shared-range waiter on the region's registry.
-    Shared(WaiterMap, u32),
+    Shared(WaiterMap, u32, Arc<WaiterNode>),
 }
 
 /// Protection level for a shared memory region mapping.
@@ -127,13 +132,8 @@ pub struct Memory {
     shared_ranges: Vec<SharedRange>,
     /// Cursor for top-down shared mapping placement.
     next_shared_offset: usize,
-    waiters: Arc<RwLock<std::collections::HashMap<u32, Arc<Waiter>>>>,
-}
-
-#[derive(Debug)]
-pub(crate) struct Waiter {
-    notified: Mutex<bool>,
-    condvar: Condvar,
+    /// Local (owned-memory) waiter registry: address -> waiter queue.
+    waiters: LocalWaiterMap,
 }
 
 impl WaiterRegistry {
@@ -144,8 +144,12 @@ impl WaiterRegistry {
     /// mutex/condvar — so a thread parked here never blocks a notifier.
     pub(crate) fn park(&self, timeout_ns: u64) -> bool {
         match self {
-            WaiterRegistry::Local(waiters, address) => local_wait(waiters, *address, timeout_ns),
-            WaiterRegistry::Shared(waiters, offset) => shared_wait(waiters, *offset, timeout_ns),
+            WaiterRegistry::Local(waiters, address, node) => {
+                park_node(waiters, *address, node, timeout_ns)
+            }
+            WaiterRegistry::Shared(waiters, offset, node) => {
+                park_node(waiters, *offset, node, timeout_ns)
+            }
         }
     }
 }
@@ -215,7 +219,7 @@ impl Memory {
             capacity,
             shared_ranges: Vec::new(),
             next_shared_offset: capacity,
-            waiters: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            waiters: LocalWaiterMap::new(RwLock::new(std::collections::HashMap::new())),
         })
     }
 
@@ -224,19 +228,23 @@ impl Memory {
     /// Call while holding the memory lock (the register must be atomic with
     /// the value compare), then drop the lock and park via
     /// [`WaiterRegistry::park`] — a parked waiter must not hold the memory
-    /// lock, or a notifier on another thread could never reach it.
+    /// lock, or a notifier on another thread could never reach it. The
+    /// returned registry carries a fresh node already pushed onto the
+    /// address's queue, so a notify landing after the memory lock drops is
+    /// latched in the node rather than lost.
     pub(crate) fn waiter_registry(&self, address: u32) -> WaiterRegistry {
         if let Some((range, region_offset)) = self.find_shared_range(address) {
-            ensure_shared_waiter(&range.waiters, region_offset);
-            WaiterRegistry::Shared(range.waiters.clone(), region_offset)
+            let node = register_waiter(&range.waiters, region_offset);
+            WaiterRegistry::Shared(range.waiters.clone(), region_offset, node)
         } else {
-            self.get_waiter(address);
-            WaiterRegistry::Local(self.waiters.clone(), address)
+            let node = register_waiter(&self.waiters, address);
+            WaiterRegistry::Local(self.waiters.clone(), address, node)
         }
     }
 
     /// Notifies waiters at the given address.
-    /// Returns the number of waiters notified.
+    /// Returns the number of waiters notified (up to `n` distinct waiters,
+    /// per the threads proposal).
     pub fn notify(&self, address: u32, n: u32) -> Result<u32> {
         // Bounds check: address must be in owned range or a shared range
         if !self.is_valid_access(address, 4)? {
@@ -245,9 +253,9 @@ impl Memory {
 
         // Check if address falls in a shared range
         if let Some((range, region_offset)) = self.find_shared_range(address) {
-            // Delegate to the shared waiters registry (same mechanism as
+            // Delegate to the shared waiters queue (same mechanism as
             // SharedMemoryRegistry::notify_region).
-            let notified = shared_notify(&range.waiters, region_offset, n);
+            let notified = notify_queue(&range.waiters, region_offset, n);
 
             // Stage 2 side effect: when compiled in and enabled, also emit
             // the host platform's wake primitive for the region's host
@@ -264,39 +272,8 @@ impl Memory {
             return Ok(notified);
         }
 
-        // Use local waiters for owned memory
-        let waiters = self.waiters.read();
-        let Some(waiter) = waiters.get(&address) else {
-            return Ok(0);
-        };
-
-        let mut notified = 0;
-        for _ in 0..n {
-            let mut flag = waiter.notified.lock();
-            *flag = true;
-            waiter.condvar.notify_one();
-            notified += 1;
-        }
-
-        Ok(notified)
-    }
-
-    /// Returns a waiter reference for the given address (for atomic wait).
-    pub(crate) fn get_waiter(&self, address: u32) {
-        // Check if address falls in a shared range
-        if let Some((range, region_offset)) = self.find_shared_range(address) {
-            ensure_shared_waiter(&range.waiters, region_offset);
-            return;
-        }
-
-        // Use local waiters for owned memory
-        let mut waiters = self.waiters.write();
-        waiters.entry(address).or_insert_with(|| {
-            Arc::new(Waiter {
-                notified: Mutex::new(false),
-                condvar: Condvar::new(),
-            })
-        });
+        // Use the local waiter queue for owned memory.
+        Ok(notify_queue(&self.waiters, address, n))
     }
 
     /// Returns the size in pages (owned pages only).
@@ -343,6 +320,24 @@ impl Memory {
 
         self.len = new_byte_len;
         Ok(old_size)
+    }
+
+    /// Sets the OS page protection for `len` bytes at owned byte offset
+    /// `base` (which must lie within the current owned length).
+    ///
+    /// The engine uses this to plant PROT_NONE guard pages below
+    /// per-invocation shadow-stack slots, so a stack overflow faults on the
+    /// guard (trapping `MemoryOutOfBounds`) instead of silently writing into
+    /// the guest heap below the slot. Callers hold the memory lock.
+    pub(crate) fn protect_owned(&self, base: u32, len: usize, prot: libc::c_int) -> Result<()> {
+        let base = base as usize;
+        if base.checked_add(len).is_none_or(|end| end > self.len) {
+            return Err(WasmError::Runtime(
+                "guard range lies outside the owned memory".to_string(),
+            ));
+        }
+        // SAFETY: `base + len` is within the owned, mmap'd region.
+        unsafe { mprotect_range(self.ptr.add(base), len, prot) }
     }
 
     /// Returns the owned length in bytes (shared ranges are placed top-down
@@ -853,48 +848,6 @@ impl Drop for Memory {
                 );
             }
         }
-    }
-}
-
-/// Parks the calling thread on the local waiter registered for `address`.
-///
-/// Does not take or hold any memory lock — only the waiter's own
-/// mutex/condvar — so a thread parked here never blocks a notifier on
-/// another thread (see [`WaiterRegistry`]). A zero timeout does not block; a
-/// notify latched before the park returns `true` immediately; spurious
-/// condvar wakeups re-check the notified flag and re-sleep with the
-/// remaining timeout.
-pub(crate) fn local_wait(waiters: &LocalWaiterMap, address: u32, timeout_ns: u64) -> bool {
-    let waiter = {
-        let mut map = waiters.write();
-        map.entry(address)
-            .or_insert_with(|| {
-                Arc::new(Waiter {
-                    notified: Mutex::new(false),
-                    condvar: Condvar::new(),
-                })
-            })
-            .clone()
-    };
-
-    if timeout_ns == 0 {
-        return false;
-    }
-
-    let mut notified = waiter.notified.lock();
-    if *notified {
-        *notified = false;
-        return true;
-    }
-
-    let timeout = std::time::Duration::from_nanos(timeout_ns);
-    let result = waiter.condvar.wait_for(&mut notified, timeout);
-
-    if result.timed_out() {
-        false
-    } else {
-        *notified = false;
-        true
     }
 }
 

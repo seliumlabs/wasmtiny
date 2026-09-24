@@ -31,6 +31,8 @@ const SIGNALS: [libc::c_int; 4] = [libc::SIGILL, libc::SIGSEGV, libc::SIGBUS, li
 struct CatchFrame {
     jmp: SigJmpBuf,
     trap: Cell<Option<TrapCode>>,
+    /// The faulting PC of the trap delivered to this frame, for diagnostics.
+    pc: Cell<Option<usize>>,
 }
 
 /// The faulting program counter's classification.
@@ -76,6 +78,7 @@ impl CatchFrame {
             Self {
                 jmp: std::mem::zeroed(),
                 trap: Cell::new(None),
+                pc: Cell::new(None),
             }
         }
     }
@@ -168,6 +171,23 @@ thread_local! {
     static STACK_BASE: Cell<usize> = const { Cell::new(0) };
 }
 
+thread_local! {
+    /// The faulting PC of the most recent trap on this thread, for
+    /// diagnostics (`AotInstance::last_trap_site`). Cleared by every
+    /// successful `catch_traps` call, so a query always reflects the last
+    /// *failed* invocation on this thread.
+    static LAST_TRAP_PC: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Returns the faulting PC of the most recent trap on this thread.
+///
+/// Diagnostic aid: map the PC through [`crate::aot::AotInstance::last_trap_site`]
+/// to recover the function index and code offset. `None` when no trap has
+/// fired on this thread (or the last invocation succeeded).
+pub fn last_trap_pc() -> Option<usize> {
+    LAST_TRAP_PC.with(|pc| pc.get())
+}
+
 /// Runs `body` with a recovery boundary: if native code faults, the signal
 /// handler transfers control back here and this returns `Err(Trap(code))`.
 #[inline(never)]
@@ -192,17 +212,25 @@ pub fn catch_traps<F: FnOnce()>(body: F) -> Result<()> {
         CATCHES.with(|c| {
             c.borrow_mut().pop();
         });
+        // A successful invocation clears the last-trap record, so
+        // `last_trap_pc` reflects only the most recent *failed* call.
+        LAST_TRAP_PC.with(|pc| pc.set(None));
         Ok(())
     } else {
         // Control returned via `siglongjmp`: a trap was delivered to the top
         // frame, which is still on the stack (its `pop` never ran).
-        let trap = CATCHES.with(|c| {
+        let (trap, pc) = CATCHES.with(|c| {
             let frames = c.borrow();
-            frames.last().and_then(|frame| frame.trap.get())
+            let frame = frames.last();
+            (
+                frame.and_then(|frame| frame.trap.get()),
+                frame.and_then(|frame| frame.pc.get()),
+            )
         });
         CATCHES.with(|c| {
             c.borrow_mut().pop();
         });
+        LAST_TRAP_PC.with(|last| last.set(pc));
         Err(WasmError::Trap(trap.unwrap_or(TrapCode::HostTrap)))
     }
 }
@@ -290,12 +318,14 @@ fn classify(pc: usize) -> FaultKind {
     FaultKind::NotOurs
 }
 
-/// Delivers `code` to the currently armed recovery frame on this thread.
-fn deliver(code: TrapCode) -> ! {
+/// Delivers `code` to the currently armed recovery frame on this thread,
+/// recording the faulting `pc` for diagnostics.
+fn deliver(code: TrapCode, pc: usize) -> ! {
     let jmp_ptr = CATCHES.with(|c| {
         c.try_borrow().ok().and_then(|frames| {
             frames.last().map(|frame| {
                 frame.trap.set(Some(code));
+                frame.pc.set(Some(pc));
                 core::ptr::addr_of!(frame.jmp).cast_mut()
             })
         })
@@ -413,7 +443,7 @@ unsafe extern "C" fn handle_signal(
     let pc = unsafe { pc_from_context(context) };
     match classify(pc) {
         FaultKind::NotOurs => unsafe { forward_to_previous(signal, info, context) },
-        FaultKind::Trap(code) => deliver(code),
+        FaultKind::Trap(code) => deliver(code, pc),
         FaultKind::InCode => {
             // A fault at a non-trap PC inside registered code is either a
             // guest memory access into the reservation's PROT_NONE guard
@@ -425,9 +455,9 @@ unsafe extern "C" fn handle_signal(
             // thread's stack base, whereas a guest access leaves SP inside
             // the healthy stack.
             if unsafe { stack_exhausted(context) } {
-                deliver(TrapCode::StackOverflow);
+                deliver(TrapCode::StackOverflow, pc);
             } else {
-                deliver(TrapCode::MemoryOutOfBounds);
+                deliver(TrapCode::MemoryOutOfBounds, pc);
             }
         }
     }

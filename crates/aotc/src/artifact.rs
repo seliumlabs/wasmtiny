@@ -22,6 +22,8 @@
 //! elems       element segments in unified index order (active/passive/declared)
 //! func map    defined-function -> type index, code offset/len, trap records
 //! code        the finish-linked machine-code image
+//! start       optional start function index
+//! stack ptr   shadow-stack pointer global index (u32::MAX = none)
 //! integrity   scheme | key_id_len | key_id (v1: absent) | SHA512 digest
 //!             over every byte preceding the digest
 //! ```
@@ -44,7 +46,12 @@ use crate::{
 };
 
 /// ABI version written (and accepted) by this compiler.
-pub const ABI_VERSION: u32 = 1;
+///
+/// v2: the vmctx gained a `stack_pointer` field, so the globals-cell layout
+/// and shadow-stack routing changed (see `environment::VmCtxOffsets`); the
+/// artifact also records the shadow-stack pointer global index in
+/// [`SECTION_STACK_POINTER`].
+pub const ABI_VERSION: u32 = 2;
 /// Endianness marker: little-endian.
 pub const ENDIANNESS_LITTLE: u32 = 0;
 /// Export kinds (wasm external-kind values).
@@ -100,6 +107,9 @@ pub const SECTION_GLOBALS: u32 = 6;
 pub const SECTION_IMPORTS: u32 = 2;
 pub const SECTION_INTEGRITY: u32 = 13;
 pub const SECTION_MEMORIES: u32 = 4;
+/// The shadow-stack pointer global index (`u32::MAX` when the module has
+/// none). Added in ABI v2.
+pub const SECTION_STACK_POINTER: u32 = 14;
 pub const SECTION_START: u32 = 12;
 pub const SECTION_TABLES: u32 = 5;
 /// Section identifiers.
@@ -224,6 +234,11 @@ pub fn write_artifact(compiled: &CompiledModule) -> Vec<u8> {
         &section_extra_traps(compiled),
     );
     write_section(&mut out, SECTION_START, &section_start(compiled));
+    write_section(
+        &mut out,
+        SECTION_STACK_POINTER,
+        &section_stack_pointer(compiled),
+    );
 
     // Integrity section: `scheme | key_id_len | key_id | digest`. The digest
     // covers *every* byte preceding the digest itself — the whole artifact
@@ -609,6 +624,15 @@ fn section_start(compiled: &CompiledModule) -> Vec<u8> {
         }
         None => out.push(0),
     }
+    out
+}
+
+/// The shadow-stack pointer global index: `u32::MAX` when the module has no
+/// shadow stack. The runtime gives each concurrent invocation a private
+/// stack slot only when this is present (see the `VmCtx` docs).
+fn section_stack_pointer(compiled: &CompiledModule) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_u32(&mut out, compiled.stack_pointer_global.unwrap_or(u32::MAX));
     out
 }
 

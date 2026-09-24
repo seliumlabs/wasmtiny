@@ -19,7 +19,7 @@ use crate::{
     environment::Translator,
     error::{CompileError, CompileResult},
     translate::translate_module,
-    types::FuncIndex,
+    types::{FuncIndex, GlobalIndex},
 };
 
 /// The raw per-function machine-code compilation result.
@@ -63,6 +63,10 @@ pub struct CompiledModule {
     /// Trap sites (absolute code-image offsets) outside wasm functions —
     /// entry trampolines and host-call stubs.
     pub extra_traps: Vec<(u32, TrapCode)>,
+    /// The module's shadow-stack pointer global index (`__stack_pointer`),
+    /// resolved from the compiler config override or the export directory.
+    /// `None` when the module has no shadow stack.
+    pub stack_pointer_global: Option<u32>,
     /// The linked code image containing the assembled code for all functions.
     pub code_image: Vec<u8>,
 }
@@ -380,12 +384,24 @@ pub fn compile_module(wasm: &[u8], config: &CompilerConfig) -> CompileResult<Com
         code_image.extend_from_slice(&stub.buffer);
     }
 
+    // The shadow-stack pointer global: the compiler-config override wins over
+    // export-based detection (recorded in the artifact for the runtime).
+    let stack_pointer_global = config
+        .shadow_stack_global
+        .or_else(|| {
+            translator
+                .info
+                .shadow_stack_pointer()
+                .map(|index| index.as_u32())
+        });
+
     Ok(CompiledModule {
         target: config.target.clone(),
         translator,
         functions,
         func_import_stub_offsets,
         extra_traps,
+        stack_pointer_global,
         code_image,
     })
 }
@@ -577,8 +593,8 @@ fn translate(
     gate_unsupported_features(wasm)?;
 
     let mut translator = Translator::new(isa.frontend_config(), isa.default_call_conv());
+    translator.stack_pointer_override = config.shadow_stack_global.map(GlobalIndex::from_u32);
     translate_module(wasm, &mut translator)?;
 
-    let _ = config;
     Ok(translator)
 }

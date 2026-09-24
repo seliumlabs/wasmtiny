@@ -91,6 +91,11 @@ pub struct AotModule {
     pub func_import_stub_offsets: Vec<u32>,
     /// Optional start function.
     pub start: Option<u32>,
+    /// The module's shadow-stack pointer global index (`__stack_pointer`),
+    /// when the artifact declares one. `None` when the module has no shadow
+    /// stack (or the section is absent — the runtime then falls back to
+    /// export-based detection).
+    pub stack_pointer_global: Option<u32>,
     /// The finish-linked machine-code image.
     pub code_image: Vec<u8>,
 }
@@ -165,6 +170,7 @@ impl AotLoader {
             extra_traps: Vec::new(),
             func_import_stub_offsets: Vec::new(),
             start: None,
+            stack_pointer_global: None,
             code_image: Vec::new(),
         };
         let mut seen = std::collections::HashSet::new();
@@ -497,6 +503,10 @@ fn parse_section(id: u32, payload: &[u8], module: &mut AotModule) -> Result<()> 
                 module.start = Some(reader.read_u32()?);
             }
         }
+        format::SECTION_STACK_POINTER => {
+            let value = reader.read_u32()?;
+            module.stack_pointer_global = if value == u32::MAX { None } else { Some(value) };
+        }
         format::SECTION_FUNCTION_MAP => {
             let count = reader.read_count(24)?;
             for _ in 0..count {
@@ -702,6 +712,21 @@ fn validate_indices(module: &AotModule) -> Result<()> {
         return Err(load_error(format!(
             "start function index {start} outside the module's function index space \
              ({total_funcs} functions)"
+        )));
+    }
+
+    let total_globals = module.globals.len() as u32
+        + module
+            .imports
+            .iter()
+            .filter(|import| matches!(import.kind, ImportKind::Global(_)))
+            .count() as u32;
+    if let Some(stack_pointer) = module.stack_pointer_global
+        && stack_pointer >= total_globals
+    {
+        return Err(load_error(format!(
+            "stack-pointer global index {stack_pointer} outside the module's global index \
+             space ({total_globals} globals)"
         )));
     }
 

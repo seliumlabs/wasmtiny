@@ -7,6 +7,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+use parking_lot::Mutex as ParkingMutex;
+
 use super::{
     code::ExecutableCode,
     context::{FuncDesc, MemoryDesc, TableCells, VmCtx},
@@ -15,10 +17,12 @@ use super::{
     traps,
 };
 
+use crate::memory::RegionProt;
 use crate::runtime::{
     DataKind, ElemKind, ExportKind, ExportType, FunctionType, Global, GlobalType, HostCaller,
-    HostFunc, ImportKind, InstanceMeter, InstanceStats, Memory, NumType, RefType, Result, Store,
-    TrapCode, ValType, WasmError, WasmValue, evaluate_const_expr,
+    HostFunc, ImportKind, InstanceMeter, InstanceStats, Memory, NumType, RefType, Result,
+    SharedMemoryRegistry, SharedRegionId, Store, TrapCode, ValType, WasmError, WasmValue,
+    evaluate_const_expr,
 };
 
 /// The fixed shape of an array-call entry trampoline:
@@ -28,9 +32,34 @@ type SharedTableTag = Arc<Mutex<AotTable>>;
 
 /// Packed trap sentinel shifted into the high word of a libcall result.
 const LIBCALL_TRAP: u64 = 1 << 32;
+
+/// Byte size of one wasm global cell in the vmctx globals array.
+const GLOBAL_CELL_SIZE: usize = 8;
+
+/// Floor and ceiling for a per-invocation shadow-stack slot (see
+/// `AotInstance::invoke_shared`).
+const MIN_STACK_SIZE: usize = 64 * 1024;
+const MAX_STACK_SIZE: usize = 16 * 1024 * 1024;
+
+/// Guard between the initial shadow-stack pointer and the top of its slot, so
+/// an access at the entry stack pointer stays inside the memory's addressable
+/// bound.
+const STACK_TOP_GUARD: u32 = 4096;
+
 /// Budget of host stack (in bytes) granted to wasm recursion before the
 /// entry-time stack check traps.
 const MAX_WASM_STACK: usize = 256 * 1024;
+
+/// Per-instance options affecting shadow-stack support.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InstanceOptions {
+    /// Overrides the per-invocation shadow-stack slot size in bytes
+    /// (clamped to [`MIN_STACK_SIZE`]..[`MAX_STACK_SIZE`]). When unset, the
+    /// slot size is derived from the module's `__stack_pointer` initial value
+    /// minus the exported `__heap_base` (the stack region the linker
+    /// reserved), falling back to the bare initial value.
+    pub stack_size: Option<usize>,
+}
 
 /// A loaded, instantiated artifact ready for native invocation.
 pub struct AotInstance {
@@ -51,9 +80,29 @@ pub struct AotInstance {
     _table_slots: Vec<*const TableCells>,
     _memories: Vec<Arc<Mutex<Memory>>>,
     _memory_descs: Vec<MemoryDesc>,
+    /// Index of the module's shadow-stack global (`__stack_pointer`), resolved
+    /// at instantiation from the artifact record (falling back to the export
+    /// directory). `None` when the module declares no stack-pointer global,
+    /// in which case `invoke_shared` keeps the shared-globals behaviour (and
+    /// the module must not be entered concurrently if it uses a shadow stack).
+    stack_pointer_global: Option<usize>,
+    /// Per-invocation shadow-stack slot size in bytes (usable bytes, excluding
+    /// the guard page), derived from the module's `__stack_pointer`/`__heap_base`
+    /// values (0 when there is none).
+    stack_size: usize,
+    /// Recycled shadow-stack slot base addresses (byte offsets into memory 0).
+    /// Guarded so concurrent `invoke_shared` calls never share a slot.
+    stack_slots: Mutex<Vec<u32>>,
     _libcalls: Box<LibcallTable>,
     _dispatch: Box<AotDispatchState>,
     _store: SharedAotStore,
+    /// The instance's shared-memory registry, shared with the store so host
+    /// and guest wait/notify interoperate (see
+    /// [`AotInstance::allocate_shared_region`]).
+    _shared_memory: Arc<ParkingMutex<SharedMemoryRegistry>>,
+    /// Shared regions currently attached to this instance's memory, detached
+    /// on drop to keep the registry's attachment counts accurate.
+    _attached_regions: Mutex<Vec<SharedRegionId>>,
     _registered: traps::RegisteredCode,
 }
 
@@ -115,6 +164,46 @@ impl AotInstance {
         shared_store: &SharedAotStore,
         module: &AotModule,
         imports: &[(String, String, AotExtern)],
+    ) -> Result<Self> {
+        Self::instantiate_with_registry(
+            shared_store,
+            module,
+            imports,
+            Arc::new(ParkingMutex::new(SharedMemoryRegistry::default())),
+        )
+    }
+
+    /// Like [`instantiate`](Self::instantiate), but the instance uses the
+    /// provided shared-memory registry instead of a fresh one.
+    ///
+    /// Two instances created with the same registry Arc see the same shared
+    /// regions: a region allocated by one can be attached by the other, and
+    /// host waiters on the registry interoperate with both. This mirrors
+    /// `Store::with_shared_registry` on the interpreter side; without it,
+    /// each AOT instance's regions would be invisible to every other.
+    pub fn instantiate_with_registry(
+        shared_store: &SharedAotStore,
+        module: &AotModule,
+        imports: &[(String, String, AotExtern)],
+        registry: Arc<ParkingMutex<SharedMemoryRegistry>>,
+    ) -> Result<Self> {
+        Self::instantiate_with_registry_and_options(
+            shared_store,
+            module,
+            imports,
+            registry,
+            InstanceOptions::default(),
+        )
+    }
+
+    /// Like [`instantiate_with_registry`](Self::instantiate_with_registry),
+    /// with per-instance [`InstanceOptions`] (shadow-stack slot sizing).
+    pub fn instantiate_with_registry_and_options(
+        shared_store: &SharedAotStore,
+        module: &AotModule,
+        imports: &[(String, String, AotExtern)],
+        registry: Arc<ParkingMutex<SharedMemoryRegistry>>,
+        options: InstanceOptions,
     ) -> Result<Self> {
         traps::ensure_installed().map_err(|error| {
             WasmError::Runtime(format!("signal machinery unavailable: {error}"))
@@ -507,7 +596,11 @@ impl AotInstance {
             .map(|segment| AtomicBool::new(matches!(segment.kind, ElemKind::Passive)))
             .collect();
 
-        let rt_store = Arc::new(Mutex::new(Store::new()));
+        let rt_store = Arc::new(Mutex::new(Store::with_shared_registry(registry.clone())));
+        let shared_memory = {
+            let store = rt_store.lock().map_err(|_| poisoned_case())?;
+            store.shared_memory_registry()
+        };
         let libcalls = LibcallTable::new();
         let dispatch = Box::new(AotDispatchState {
             host_funcs,
@@ -575,8 +668,66 @@ impl AotInstance {
             _libcalls: libcalls,
             _dispatch: dispatch,
             _store: shared_store.clone(),
+            _shared_memory: shared_memory,
+            _attached_regions: Mutex::new(Vec::new()),
             _registered: registered,
+            stack_pointer_global: None,
+            stack_size: 0,
+            stack_slots: Mutex::new(Vec::new()),
         };
+
+        // Resolve the module's shadow-stack global. The artifact records the
+        // index the compiler routed through the vmctx `stack_pointer` field
+        // (config override or the `__stack_pointer` export); export-based
+        // detection is kept as a fallback for artifacts without the record.
+        // Its initial value is the stack top; the exported `__heap_base`
+        // (stack bottom) refines the reserved stack region when present. The
+        // shared context's stack pointer keeps the module's initial value for
+        // the single-threaded `invoke` path.
+        let stack_pointer_global = module.stack_pointer_global.or_else(|| {
+            instance.exports.iter().find_map(|export| match &export.kind {
+                ExportKind::Global(index) if export.name == "__stack_pointer" => Some(*index),
+                _ => None,
+            })
+        });
+        instance.stack_pointer_global = stack_pointer_global.map(|index| index as usize);
+        if let Some(index) = stack_pointer_global {
+            let index = index as usize;
+            let cell = index * GLOBAL_CELL_SIZE;
+            let init = instance
+                ._globals
+                .get(cell..cell + 4)
+                .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                .unwrap_or(0);
+            instance.ctx.stack_pointer = init;
+            // The linker places the stack between `__heap_base` (bottom) and
+            // the initial `__stack_pointer` (top); the reserved region is the
+            // difference. Without `__heap_base` (not all toolchains export
+            // it), the top address alone is the fallback — for the rustc/LLD
+            // layout the stack sits at the top of linear memory, so the top
+            // over-estimates rather than under-estimates the region.
+            let heap_base = instance.exports.iter().find_map(|export| match &export.kind {
+                ExportKind::Global(index) if export.name == "__heap_base" => {
+                    let cell = *index as usize * GLOBAL_CELL_SIZE;
+                    instance
+                        ._globals
+                        .get(cell..cell + 4)
+                        .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                }
+                _ => None,
+            });
+            let reserved = heap_base
+                .and_then(|heap| init.checked_sub(heap))
+                .filter(|size| *size > 0)
+                .unwrap_or(init);
+            // Clamp the slot size to a sane band: a module with no reserved
+            // stack (init 0) still gets a usable stack; a pathologically large
+            // init cannot exhaust the reservation.
+            instance.stack_size = options
+                .stack_size
+                .unwrap_or(reserved as usize)
+                .clamp(MIN_STACK_SIZE, MAX_STACK_SIZE);
+        }
 
         // Run the start function, if any, after the instance is fully wired.
         if let Some(start) = module.start {
@@ -605,6 +756,124 @@ impl AotInstance {
     /// A shared memory reference, usable to import it into another module.
     pub fn memory_handle(&self, memory_index: u32) -> Option<Arc<Mutex<Memory>>> {
         self._memories.get(memory_index as usize).cloned()
+    }
+
+    /// Returns the instance's shared-memory registry.
+    ///
+    /// The registry is shared with the instance's store, so every instance
+    /// created from the same store sees the same regions; `notify_region`
+    /// and `register_region_waiter` on the registry interoperate with guest
+    /// `memory.atomic.wait/notify` on attached ranges.
+    pub fn shared_memory_registry(&self) -> Arc<ParkingMutex<SharedMemoryRegistry>> {
+        self._shared_memory.clone()
+    }
+
+    /// Allocates a new shared region and maps it into this instance's first
+    /// memory. Returns `(region_id, page_offset)`.
+    ///
+    /// Thread-safe (`&self`): the memory and registry locks are taken in the
+    /// same order as the interpreter's `Instance` (memory first, registry
+    /// second), so mixed interpreter/AOT embedding cannot deadlock.
+    pub fn allocate_shared_region(
+        &self,
+        size: u32,
+        prot: RegionProt,
+    ) -> Result<(SharedRegionId, u32)> {
+        let memory = self._memories.first().cloned().ok_or_else(|| {
+            WasmError::Runtime("no memory to attach shared region to".to_string())
+        })?;
+        let mut mem = memory.lock().map_err(|_| poisoned_lock())?;
+        let result = self
+            ._shared_memory
+            .lock()
+            .allocate_region(&mut mem, size, prot)?;
+        self._attached_regions
+            .lock()
+            .map_err(|_| poisoned_lock())?
+            .push(result.0);
+        Ok(result)
+    }
+
+    /// Allocates a shared region without mapping it into any guest memory.
+    pub fn allocate_shared_region_standalone(&self, size: u32) -> Result<SharedRegionId> {
+        self._shared_memory.lock().allocate_region_standalone(size)
+    }
+
+    /// Destroys a shared region; it must have no attached mappings.
+    pub fn destroy_shared_region(&self, region_id: SharedRegionId) -> Result<()> {
+        self._shared_memory.lock().destroy_region(region_id)
+    }
+
+    /// Returns the length of the shared region in bytes.
+    pub fn shared_region_len(&self, region_id: SharedRegionId) -> Result<u32> {
+        self._shared_memory.lock().region_len(region_id)
+    }
+
+    /// Attaches an existing shared region to this instance's first memory.
+    ///
+    /// The region's physical pages are mapped into the guest's address space
+    /// (`mmap(MAP_FIXED | MAP_SHARED)`), so writes are immediately visible to
+    /// every other attached instance. Returns the page offset where the
+    /// region was mapped.
+    pub fn attach_shared_region(
+        &self,
+        region_id: SharedRegionId,
+        prot: RegionProt,
+        reader_slot: Option<u32>,
+    ) -> Result<u32> {
+        let memory = self._memories.first().cloned().ok_or_else(|| {
+            WasmError::Runtime("no memory to attach shared region to".to_string())
+        })?;
+        let mut mem = memory.lock().map_err(|_| poisoned_lock())?;
+        let page_offset =
+            self._shared_memory
+                .lock()
+                .attach_region(&mut mem, region_id, prot, reader_slot)?;
+        self._attached_regions
+            .lock()
+            .map_err(|_| poisoned_lock())?
+            .push(region_id);
+        Ok(page_offset)
+    }
+
+    /// Detaches a shared region from this instance's first memory.
+    pub fn detach_shared_region(&self, region_id: SharedRegionId) -> Result<()> {
+        let memory = self._memories.first().cloned().ok_or_else(|| {
+            WasmError::Runtime("no memory to detach shared region from".to_string())
+        })?;
+        let mut mem = memory.lock().map_err(|_| poisoned_lock())?;
+        self._shared_memory
+            .lock()
+            .detach_region(&mut mem, region_id)?;
+        self._attached_regions
+            .lock()
+            .map_err(|_| poisoned_lock())?
+            .retain(|id| *id != region_id);
+        Ok(())
+    }
+
+    /// Writes data to a shared region from the host side.
+    pub fn write_shared_region(
+        &self,
+        region_id: SharedRegionId,
+        offset: usize,
+        data: &[u8],
+    ) -> Result<()> {
+        self._shared_memory
+            .lock()
+            .write_to_region(region_id, offset, data)
+    }
+
+    /// Reads data from a shared region from the host side.
+    pub fn read_shared_region(
+        &self,
+        region_id: SharedRegionId,
+        offset: usize,
+        buf: &mut [u8],
+    ) -> Result<()> {
+        self._shared_memory
+            .lock()
+            .read_from_region(region_id, offset, buf)
     }
 
     /// Reads the current value of global `index` (imports first, then defined).
@@ -685,6 +954,30 @@ impl AotInstance {
     /// Invokes the function `func_idx` natively on a shared instance.
     ///
     /// Concurrent entry; see [`invoke_export_shared`](Self::invoke_export_shared).
+    ///
+    /// # Per-invocation context copy
+    ///
+    /// Each invocation runs on a *copy* of the instance context with this
+    /// thread's stack bound — never the shared context — so concurrent
+    /// invocations from many threads cannot race on it. The copy is shallow:
+    /// only `stack_limit` and, for a module with a shadow stack, the
+    /// `stack_pointer` value differ; the memory, table, function, dispatch and
+    /// globals pointers are shared (see the `VmCtx` docs for the full
+    /// contract). Because the copy lives on the invoking thread's stack and
+    /// the callee receives its address directly, no cross-thread publication
+    /// of the copy is ever needed.
+    ///
+    /// # Shadow stacks
+    ///
+    /// A rustc-compiled module keeps every function frame on a single
+    /// `__stack_pointer` shadow stack in linear memory, so two concurrent
+    /// invocations of one instance would overlap their frames if they shared
+    /// that pointer. Compiled `global.get`/`global.set` of `__stack_pointer`
+    /// read/write the vmctx `stack_pointer` field (the compiler routes it),
+    /// so each invocation points it at a private stack slot carved from the
+    /// committed memory and no globals copying is involved: ordinary mutable
+    /// globals stay genuinely shared through the globals array. Modules
+    /// without a stack pointer keep the shared-globals behaviour unchanged.
     pub fn invoke_shared(&self, func_idx: u32, args: &[WasmValue]) -> Result<Vec<WasmValue>> {
         // Per-invocation execution context: a copy of the instance context
         // with this thread's stack bound. Direct calls propagate it, so the
@@ -692,7 +985,81 @@ impl AotInstance {
         // thread-relative limit while leaving the shared context untouched.
         let mut context = *self.ctx.as_ref();
         context.stack_limit = traps::thread_stack_limit(MAX_WASM_STACK);
-        self.invoke_with_context(func_idx, args, &context)
+
+        if self.stack_pointer_global.is_none() {
+            // No shadow stack: shared globals and stack pointer, as before.
+            return self.invoke_with_context(func_idx, args, &context);
+        }
+
+        // Reserve a private stack slot and point this invocation's stack
+        // pointer at it. The slot is carved from the committed memory (see
+        // `acquire_stack_slot`) with a PROT_NONE guard page at its bottom, so
+        // a stack overflow traps `MemoryOutOfBounds` instead of silently
+        // clobbering the guest heap below; the stack top is kept a small
+        // guard below the slot's end so accesses at the entry stack pointer
+        // stay inside the memory's addressable bound.
+        let slot_base = self.acquire_stack_slot()?;
+        let stack_top = slot_base
+            .wrapping_add(self.slot_total_bytes())
+            .wrapping_sub(STACK_TOP_GUARD);
+        context.stack_pointer = stack_top;
+
+        let result = self.invoke_with_context(func_idx, args, &context);
+
+        self.release_stack_slot(slot_base);
+        result
+    }
+
+    /// Total byte span of one stack slot: the usable pages plus the bottom
+    /// PROT_NONE guard page.
+    fn slot_total_bytes(&self) -> u32 {
+        let page = crate::memory::PAGE_SIZE_BYTES;
+        let usable_pages = self.stack_size.div_ceil(page as usize) as u32;
+        usable_pages.wrapping_add(1).wrapping_mul(page)
+    }
+
+    /// Acquires a private shadow-stack slot, recycling a freed slot or
+    /// growing memory 0 by the slot size and taking the new pages. Returns the
+    /// slot's base byte offset.
+    ///
+    /// The slot is carved from the committed (owned) memory rather than a
+    /// top-down reservation because compiled accesses — and the module's own
+    /// stack/pointer arithmetic — treat the owned length as the addressable
+    /// bound, so the stack pointer must lie within it. Each grow appends, so a
+    /// stack slot is always disjoint from the guest allocator's own
+    /// `memory.grow` regions. The lowest page of every slot is `mprotect`ed
+    /// PROT_NONE: a shadow stack that grows past its slot faults on that page
+    /// and traps, instead of silently corrupting the guest heap below.
+    ///
+    /// Engine-internal growth is not charged against the instance's memory
+    /// budget (the budget gates guest `memory.grow`, not engine stacks);
+    /// `stats()` still reports the slot pages, since they are committed
+    /// memory. Slots are bounded by the peak concurrent invocation count and
+    /// are recycled, so the overhead does not accumulate.
+    fn acquire_stack_slot(&self) -> Result<u32> {
+        if let Some(base) = self.stack_slots.lock().map_err(|_| poisoned_lock())?.pop() {
+            return Ok(base);
+        }
+        let memory = self
+            ._memories
+            .first()
+            .ok_or_else(|| WasmError::Runtime("no memory for stack slot".to_string()))?
+            .clone();
+        let mut memory = memory.lock().map_err(|_| poisoned_lock())?;
+        let page = crate::memory::PAGE_SIZE_BYTES;
+        let usable_pages = self.stack_size.div_ceil(page as usize) as u32;
+        // + 1 page: the bottom PROT_NONE guard.
+        let old_pages = memory.grow(usable_pages.wrapping_add(1))?;
+        let base = old_pages.wrapping_mul(page);
+        memory.protect_owned(base, page as usize, libc::PROT_NONE)?;
+        Ok(base)
+    }
+
+    /// Returns a shadow-stack slot to the free list for reuse.
+    fn release_stack_slot(&self, base: u32) {
+        if let Ok(mut slots) = self.stack_slots.lock() {
+            slots.push(base);
+        }
     }
 
     fn invoke_with_context(
@@ -760,6 +1127,37 @@ impl AotInstance {
         })?;
         Ok(self._dispatch.meter.snapshot(pages))
     }
+
+    /// Returns the trap site of the most recent trap on the *calling thread*:
+    /// `(function index, byte offset within that function's code, trap code)`.
+    ///
+    /// Diagnostic aid for root-causing guest traps (the signal handler only
+    /// classifies the faulting PC to a [`TrapCode`]; this maps it back to the
+    /// wasm function and instruction). `None` when the last invocation on
+    /// this thread succeeded, or when the faulting PC is outside this
+    /// instance's code image (e.g. a host-side fault).
+    pub fn last_trap_site(&self) -> Option<(u32, u32, TrapCode)> {
+        let pc = traps::last_trap_pc()?;
+        let base = self.image.entry() as usize;
+        if pc < base || pc >= base + self.image.len() {
+            return None;
+        }
+        let offset = (pc - base) as u32;
+        for function in &self.functions {
+            let start = function.code_offset;
+            let end = start.saturating_add(function.code_len);
+            if offset >= start && offset < end {
+                let code = function
+                    .traps
+                    .iter()
+                    .find(|(trap_offset, _)| *trap_offset == offset - start)
+                    .map(|(_, code)| *code)
+                    .unwrap_or(TrapCode::MemoryOutOfBounds);
+                return Some((function.func_index, offset - start, code));
+            }
+        }
+        None
+    }
 }
 
 // SAFETY: an `AotInstance` shares no mutable state across threads while it is
@@ -773,6 +1171,37 @@ impl AotInstance {
 unsafe impl Send for AotInstance {}
 
 unsafe impl Sync for AotInstance {}
+
+impl Drop for AotInstance {
+    fn drop(&mut self) {
+        // Detach every shared region this instance attached, so the
+        // registry's attachment counts stay accurate and `destroy_region`
+        // succeeds after the instance goes away. The memory's own drop
+        // unmaps the shared pages regardless; this only fixes the bookkeeping.
+        // Lock order: memory first, registry second — the same order as
+        // `allocate_shared_region`/`attach_shared_region`/`detach_shared_region`
+        // (and the interpreter's `Instance`), so a concurrent attach on
+        // another thread can never deadlock against a drop.
+        let regions: Vec<SharedRegionId> = {
+            let mut attached = match self._attached_regions.lock() {
+                Ok(attached) => attached,
+                Err(_) => return,
+            };
+            std::mem::take(&mut *attached)
+        };
+        if regions.is_empty() {
+            return;
+        }
+        for region_id in regions {
+            if let Some(memory) = self._memories.first()
+                && let Ok(mut mem) = memory.lock()
+            {
+                let mut shared_memory = self._shared_memory.lock();
+                let _ = shared_memory.detach_region(&mut mem, region_id);
+            }
+        }
+    }
+}
 
 impl LibcallTable {
     fn new() -> Box<Self> {

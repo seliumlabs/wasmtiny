@@ -8,7 +8,10 @@
 use crate::runtime::TrapCode;
 
 /// ABI version accepted by this loader.
-pub const ABI_VERSION: u32 = 1;
+///
+/// v2: the vmctx gained a `stack_pointer` field and the artifact carries the
+/// shadow-stack pointer global index in [`SECTION_STACK_POINTER`].
+pub const ABI_VERSION: u32 = 2;
 /// Little-endian marker.
 pub const ENDIANNESS_LITTLE: u32 = 0;
 /// Export kinds (wasm external-kind values).
@@ -42,6 +45,8 @@ pub const SECTION_IMPORTS: u32 = 2;
 pub const SECTION_INTEGRITY: u32 = 13;
 pub const SECTION_MEMORIES: u32 = 4;
 pub const SECTION_START: u32 = 12;
+/// Shadow-stack pointer global index (`u32::MAX` = none). ABI v2.
+pub const SECTION_STACK_POINTER: u32 = 14;
 pub const SECTION_TABLES: u32 = 5;
 /// Section identifiers.
 pub const SECTION_TYPES: u32 = 1;

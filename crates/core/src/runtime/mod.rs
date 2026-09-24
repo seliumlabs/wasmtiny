@@ -16,8 +16,8 @@
 
 #[cfg(feature = "aot")]
 pub(crate) use instance::evaluate_const_expr;
-pub(crate) use shared_memory::WaiterMap;
-pub(crate) use shared_memory::{ensure_shared_waiter, shared_notify, shared_wait};
+pub(crate) use shared_memory::{WaiterMap, WaiterNode, WaiterQueue};
+pub(crate) use shared_memory::{notify_queue, park_node, register_waiter};
 
 pub use crate::memory::Memory;
 pub use atomic_op::{ATOMIC_OPS, AtomicKind, AtomicOpMeta, lookup as atomic_lookup};

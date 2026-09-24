@@ -1185,12 +1185,16 @@ impl Drop for Instance {
         }
 
         let regions: Vec<SharedRegionId> = std::mem::take(&mut self.attached_regions);
-        let mut shared_memory = self.shared_memory.lock();
 
+        // Lock order: memory first, registry second — the same order as
+        // `allocate_shared_region`/`attach_shared_region`/`detach_shared_region`
+        // (and the AOT `AotInstance`), so a concurrent attach on another
+        // thread can never deadlock against a drop.
         for region_id in regions {
             if let Some(memory) = self.memories.first()
                 && let Ok(mut mem) = memory.lock()
             {
+                let mut shared_memory = self.shared_memory.lock();
                 let _ = shared_memory.detach_region(&mut mem, region_id);
             }
         }

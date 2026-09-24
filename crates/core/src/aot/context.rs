@@ -66,6 +66,44 @@ pub struct FuncDesc {
 ///
 /// `Copy` because a concurrent invocation clones the context (adjusting only
 /// the per-invocation stack limit) instead of writing the shared one.
+///
+/// # Per-invocation copies (concurrent execution contract)
+///
+/// [`AotInstance::invoke_shared`](crate::aot::AotInstance::invoke_shared)
+/// runs with a *copy* of this struct, not the shared one. The contract of
+/// that copy is:
+///
+/// - **`stack_limit` is per-invocation.** The copy refreshes it to the
+///   invoking thread's native-stack bound, so every direct callee on that
+///   invocation checks a correct, thread-relative limit while the shared
+///   context stays disabled (0) and unusable by other threads.
+/// - **`stack_pointer` is per-invocation when the module has a shadow
+///   stack.** Compiled `global.get`/`global.set` of the module's
+///   `__stack_pointer` global read/write this field directly (never the
+///   globals array — the compiler routes it). [`AotInstance::invoke_shared`]
+///   (crate::aot::AotInstance::invoke_shared) points the copy at a private
+///   stack slot by writing `stack_pointer`; the shared context keeps the
+///   module's initial value for the single-threaded [`invoke`]
+///   (crate::aot::AotInstance::invoke) path.
+/// - **`globals` is always shared by pointer.** Ordinary mutable globals are
+///   read and written in place through the one array — identical
+///   unsynchronised-shared semantics to modules without a shadow stack, so
+///   concurrent invocations observe each other's writes (non-atomic guest
+///   read-modify-write cycles are racy by design, as on any shared memory).
+/// - **Everything else is shared by pointer.** The copy carries the same
+///   `memories`, `tables`, `funcs`, `store_funcs`, `type_ids`, `libcalls`,
+///   `dispatch` and `refs` pointers as the shared context.
+///
+/// A rustc-compiled module uses the `__stack_pointer` shadow-stack global for
+/// every frame; the per-invocation stack slot above is what lets several host
+/// threads enter one instance without overlapping frames. Modules that also
+/// use `__tls_base` (real per-thread TLS) need an engine-side per-thread TLS
+/// block with `__wasm_init_tls`, which is not implemented; without it a
+/// `__tls_base`-relative thread-local is shared across invocations. Tests
+/// pinning this contract live in `crates/aotc/tests/concurrency.rs`
+/// (`concurrent_mutable_global_access_is_correct`,
+/// `concurrent_invocations_share_mutable_globals`, and
+/// `shadow_stack_is_per_invocation`).
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct VmCtx {
@@ -91,6 +129,10 @@ pub struct VmCtx {
     pub dispatch: *mut core::ffi::c_void,
     /// Array of store-native funcref handles (u32 per function index).
     pub refs: *const u32,
+    /// The shadow-stack pointer. Compiled `__stack_pointer` `global.get`/`set`
+    /// read/write this field; per-invocation on the concurrent path (see the
+    /// struct docs), the module's initial value on the shared context.
+    pub stack_pointer: u32,
 }
 
 // SAFETY: `FuncDesc` stores raw pointers into instance-owned code/images that
@@ -118,6 +160,7 @@ impl VmCtx {
             stack_limit: usize::MAX,
             dispatch: std::ptr::null_mut(),
             refs: dangling.cast(),
+            stack_pointer: 0,
         }
     }
 }

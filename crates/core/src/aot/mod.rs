@@ -5,7 +5,7 @@
 //! It mirrors — but never links — the `wasmtiny-aotc` compiler crate.
 
 pub use code::ExecutableCode;
-pub use exec::AotInstance;
+pub use exec::{AotInstance, InstanceOptions};
 pub use loader::{AotFunction, AotLoader, AotModule};
 pub use store::{AotExtern, AotStore, AotTable};
 

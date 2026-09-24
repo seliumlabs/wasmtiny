@@ -80,6 +80,135 @@ fn dropped_waiter_is_deregistered() {
     assert_eq!(woken, 0, "registry must not retain dropped waiters");
 }
 
+/// Spike finding 1 (shared-region path): the per-address waiter queue means
+/// `notify_region(n)` releases up to `n` *distinct* host waiters on the same
+/// offset — the old single flag per address could never wake more than one.
+#[test]
+fn notify_region_releases_n_distinct_host_waiters() {
+    let fx = setup();
+    let registry = fx.registry();
+
+    // Two host waiters register on the same offset, each with its own node.
+    let a = registry
+        .lock()
+        .register_region_waiter(fx.region_id, OFFSET)
+        .expect("register A");
+    let b = registry
+        .lock()
+        .register_region_waiter(fx.region_id, OFFSET)
+        .expect("register B");
+
+    // notify_region(2) must release both, not clamp to one.
+    let woken = registry
+        .lock()
+        .notify_region(fx.region_id, OFFSET, 2)
+        .expect("notify_region(2)");
+    assert_eq!(
+        woken, 2,
+        "notify_region(2) must release two distinct waiters"
+    );
+    assert_eq!(
+        a.wait(Duration::from_millis(200)).expect("A wait"),
+        WakeOutcome::Woken
+    );
+    assert_eq!(
+        b.wait(Duration::from_millis(200)).expect("B wait"),
+        WakeOutcome::Woken
+    );
+
+    // A fresh pair: notify_region(1) releases exactly one; the second
+    // notify_region(1), issued while the other is still parked, releases it.
+    let a = registry
+        .lock()
+        .register_region_waiter(fx.region_id, OFFSET)
+        .expect("register A2");
+    let b = registry
+        .lock()
+        .register_region_waiter(fx.region_id, OFFSET)
+        .expect("register B2");
+    let woken = registry
+        .lock()
+        .notify_region(fx.region_id, OFFSET, 1)
+        .expect("notify_region(1)");
+    assert_eq!(woken, 1, "notify_region(1) releases exactly one waiter");
+    // Both nodes are registered at registration time; the remaining waiter
+    // is still parked, so the second notify finds it deterministically.
+    let woken = registry
+        .lock()
+        .notify_region(fx.region_id, OFFSET, 1)
+        .expect("second notify_region(1)");
+    assert_eq!(
+        woken, 1,
+        "second notify_region(1) releases the remaining waiter"
+    );
+    assert_eq!(
+        a.wait(Duration::from_secs(5)).expect("A re-wait"),
+        WakeOutcome::Woken
+    );
+    assert_eq!(
+        b.wait(Duration::from_secs(5)).expect("B re-wait"),
+        WakeOutcome::Woken
+    );
+}
+
+/// F2: a `RegionWaiter` handle can wait again after being woken — the node
+/// is re-registered on each `wait`, matching the documented "register cheap,
+/// wait often" contract.
+#[test]
+fn waiter_handle_waits_again_after_wake() {
+    let fx = setup();
+    let registry = fx.registry();
+
+    let waiter = registry
+        .lock()
+        .register_region_waiter(fx.region_id, OFFSET)
+        .expect("register");
+
+    // First wait: woken by notify_region(1) (the node is queued at
+    // registration, so the notify finds it deterministically).
+    let woken = registry
+        .lock()
+        .notify_region(fx.region_id, OFFSET, 1)
+        .expect("first notify");
+    assert_eq!(woken, 1, "first notify wakes the registered waiter");
+    assert_eq!(
+        waiter
+            .wait(Duration::from_millis(200))
+            .expect("first wait"),
+        WakeOutcome::Woken
+    );
+
+    // Second wait on the SAME handle: the first wake popped its node, so the
+    // blocking `wait` must re-register it. A blocking wait on another thread
+    // re-joins the queue before parking; retry the notify (bounded) until it
+    // lands on the re-registered node — a handle that never re-registered
+    // would time out and fail the join instead.
+    let re_wait = {
+        let waiter = waiter.clone();
+        std::thread::spawn(move || waiter.wait(Duration::from_secs(5)).expect("re-wait"))
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut woken = 0;
+    while woken == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "re-registration never observed; the handle cannot wait again"
+        );
+        woken = registry
+            .lock()
+            .notify_region(fx.region_id, OFFSET, 1)
+            .expect("second notify");
+        if woken == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    assert_eq!(woken, 1, "second notify finds the re-registered waiter");
+    assert_eq!(
+        re_wait.join().expect("re-wait thread survives"),
+        WakeOutcome::Woken
+    );
+}
+
 #[cfg(all(
     feature = "platform-wake-emission",
     any(target_os = "linux", target_os = "freebsd")

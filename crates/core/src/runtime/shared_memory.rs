@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     ffi::CString,
     sync::{
         Arc,
@@ -15,8 +15,14 @@ use crate::{
     runtime::{Memory, Result, WasmError, os_wake},
 };
 
-/// Shared waiter map for a region: byte offset within the region -> waiter.
-pub(crate) type WaiterMap = Arc<RwLock<HashMap<u32, Arc<SharedWaiter>>>>;
+/// Shared waiter map for a region: byte offset within the region -> queue of
+/// parked waiters.
+///
+/// Each address owns a *queue* of one node per parked thread (see
+/// [`WaiterNode`]); `memory.atomic.notify(n)` pops and wakes up to `n`
+/// distinct nodes, matching the threads proposal, where the old single
+/// flag-per-address entry could never wake more than one waiter.
+pub(crate) type WaiterMap = Arc<RwLock<HashMap<u32, Arc<WaiterQueue>>>>;
 
 /// Maximum shared region size (1 GiB).
 const MAX_REGION_SIZE: u32 = 1 << 30;
@@ -48,6 +54,30 @@ pub struct SharedRegion {
     waiters: WaiterMap,
 }
 
+/// A per-address queue of parked waiters.
+///
+/// One [`WaiterNode`] per parked thread: a notify pops up to `n` nodes and
+/// wakes each, so several threads can park on the same word and a
+/// `notify(n)` releases up to `n` distinct waiters (threads proposal). The
+/// queue itself never holds a parked thread — waiting happens on the node's
+/// own mutex/condvar, so a parked waiter never blocks a notifier.
+#[derive(Debug)]
+pub(crate) struct WaiterQueue {
+    inner: ParkingMutex<VecDeque<Arc<WaiterNode>>>,
+}
+
+/// A single parked thread's wake state.
+///
+/// `notified` is set by a notify that popped this node out of its queue
+/// (under the node's mutex), so a notify landing after the node was
+/// registered but before the owner parked is latched: the park observes the
+/// flag and returns immediately instead of sleeping through the timeout.
+#[derive(Debug)]
+pub(crate) struct WaiterNode {
+    pub(crate) notified: ParkingMutex<bool>,
+    pub(crate) condvar: Condvar,
+}
+
 /// Outcome of a host-side [`RegionWaiter::wait`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WakeOutcome {
@@ -69,32 +99,26 @@ pub enum WakeOutcome {
 /// // 2. Re-check the shared word through your own mapping.
 /// if ring_is_empty() { return Ok(()); } // no need to sleep
 /// // 3. Only then block. A notify that landed between steps 1 and 3 is
-/// //    latched in the waiter's notified flag, so this returns Woken
-/// //    immediately instead of sleeping.
+/// //    latched in the waiter's node, so this returns Woken immediately
+/// //    instead of sleeping.
 /// match waiter.wait(Duration::from_secs(1))? {
 ///     WakeOutcome::Woken => { /* re-check and make progress */ }
 ///     WakeOutcome::TimedOut => { /* backstop; retry the loop */ }
 /// }
 /// ```
 ///
-/// The waiter occupies an entry in the region's waiter registry — the same
-/// registry guest `memory.atomic.wait32`/`memory.atomic.notify` use on
-/// shared ranges, so guest notifies wake host waiters and vice versa.
+/// Each registration pushes a fresh node onto the address's waiter queue —
+/// the same queue guest `memory.atomic.wait32`/`memory.atomic.notify` use on
+/// shared ranges — so guest notifies wake host waiters and vice versa, and
+/// several host threads may register on the same address independently.
 ///
 /// Handles are cheap to create ("register cheap, wait often"); dropping
-/// the last handle for an offset deregisters it from the registry, so no
+/// the last handle for an offset deregisters its node from the queue, so no
 /// stale entries are retained. Keep a bounded timeout as a backstop.
 pub struct RegionWaiter {
     map: WaiterMap,
     offset: u32,
-    inner: Arc<SharedWaiter>,
-}
-
-/// A waiter for atomic wait/notify on shared memory addresses.
-#[derive(Debug)]
-pub(crate) struct SharedWaiter {
-    pub(crate) notified: ParkingMutex<bool>,
-    pub(crate) condvar: Condvar,
+    node: Arc<WaiterNode>,
 }
 
 /// Shared memory registry.
@@ -331,26 +355,47 @@ impl RegionWaiter {
     /// Blocks until a notify arrives for this waiter or the timeout elapses.
     ///
     /// A notify that arrived after registration but before this call is
-    /// observed here (the flag is checked under the waiter's mutex before
+    /// observed here (the flag is checked under the node's mutex before
     /// sleeping), which is what makes the register → re-check → wait idiom
     /// race-free. Spurious condvar wakeups are re-checked against the
     /// notified flag and re-slept with the remaining timeout, so `Woken`
     /// really means "a notify arrived".
+    ///
+    /// The handle is re-registered on every call: a notify that woke an
+    /// earlier `wait` pops the node out of the queue, so a subsequent
+    /// `wait` on the same handle re-joins the queue first (register cheap,
+    /// wait often). While the node is already queued (the register →
+    /// re-check → wait idiom), re-registration is a no-op and exactly one
+    /// registration remains. A wake consumed before the re-registration is
+    /// still reported (`Woken`) and the re-registered node is removed again,
+    /// so a handle never leaves a stale registration behind after `wait`
+    /// returns.
     pub fn wait(&self, timeout: Duration) -> Result<WakeOutcome> {
+        // Re-join the queue unless this node is still registered (a previous
+        // wake popped it, a previous timeout deregistered it).
+        ensure_waiter_registered(&self.map, self.offset, &self.node);
         let deadline = Instant::now()
             .checked_add(timeout)
             .expect("wait timeout overflows Instant");
-        let mut notified = self.inner.notified.lock();
+        let mut notified = self.node.notified.lock();
         loop {
             if *notified {
                 *notified = false;
+                // The wake that set this flag popped the node; if the
+                // re-registration above pushed it back (a stale latch), drop
+                // it again so the handle leaves no queued registration behind.
+                unregister_waiter(&self.map, self.offset, &self.node);
                 return Ok(WakeOutcome::Woken);
             }
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                drop(notified);
+                unregister_waiter(&self.map, self.offset, &self.node);
                 return Ok(WakeOutcome::TimedOut);
             };
-            let result = self.inner.condvar.wait_for(&mut notified, remaining);
+            let result = self.node.condvar.wait_for(&mut notified, remaining);
             if result.timed_out() && !*notified {
+                drop(notified);
+                unregister_waiter(&self.map, self.offset, &self.node);
                 return Ok(WakeOutcome::TimedOut);
             }
             // Either the flag was set (loop head returns Woken) or the
@@ -361,23 +406,25 @@ impl RegionWaiter {
 
 impl Drop for RegionWaiter {
     fn drop(&mut self) {
-        // Deregister from the region's waiter map, but only if the map
-        // entry is still this waiter (it may have been removed and
-        // recreated since registration).
-        let mut map = self.map.write();
-        if let Some(entry) = map.get(&self.offset)
-            && Arc::ptr_eq(entry, &self.inner)
-        {
-            map.remove(&self.offset);
-        }
+        // Deregister this waiter's node from the region's queue. A node
+        // already popped by a notify is no longer queued and is left alone.
+        unregister_waiter(&self.map, self.offset, &self.node);
     }
 }
 
-impl SharedWaiter {
+impl WaiterNode {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             notified: ParkingMutex::new(false),
             condvar: Condvar::new(),
+        })
+    }
+}
+
+impl WaiterQueue {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: ParkingMutex::new(VecDeque::new()),
         })
     }
 }
@@ -468,11 +515,12 @@ impl SharedMemoryRegistry {
     /// Registers a host waiter on `(region_id, offset)` and returns a
     /// handle for waiting.
     ///
-    /// The waiter joins the region's per-offset waiter registry — the same
+    /// The waiter joins the region's per-offset waiter queue — the same
     /// mechanism guest `memory.atomic.wait32`/`memory.atomic.notify` use on
     /// shared ranges — so a guest notify on the address mapping `offset`
     /// wakes the returned waiter, and [`Self::notify_region`] wakes guest
-    /// waiters parked on that offset.
+    /// waiters parked on that offset. Several host threads may register on
+    /// the same offset; each gets its own queue node.
     ///
     /// See [`RegionWaiter`] for the register → re-check → wait idiom and
     /// deregistration-on-drop semantics. Registration bounds-checks the
@@ -491,16 +539,12 @@ impl SharedMemoryRegistry {
             )));
         }
         let offset = offset as u32;
-
-        let inner = {
-            let mut map = region.waiters.write();
-            map.entry(offset).or_insert_with(SharedWaiter::new).clone()
-        };
+        let node = register_waiter(&region.waiters, offset);
 
         Ok(Arc::new(RegionWaiter {
             map: region.waiters_arc(),
             offset,
-            inner,
+            node,
         }))
     }
 
@@ -508,8 +552,10 @@ impl SharedMemoryRegistry {
     ///
     /// Wakes both host waiters created via [`Self::register_region_waiter`]
     /// and guest threads parked in `memory.atomic.wait32`/`wait64` on the
-    /// address mapping `offset`. With no registered waiter this returns
-    /// zero without erroring — a notify with nobody to wake is not a fault.
+    /// address mapping `offset`. Up to `count` *distinct* waiters are
+    /// released, per the threads proposal. With no registered waiter this
+    /// returns zero without erroring — a notify with nobody to wake is not
+    /// a fault.
     pub fn notify_region(
         &self,
         region_id: SharedRegionId,
@@ -524,7 +570,7 @@ impl SharedMemoryRegistry {
                 region.len()
             )));
         }
-        Ok(shared_notify(&region.waiters, offset as u32, count))
+        Ok(notify_queue(&region.waiters, offset as u32, count))
     }
 
     /// Reports the engine's host-wait support level.
@@ -680,72 +726,141 @@ impl Default for SharedMemoryRegistry {
     }
 }
 
-/// Gets or creates the shared waiter entry for `offset` (crate-internal;
-/// used by both the interpreter paths and the public API).
-pub(crate) fn ensure_shared_waiter(waiters: &WaiterMap, offset: u32) {
-    let mut map = waiters.write();
-    map.entry(offset).or_insert_with(SharedWaiter::new);
-}
-
-/// Wakes up to `count` threads parked on the shared waiter for `offset`.
-/// Returns the number of wake attempts delivered (zero when no waiter is
-/// registered).
-pub(crate) fn shared_notify(waiters: &WaiterMap, offset: u32, n: u32) -> u32 {
-    if n == 0 {
-        return 0;
-    }
-    let map = waiters.read();
-    let Some(waiter) = map.get(&offset) else {
-        return 0;
-    };
-
-    // The map holds ONE waiter entry per offset, whose `notified` flag
-    // satisfies exactly one parked thread; notify counts above 1 can never
-    // wake more than one distinct waiter and must not loop `n` times (a
-    // guest notify with a huge count would spin the loop under this read
-    // lock, stalling every registrant's deregistration).
-    let mut notified = waiter.notified.lock();
-    *notified = true;
-    drop(notified);
-    waiter.condvar.notify_one();
-    1
-}
-
-/// Parks the calling thread on the shared waiter for `offset`.
+/// Registers a fresh waiter node in the queue for `key` and returns it.
 ///
-/// Returns true if woken, false if the timeout elapsed. Interpreter
-/// semantics: a zero timeout does not block and reports not-woken even if a
-/// notify is already latched. Does not take any guest memory lock while
-/// parked — only the waiter's own mutex/condvar are held. Spurious condvar
-/// wakeups are re-checked against the notified flag and re-slept with the
-/// remaining timeout.
-pub(crate) fn shared_wait(waiters: &WaiterMap, offset: u32, timeout_ns: u64) -> bool {
-    let waiter = {
-        let mut map = waiters.write();
-        map.entry(offset).or_insert_with(SharedWaiter::new).clone()
-    };
+/// The node sits in the queue from registration until either a notify pops
+/// it (the owner is then woken) or the owner removes it via
+/// [`unregister_waiter`] (timeout or drop). Registration is done under the
+/// map write lock so a concurrent unregister can never remove the queue out
+/// from under a just-pushed node — the register → re-check → wait idiom
+/// stays lost-wake-free.
+pub(crate) fn register_waiter(waiters: &WaiterMap, key: u32) -> Arc<WaiterNode> {
+    let node = WaiterNode::new();
+    let mut map = waiters.write();
+    let queue = map.entry(key).or_insert_with(WaiterQueue::new).clone();
+    queue.inner.lock().push_back(node.clone());
+    node
+}
 
+/// Re-joins `node` to the queue for `key` unless it is already queued.
+///
+/// Used by [`RegionWaiter::wait`] so a handle whose node was popped by a
+/// notify (or removed by a timeout) can wait again. No-op while the node is
+/// still queued, keeping the register → re-check → wait idiom at exactly one
+/// registration. Serialised with [`register_waiter`]/[`unregister_waiter`]
+/// on the map write lock.
+pub(crate) fn ensure_waiter_registered(waiters: &WaiterMap, key: u32, node: &Arc<WaiterNode>) {
+    let mut map = waiters.write();
+    let queue = map.entry(key).or_insert_with(WaiterQueue::new).clone();
+    let mut inner = queue.inner.lock();
+    if !inner.iter().any(|candidate| Arc::ptr_eq(candidate, node)) {
+        inner.push_back(node.clone());
+    }
+}
+
+/// Removes `node` from the queue for `key` if it is still queued.
+///
+/// A node already popped by a notify is left alone. When the last node of a
+/// queue is removed the queue entry itself is dropped, so addresses that are
+/// no longer waited on leave no stale state behind. Serialised with
+/// [`register_waiter`] on the map write lock, so a node can never be pushed
+/// into a queue that a concurrent unregister has already discarded.
+pub(crate) fn unregister_waiter(waiters: &WaiterMap, key: u32, node: &Arc<WaiterNode>) {
+    let mut map = waiters.write();
+    let Some(queue) = map.get(&key).cloned() else {
+        return;
+    };
+    let mut inner = queue.inner.lock();
+    inner.retain(|candidate| !Arc::ptr_eq(candidate, node));
+    if inner.is_empty() {
+        // The queue is empty and we hold the map write lock: no concurrent
+        // register can be pushing into it, so removing the entry is safe.
+        drop(inner);
+        map.remove(&key);
+    }
+}
+
+/// Parks the calling thread on an already-registered `node` until notified
+/// or timed out.
+///
+/// Returns true if woken, false if the timeout elapsed. A zero timeout does
+/// not block: the node is deregistered and `false` is reported even if a
+/// notify is already latched (interpreter semantics preserved). Does not
+/// take any guest memory lock while parked — only the node's own
+/// mutex/condvar are held. Spurious condvar wakeups are re-checked against
+/// the notified flag and re-slept with the remaining timeout.
+pub(crate) fn park_node(
+    waiters: &WaiterMap,
+    key: u32,
+    node: &Arc<WaiterNode>,
+    timeout_ns: u64,
+) -> bool {
     if timeout_ns == 0 {
+        unregister_waiter(waiters, key, node);
         return false;
     }
 
     let deadline = Instant::now()
         .checked_add(Duration::from_nanos(timeout_ns))
         .expect("wait timeout overflows Instant");
-    let mut notified = waiter.notified.lock();
+    let mut notified = node.notified.lock();
     loop {
         if *notified {
             *notified = false;
             return true;
         }
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            drop(notified);
+            unregister_waiter(waiters, key, node);
             return false;
         };
-        let result = waiter.condvar.wait_for(&mut notified, remaining);
+        let result = node.condvar.wait_for(&mut notified, remaining);
         if result.timed_out() && !*notified {
+            drop(notified);
+            unregister_waiter(waiters, key, node);
             return false;
         }
         // Either the flag was set (loop head returns true) or the wake was
         // spurious — re-check and keep waiting.
     }
+}
+
+/// Wakes up to `n` distinct threads parked in the queue for `key`; returns
+/// the number of wake attempts delivered (zero when no waiter is queued).
+///
+/// Nodes are popped under the queue's own lock and woken *after* it is
+/// dropped, so a notifier never holds the queue lock while another thread
+/// registers or deregisters. `n == 0` notifies nobody (threads proposal).
+pub(crate) fn notify_queue(waiters: &WaiterMap, key: u32, n: u32) -> u32 {
+    if n == 0 {
+        return 0;
+    }
+    let queue = {
+        let map = waiters.read();
+        map.get(&key).cloned()
+    };
+    let Some(queue) = queue else {
+        return 0;
+    };
+
+    let mut woken = Vec::new();
+    {
+        let mut inner = queue.inner.lock();
+        while woken.len() < n as usize {
+            match inner.pop_front() {
+                Some(node) => woken.push(node),
+                None => break,
+            }
+        }
+    }
+
+    let count = woken.len() as u32;
+    for node in woken {
+        let mut notified = node.notified.lock();
+        *notified = true;
+        drop(notified);
+        node.condvar.notify_one();
+    }
+    // `n` bounds the loop; woken.len() is at most n, so the count fits u32.
+    count
 }

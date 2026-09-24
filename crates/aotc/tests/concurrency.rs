@@ -363,8 +363,539 @@ fn grow_racing_reads_never_tears() {
     }
 }
 
+/// Spike finding 2 (OOB/hang root cause, fixed): `memory.atomic.wait32` /
+/// `notify` **memarg offsets** must be folded into the effective address.
+///
+/// The AOT compiler originally dropped the memarg offset for the wait/notify
+/// libcalls (loads/stores folded it via `memory_addr`), so every wait and
+/// notify landed on address 0. Real Rust atomics modules (std futexes) use
+/// nonzero offsets for their wake words, which routed the guest worker pool
+/// and condvar traffic to the wrong address: notify at the intended word
+/// never reached the parked waiter (the 2-worker hang), and value compares
+/// read the wrong word. This test pins the fix: a waiter parked at effective
+/// address 64 must NOT be woken by a notify at address 0, and MUST be woken
+/// by a notify at address 64.
+#[test]
+fn wait_notify_memarg_offsets_are_respected() {
+    let source = r#"(module
+      (memory 1)
+      (func (export "wait") (result i32)
+        ;; Atomic parked counter at address 4; the wait word is at 64.
+        (i32.atomic.rmw.add (i32.const 4) (i32.const 1))
+        (drop)
+        (memory.atomic.wait32 offset=64 (i32.const 0) (i32.const 0) (i64.const 2000000000)))
+      (func (export "parked_count") (result i32)
+        (i32.atomic.load (i32.const 4)))
+      (func (export "notify64") (result i32)
+        (memory.atomic.notify offset=64 (i32.const 0) (i32.const 1)))
+      (func (export "notify0") (result i32)
+        (memory.atomic.notify offset=0 (i32.const 0) (i32.const 1))))"#;
+
+    for run in 0..5 {
+        let instance = instantiate(source);
+        let waiter = spawn_invoke(instance.clone(), 0, vec![]);
+
+        // Counter-based readiness: wait until the worker has entered `wait`,
+        // then a short grace period for it to reach the engine's waiter
+        // registration. The window between the counter bump and the wait32
+        // libcall's register is microseconds; 50 ms is an enormous margin
+        // and removes the thread-spawn latency that made a bare sleep flaky.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while instance
+            .invoke_shared(1, &[])
+            .expect("parked_count succeeds")[0]
+            .i32()
+            .expect("i32")
+            != 1
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "run {run}: worker never entered wait"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // A notify on address 0 must find nobody (the waiter is at 64).
+        let notified = instance.invoke_shared(3, &[]).expect("notify0 succeeds");
+        assert_eq!(
+            notified,
+            vec![WasmValue::I32(0)],
+            "run {run}: notify at address 0 must not reach the waiter parked at 64"
+        );
+
+        // The waiter must still be parked: notify at address 64 wakes it.
+        let notified = instance.invoke_shared(2, &[]).expect("notify64 succeeds");
+        assert_eq!(
+            notified,
+            vec![WasmValue::I32(1)],
+            "run {run}: notify at address 64 must reach the waiter"
+        );
+        let result = waiter.join().expect("waiter thread survives");
+        assert_eq!(
+            result,
+            Ok(vec![WasmValue::I32(0)]),
+            "run {run}: waiter parked at 64 must be woken by the address-64 notify"
+        );
+    }
+}
+
 fn instantiate(source: &str) -> Arc<AotInstance> {
     Arc::new(AotInstance::new(&load(source)).expect("instantiation succeeds"))
+}
+
+/// Spike finding 1 (multi-waiter wait/notify): the 2-worker hang repro.
+///
+/// A worker pool parks N workers on ONE shared wake word and a dispatcher
+/// calls `notify(N)`. The pre-queue registry held a single flag per address,
+/// so `notify(N)` could never wake more than one distinct waiter — the
+/// other N-1 workers slept until their timeout (the observed hang). With the
+/// per-address waiter queue, `notify(N)` releases up to N distinct waiters.
+///
+/// Runs 10 times with 2 and 4 workers; every worker must report woken (0),
+/// never timed out (2). Synchronisation is counter-based (a guest parked
+/// counter, drained by repeated notifies) rather than a fixed sleep: a
+/// worker that bumped the counter but had not yet registered when a notify
+/// fired simply parks and the next drain notify releases it, so the test is
+/// deterministic. Without the queue fix the surplus workers return 2 after
+/// the 2 s timeout backstop and the join assertion fails.
+#[test]
+fn many_workers_on_one_wake_word_all_wake() {
+    let source = r#"(module
+      (memory 1)
+      (func (export "park") (result i32)
+        (local $r i32)
+        ;; Atomic parked counter at address 4 (address 0 is the wake word).
+        (i32.atomic.rmw.add (i32.const 4) (i32.const 1))
+        (drop)
+        (memory.atomic.wait32 (i32.const 0) (i32.const 0) (i64.const 2000000000))
+        (local.set $r)
+        (i32.atomic.rmw.add (i32.const 4) (i32.const -1))
+        (drop)
+        (local.get $r))
+      (func (export "parked_count") (result i32)
+        (i32.atomic.load (i32.const 4)))
+      (func (export "wake") (param i32) (result i32)
+        (memory.atomic.notify (i32.const 0) (local.get 0))))"#;
+
+    for run in 0..10 {
+        for workers in [2usize, 4] {
+            let instance = instantiate(source);
+            let handles: Vec<_> = (0..workers)
+                .map(|_| spawn_invoke(instance.clone(), 0, vec![]))
+                .collect();
+
+            // Wait until every worker has entered `park`.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while instance
+                .invoke_shared(1, &[])
+                .expect("parked_count succeeds")[0]
+                .i32()
+                .unwrap()
+                < workers as i32
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "run {run}/{workers} workers: never all parked"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+
+            // Drain: notify until no worker remains parked. A worker whose
+            // counter bump preceded its registration is released by a later
+            // drain iteration; the joins assert every worker was woken.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while instance
+                .invoke_shared(1, &[])
+                .expect("parked_count succeeds")[0]
+                .i32()
+                .unwrap()
+                > 0
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "run {run}/{workers} workers: never all woken"
+                );
+                instance
+                    .invoke_shared(2, &[WasmValue::I32(workers as i32)])
+                    .expect("notify succeeds");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+
+            for handle in handles {
+                let result = handle.join().expect("worker thread survives");
+                assert_eq!(
+                    result,
+                    Ok(vec![WasmValue::I32(0)]),
+                    "run {run}/{workers} workers: every parked worker must be woken, none may time out"
+                );
+            }
+        }
+    }
+}
+
+/// Spike finding 3 (per-invocation VmCtx copy contract): mutable globals are
+/// SHARED across concurrent invocations.
+///
+/// `invoke_shared` runs on a copy of the instance context, but the copy is
+/// shallow — only `stack_limit` differs; `vmctx.globals` still references
+/// the instance's single cell buffer. This test pins that contract: a value
+/// written by thread A is observable by thread B through its own
+/// per-invocation context copy. If the copy ever snapshotted globals, B
+/// would read stale zeros and this fails.
+#[test]
+fn concurrent_invocations_share_mutable_globals() {
+    let instance = instantiate(
+        r#"(module
+          (global $g (mut i32) (i32.const 0))
+          (func (export "write") (param i32) (global.set $g (local.get 0)))
+          (func (export "read") (result i32) (global.get $g)))"#,
+    );
+
+    for run in 0..10 {
+        // A writes a distinct value...
+        instance
+            .invoke_shared(0, &[WasmValue::I32(0xDEAD_BEEFu32 as i32 + run)])
+            .expect("write succeeds");
+        // ...and B (a fresh invocation on this thread) must observe it.
+        let value = instance.invoke_shared(1, &[]).expect("read succeeds");
+        assert_eq!(
+            value,
+            vec![WasmValue::I32(0xDEAD_BEEFu32 as i32 + run)],
+            "run {run}: mutable globals are shared across invocations, not per-invocation"
+        );
+    }
+}
+
+/// A module that exports `__stack_pointer` (the wasm-threads shadow-stack
+/// convention) must get a private shadow stack per concurrent invocation: two
+/// threads carving frames and writing a tag through `$sp` must never clobber
+/// each other. Without per-invocation stacks both invocations compute the same
+/// `$sp`-relative slot, so one thread reads back the other's tag and the check
+/// fails.
+#[test]
+fn shadow_stack_is_per_invocation() {
+    let instance = instantiate(
+        r#"(module
+          (memory 1)
+          (global $sp (mut i32) (i32.const 65536))
+          (export "__stack_pointer" (global $sp))
+          (func (export "run") (param $tag i32) (result i32)
+            (local $k i32)
+            (local $slot i32)
+            ;; Carve 16 bytes of shadow stack and write the tag.
+            (global.set $sp (i32.sub (global.get $sp) (i32.const 16)))
+            (local.set $slot (global.get $sp))
+            (i32.store (local.get $slot) (local.get $tag))
+            ;; Spin to widen the overlap window.
+            (block $done
+              (loop $l
+                (br_if $done (i32.ge_u (local.get $k) (i32.const 50000)))
+                (local.set $k (i32.add (local.get $k) (i32.const 1)))
+                (br $l)))
+            ;; Read the tag back and restore the stack pointer.
+            (local.set $k (i32.load (local.get $slot)))
+            (global.set $sp (i32.add (global.get $sp) (i32.const 16)))
+            (i32.eq (local.get $k) (local.get $tag))))"#,
+    );
+
+    let a = {
+        let instance = instance.clone();
+        std::thread::spawn(move || {
+            for _ in 0..2000 {
+                let value = instance
+                    .invoke_shared(0, &[WasmValue::I32(0x1111_1111)])
+                    .expect("run succeeds");
+                assert_eq!(
+                    value,
+                    vec![WasmValue::I32(1)],
+                    "thread A read back a clobbered stack slot"
+                );
+            }
+        })
+    };
+    let b = {
+        let instance = instance.clone();
+        std::thread::spawn(move || {
+            for _ in 0..2000 {
+                let value = instance
+                    .invoke_shared(0, &[WasmValue::I32(0x2222_2222)])
+                    .expect("run succeeds");
+                assert_eq!(
+                    value,
+                    vec![WasmValue::I32(1)],
+                    "thread B read back a clobbered stack slot"
+                );
+            }
+        })
+    };
+    a.join().expect("thread A survives");
+    b.join().expect("thread B survives");
+}
+
+/// F5: a shadow-stack pointer that is **not** exported under the
+/// `__stack_pointer` name can be declared through the compiler config. The
+/// compiler routes its `global.get`/`set` through the vmctx stack-pointer
+/// field and records the index in the artifact, so the runtime still gives
+/// each concurrent invocation a private stack.
+#[test]
+fn unexported_shadow_stack_pointer_via_compiler_config() {
+    // `$sp` is a plain mutable global here — never exported.
+    let source = r#"(module
+          (memory 1)
+          (global $sp (mut i32) (i32.const 65536))
+          (func (export "run") (param $tag i32) (result i32)
+            (local $k i32)
+            (local $slot i32)
+            (global.set $sp (i32.sub (global.get $sp) (i32.const 16)))
+            (local.set $slot (global.get $sp))
+            (i32.store (local.get $slot) (local.get $tag))
+            (block $done
+              (loop $l
+                (br_if $done (i32.ge_u (local.get $k) (i32.const 50000)))
+                (local.set $k (i32.add (local.get $k) (i32.const 1)))
+                (br $l)))
+            (local.set $k (i32.load (local.get $slot)))
+            (global.set $sp (i32.add (global.get $sp) (i32.const 16)))
+            (i32.eq (local.get $k) (local.get $tag))))"#;
+
+    let wasm = wat::parse_str(source).expect("wat parses");
+    let mut config = CompilerConfig::host();
+    config.shadow_stack_global = Some(0); // global 0 is `$sp`
+    let bytes = compile_artifact(&wasm, &config).expect("compilation succeeds");
+    let module = AotLoader::new().load(&bytes).expect("artifact loads");
+    assert_eq!(
+        module.stack_pointer_global,
+        Some(0),
+        "artifact must record the compiler-config shadow-stack pointer"
+    );
+
+    let instance = Arc::new(AotInstance::new(&module).expect("instantiation succeeds"));
+    let a = {
+        let instance = instance.clone();
+        std::thread::spawn(move || {
+            for _ in 0..2000 {
+                let value = instance
+                    .invoke_shared(0, &[WasmValue::I32(0x1111_1111)])
+                    .expect("run succeeds");
+                assert_eq!(
+                    value,
+                    vec![WasmValue::I32(1)],
+                    "thread A read back a clobbered stack slot"
+                );
+            }
+        })
+    };
+    let b = {
+        let instance = instance.clone();
+        std::thread::spawn(move || {
+            for _ in 0..2000 {
+                let value = instance
+                    .invoke_shared(0, &[WasmValue::I32(0x2222_2222)])
+                    .expect("run succeeds");
+                assert_eq!(
+                    value,
+                    vec![WasmValue::I32(1)],
+                    "thread B read back a clobbered stack slot"
+                );
+            }
+        })
+    };
+    a.join().expect("thread A survives");
+    b.join().expect("thread B survives");
+}
+
+/// F5: each shadow-stack slot carries a PROT_NONE guard page at its bottom,
+/// so a stack overflow traps `MemoryOutOfBounds` instead of silently
+/// writing into the guest heap below the slot.
+#[test]
+fn shadow_stack_overflow_traps_not_corrupts() {
+    let instance = instantiate(
+        r#"(module
+          (memory 1)
+          (global $sp (mut i32) (i32.const 65536))
+          (export "__stack_pointer" (global $sp))
+          (func (export "blow") (result i32)
+            ;; Carve 70 KiB — past the 64 KiB usable slot into the guard.
+            (global.set $sp (i32.sub (global.get $sp) (i32.const 71680)))
+            (i32.store (global.get $sp) (i32.const 1))
+            (i32.const 0)))"#,
+    );
+
+    let result = instance.invoke_shared(0, &[]);
+    assert!(
+        matches!(result, Err(WasmError::Trap(TrapCode::MemoryOutOfBounds))),
+        "a shadow-stack overflow past the slot must trap MemoryOutOfBounds, got {result:?}"
+    );
+}
+
+/// F5: `InstanceOptions::stack_size` overrides the derived slot size. With a
+/// large override the module's own heap stays untouched by stack slots (the
+/// slots are carved above it either way), and concurrent invocations still
+/// get private stacks.
+#[test]
+fn instance_options_override_stack_size() {
+    use parking_lot::Mutex as ParkingMutex;
+    use wasmtiny::{
+        aot::{AotStore, InstanceOptions},
+        runtime::SharedMemoryRegistry,
+    };
+
+    let module = load(
+        r#"(module
+          (memory 1)
+          (global $sp (mut i32) (i32.const 65536))
+          (export "__stack_pointer" (global $sp))
+          (func (export "run") (result i32)
+            (global.set $sp (i32.sub (global.get $sp) (i32.const 16)))
+            (global.set $sp (i32.add (global.get $sp) (i32.const 16)))
+            (i32.const 1)))"#,
+    );
+    let shared_store = AotStore::shared();
+    let registry = Arc::new(ParkingMutex::new(SharedMemoryRegistry::default()));
+    let instance = Arc::new(
+        AotInstance::instantiate_with_registry_and_options(
+            &shared_store,
+            &module,
+            &[],
+            registry,
+            InstanceOptions {
+                stack_size: Some(2 * 1024 * 1024),
+            },
+        )
+        .expect("instantiation succeeds"),
+    );
+
+    // The override must not break concurrent invocations; each returns 1.
+    let a = {
+        let instance = instance.clone();
+        std::thread::spawn(move || {
+            for _ in 0..500 {
+                assert_eq!(
+                    instance.invoke_shared(0, &[]).expect("run succeeds"),
+                    vec![WasmValue::I32(1)]
+                );
+            }
+        })
+    };
+    let b = {
+        let instance = instance.clone();
+        std::thread::spawn(move || {
+            for _ in 0..500 {
+                assert_eq!(
+                    instance.invoke_shared(0, &[]).expect("run succeeds"),
+                    vec![WasmValue::I32(1)]
+                );
+            }
+        })
+    };
+    a.join().expect("thread A survives");
+    b.join().expect("thread B survives");
+}
+
+/// Spike finding 2 (memory.grow dispatch-state visibility): a concurrent
+/// `memory.grow` must be visible to later per-invocation contexts.
+///
+/// Compiled heap accesses bounds-check against the memory's *capacity* (a
+/// fixed reservation; newly grown pages become accessible via `mprotect`),
+/// so growth never makes compiled loads/stores stale. This test pins the
+/// observable side: after a grow commits on another thread, a fresh
+/// `invoke_shared` sees the new size through `memory.size` AND can read the
+/// grown pages, which traps `MemoryOutOfBounds` only if the per-invocation
+/// context carried a stale view of the memory.
+#[test]
+fn concurrent_grow_is_visible_to_later_invocations() {
+    let source = r#"(module
+          (memory 1 10)
+          (func (export "grow") (param i32) (result i32)
+            (memory.grow (local.get 0)))
+          (func (export "size") (result i32)
+            (memory.size))
+          (func (export "write") (param i32) (param i32)
+            (i32.store (local.get 0) (local.get 1)))
+          (func (export "read") (param i32) (result i32)
+            (i32.load (local.get 0))))"#;
+
+    for run in 0..10 {
+        let instance = instantiate(source);
+        let grower = spawn_invoke(instance.clone(), 0, vec![WasmValue::I32(2)]);
+        // Wait for the grow to commit (the join is the synchronisation).
+        grower
+            .join()
+            .expect("grower survives")
+            .expect("grow succeeds");
+
+        // A fresh invocation must observe the grown size...
+        let size = instance.invoke_shared(1, &[]).expect("size query");
+        assert_eq!(
+            size,
+            vec![WasmValue::I32(3)],
+            "run {run}: grown size visible"
+        );
+
+        // ...and be able to access the newly grown pages.
+        instance
+            .invoke_shared(2, &[WasmValue::I32(2 * 65536), WasmValue::I32(42)])
+            .expect("write to grown page succeeds");
+        let read = instance
+            .invoke_shared(3, &[WasmValue::I32(2 * 65536)])
+            .expect("read from grown page succeeds");
+        assert_eq!(
+            read,
+            vec![WasmValue::I32(42)],
+            "run {run}: grown page coherent"
+        );
+    }
+}
+
+/// Spike finding 2 (trap backtrace): after a guest trap, the faulting
+/// function and code offset are recoverable for diagnostics.
+///
+/// The signal handler classifies the PC to a `TrapCode`; `last_trap_site`
+/// maps that PC back to the wasm function index and byte offset so an
+/// embedder can symbolise the fault (mt-demo OOB root-causing).
+#[test]
+fn trap_site_diagnostics_report_function_and_offset() {
+    let source = r#"(module
+          (memory 1)
+          (func (export "bounce") (param i32) (result i32)
+            (i32.load (local.get 0)))
+          (func (export "trap") (result i32)
+            (call 0 (i32.const 0xFFFF_FF00))))"#;
+    let instance = instantiate(source);
+
+    // A successful invocation clears the record.
+    let _ = instance
+        .invoke_shared(0, &[WasmValue::I32(0)])
+        .expect("valid load succeeds");
+    assert!(
+        instance.last_trap_site().is_none(),
+        "a successful invocation must clear the last-trap record"
+    );
+
+    let result = instance.invoke_shared(1, &[]);
+    assert!(
+        matches!(result, Err(WasmError::Trap(TrapCode::MemoryOutOfBounds))),
+        "expected OOB trap, got {result:?}"
+    );
+    let (func_index, offset, code) = instance
+        .last_trap_site()
+        .expect("trap site must be recorded");
+    assert_eq!(code, TrapCode::MemoryOutOfBounds);
+    // The faulting PC is inside "bounce" (module-local index 0), the callee
+    // whose load traps; the exported "trap" wrapper (index 1) called it.
+    assert_eq!(
+        func_index, 0,
+        "trap must map to the function containing the faulting instruction"
+    );
+    // The offset is inside that function's code, which is non-empty.
+    let function = &load(source).functions[func_index as usize];
+    assert!(
+        offset < function.code_len,
+        "offset {offset} must be within function {} ({} bytes)",
+        func_index,
+        function.code_len
+    );
 }
 
 fn load(source: &str) -> AotModule {

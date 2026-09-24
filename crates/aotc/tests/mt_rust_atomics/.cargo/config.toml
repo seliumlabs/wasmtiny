@@ -1,0 +1,16 @@
+[unstable]
+build-std = ["std", "panic_abort"]
+
+[build]
+target = "wasm32-unknown-unknown"
+target-dir = "../../../../target"
+
+[target.wasm32-unknown-unknown]
+rustflags = [
+  "-C", "target-feature=+atomics,+bulk-memory,+mutable-globals",
+  "-C", "link-arg=--max-memory=268435456",
+  "-C", "link-arg=--shared-memory",
+  "-C", "link-arg=--export-memory",
+  "-C", "link-arg=--export=__stack_pointer",
+  "-C", "link-arg=--export=__heap_base",
+]

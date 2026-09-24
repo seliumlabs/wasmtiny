@@ -1368,7 +1368,7 @@ fn translate_function_body(
     let mut func =
         ir::Function::with_name_signature(ir::UserFuncName::user(0, defined_index as u32), sig);
 
-    let mut func_env = FuncEnv::new(&translator.info);
+    let mut func_env = FuncEnv::new(&translator.info, translator.stack_pointer_override);
     translator
         .trans
         .translate_body(body, &mut func, &mut func_env)
@@ -2225,6 +2225,7 @@ fn translate_operator(
                 builder.cursor(),
                 MemoryIndex::from_u32(memarg.memory),
                 addr,
+                memarg.offset,
                 count,
             )?;
             state.push1(val);
@@ -2235,6 +2236,7 @@ fn translate_operator(
                 builder.cursor(),
                 MemoryIndex::from_u32(memarg.memory),
                 addr,
+                memarg.offset,
                 expected,
                 timeout,
             )?;
@@ -2246,6 +2248,7 @@ fn translate_operator(
                 builder.cursor(),
                 MemoryIndex::from_u32(memarg.memory),
                 addr,
+                memarg.offset,
                 expected,
                 timeout,
             )?;

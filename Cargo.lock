@@ -648,6 +648,7 @@ dependencies = [
  "cranelift-codegen",
  "cranelift-entity",
  "cranelift-frontend",
+ "parking_lot",
  "sha2",
  "target-lexicon",
  "thiserror",

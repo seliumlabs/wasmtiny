@@ -23,6 +23,7 @@ wasmparser.workspace = true
 
 [dev-dependencies]
 # The integration tests drive the runtime's AOT execution path.
+parking_lot.workspace = true
 wasmtiny = { workspace = true, features = ["aot"] }
 wat.workspace = true
 

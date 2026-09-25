@@ -4,7 +4,7 @@
 //! invocations off one shared cache line.
 
 use std::{
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -16,6 +16,27 @@ use wasmtiny::{
     },
 };
 use wasmtiny_aotc::{CompilerConfig, compile_artifact};
+
+/// Serialises the tests in this binary against one another.
+///
+/// `cargo test` runs a test binary's tests on several threads at once. Every
+/// test but [`two_workers_beat_serial_wall_time_on_a_hot_loop`] is deterministic,
+/// but that one measures wall-clock scaling and needs its two workers to land on
+/// two otherwise-free CPUs. When it shares the binary with its siblings — several
+/// of which spin up threads of their own and drive million-iteration loops — the
+/// workers are time-sliced onto a single core, the parallel phase collapses onto
+/// the serial time, and the check fails on a two-vCPU CI runner even though the
+/// runtime is correct. Taking this guard for the duration of every test means
+/// the benchmark measures the runtime, not the harness's scheduling.
+static TEST_GUARD: Mutex<()> = Mutex::new(());
+
+/// Acquires [`TEST_GUARD`] for the duration of a test, recovering from a
+/// poisoned lock so one failing test does not cascade into the rest.
+fn test_guard() -> MutexGuard<'static, ()> {
+    TEST_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// A function whose body is `i32.const; end` — a static size of 2, so one
 /// invocation charges exactly 2 units (the entry charge).
@@ -106,6 +127,7 @@ impl HostFunc for CapBudget {
 
 #[test]
 fn a_lowered_budget_takes_effect_at_the_next_host_call() {
+    let _guard = test_guard();
     let handle = Arc::new(OnceLock::new());
     let module = load(HOST_THEN_LOOP_FN);
     let imports = [nullary_import("env", Arc::new(CapBudget(handle.clone())))];
@@ -132,6 +154,7 @@ fn a_lowered_budget_takes_effect_at_the_next_host_call() {
 
 #[test]
 fn a_raised_budget_takes_effect_at_the_next_host_call() {
+    let _guard = test_guard();
     let handle = Arc::new(OnceLock::new());
     let module = load(HOST_THEN_LOOP_FN);
     let imports = [nullary_import("env", Arc::new(RaiseBudget(handle.clone())))];
@@ -159,6 +182,7 @@ fn a_raised_budget_takes_effect_at_the_next_host_call() {
 
 #[test]
 fn an_indirect_callee_is_charged_to_its_own_instance() {
+    let _guard = test_guard();
     // `call_indirect` loads the callee's context from its `FuncDesc`, which is
     // the *shared* instance context — not the invocation's per-invocation copy.
     // The callee's fuel must therefore still be attributed to (and counted by)
@@ -187,6 +211,7 @@ fn an_indirect_callee_is_charged_to_its_own_instance() {
 
 #[test]
 fn aot_budget_exhaustion_in_a_loop_traps_distinctly() {
+    let _guard = test_guard();
     let mut instance = instantiate(LOOP_FN);
     // Budget is enough for the entry charge but not for many loop iterations.
     instance.set_execution_budget(Some(20)).expect("set budget");
@@ -198,6 +223,7 @@ fn aot_budget_exhaustion_in_a_loop_traps_distinctly() {
 
 #[test]
 fn aot_execution_charges_the_counter() {
+    let _guard = test_guard();
     let mut instance = instantiate(CONST_FN);
     assert_eq!(executed(&instance), 0, "nothing charged before invocation");
 
@@ -213,6 +239,7 @@ fn aot_execution_charges_the_counter() {
 
 #[test]
 fn charges_land_when_an_invocation_traps() {
+    let _guard = test_guard();
     // The loop charges five times, then traps. A trap ends the invocation
     // through the same path as a return, so the invocation's accumulated fuel
     // must still reach the authoritative counter.
@@ -239,6 +266,7 @@ fn compile(source: &str) -> Vec<u8> {
 
 #[test]
 fn concurrent_invocations_charge_safely() {
+    let _guard = test_guard();
     const THREADS: u64 = 4;
     const PER_THREAD: u64 = 500;
 
@@ -265,6 +293,7 @@ fn concurrent_invocations_charge_safely() {
 
 #[test]
 fn configured_budget_traps_with_the_budget_trap_code() {
+    let _guard = test_guard();
     let mut instance = instantiate(CONST_FN);
     // The entry charge alone (2) exceeds a budget of 1.
     instance.set_execution_budget(Some(1)).expect("set budget");
@@ -277,6 +306,7 @@ fn configured_budget_traps_with_the_budget_trap_code() {
 
 #[test]
 fn counter_is_monotonic_across_invocations() {
+    let _guard = test_guard();
     let mut instance = instantiate(LOOP_FN);
     let mut previous = executed(&instance);
     for n in [0, 1, 2, 4, 8] {
@@ -289,6 +319,7 @@ fn counter_is_monotonic_across_invocations() {
 
 #[test]
 fn entry_charge_records_a_budget_trap_site() {
+    let _guard = test_guard();
     use wasmtiny_aotc::environment::{USER_TRAP_BUDGET, user_trap};
 
     let wasm = wat::parse_str(CONST_FN).expect("wat parses");
@@ -317,6 +348,7 @@ fn executed(instance: &AotInstance) -> u64 {
 
 #[test]
 fn fuel_is_size_weighted_at_entry_and_loop_back_edges() {
+    let _guard = test_guard();
     // n = 0: the guard fails after one pass, so the header runs once.
     let mut zero = instantiate(LOOP_FN);
     zero.invoke(0, &[WasmValue::I32(0)]).expect("invoke");
@@ -346,6 +378,7 @@ fn fuel_is_size_weighted_at_entry_and_loop_back_edges() {
 
 #[test]
 fn host_function_calls_are_not_charged() {
+    let _guard = test_guard();
     let module = load(
         "(module
            (import \"env\" \"f\" (func $f (result i32)))
@@ -396,6 +429,7 @@ fn nullary_type() -> &'static FunctionType {
 
 #[test]
 fn reset_budget_is_honoured_on_the_next_invocation() {
+    let _guard = test_guard();
     let mut instance = instantiate(CONST_FN);
     instance.set_execution_budget(Some(1)).expect("set budget");
     assert!(
@@ -421,6 +455,7 @@ fn reset_budget_is_honoured_on_the_next_invocation() {
 
 #[test]
 fn the_counter_is_monotonic_while_concurrent_invocations_run() {
+    let _guard = test_guard();
     const THREADS: u64 = 3;
     const PER_THREAD: u64 = 2_000;
     const ITERATIONS: i32 = 64;
@@ -460,16 +495,27 @@ fn the_counter_is_monotonic_while_concurrent_invocations_run() {
 /// The wall-time regression that motivated the per-invocation fuel cell: with
 /// the charge aimed at one shared cell, two workers ping-ponged that cache line
 /// once per loop iteration and ran ~1.7x *slower* than serial.
+///
+/// This is the one measurement in this file that depends on wall-clock scaling,
+/// so it holds [`TEST_GUARD`] to keep the other tests from stealing the CPUs its
+/// two workers need (see the guard's documentation) and retries the measurement
+/// a few times so a transient scheduler hiccup cannot fail a correct runtime.
 #[test]
 fn two_workers_beat_serial_wall_time_on_a_hot_loop() {
     // A single-CPU environment cannot show parallelism; don't fail there.
     if std::thread::available_parallelism().map_or(1, std::num::NonZero::get) < 2 {
         return;
     }
+    let _guard = test_guard();
 
     const ITERATIONS: i32 = 400_000;
     const TASKS: usize = 2;
     const ROUNDS: usize = 3;
+    // Retry the whole measurement on failure. The regression this pins is not
+    // transient — with the charge on one shared cell *every* attempt is ~1.7x
+    // slower than serial — so retries cannot mask it, but they do absorb a
+    // stray scheduling hiccup on an otherwise correct runtime.
+    const ATTEMPTS: usize = 5;
 
     let instance = instantiate(LOOP_FN);
     let task = || {
@@ -484,24 +530,33 @@ fn two_workers_beat_serial_wall_time_on_a_hot_loop() {
         task();
     }
 
-    let mut serial = Duration::MAX;
-    let mut parallel = Duration::MAX;
-    for _ in 0..ROUNDS {
-        let start = Instant::now();
-        for _ in 0..TASKS {
-            task();
-        }
-        serial = serial.min(start.elapsed());
-
-        let start = Instant::now();
-        std::thread::scope(|scope| {
+    let mut last = None;
+    for _ in 0..ATTEMPTS {
+        let mut serial = Duration::MAX;
+        let mut parallel = Duration::MAX;
+        for _ in 0..ROUNDS {
+            let start = Instant::now();
             for _ in 0..TASKS {
-                scope.spawn(task);
+                task();
             }
-        });
-        parallel = parallel.min(start.elapsed());
+            serial = serial.min(start.elapsed());
+
+            let start = Instant::now();
+            std::thread::scope(|scope| {
+                for _ in 0..TASKS {
+                    scope.spawn(task);
+                }
+            });
+            parallel = parallel.min(start.elapsed());
+        }
+
+        if parallel < serial {
+            return;
+        }
+        last = Some((serial, parallel));
     }
 
+    let (serial, parallel) = last.expect("the measurement runs at least once");
     assert!(
         parallel < serial,
         "two workers must beat serial wall time on a hot loop \

@@ -119,12 +119,12 @@ impl InstanceMeter {
             return Ok(());
         }
 
-        // Saturating add: the counter never wraps. `fetch_update` never fails
+        // Saturating add: the counter never wraps. `try_update` never fails
         // here (the closure always returns `Some`), so the previous value is
         // always available.
         let previous = self
             .executed
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
                 match value.checked_add(units) {
                     Some(next) => Some(next),
                     None => {

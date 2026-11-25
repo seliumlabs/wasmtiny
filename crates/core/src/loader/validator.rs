@@ -1383,7 +1383,6 @@ impl Validator {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn validate_atomic_instruction(
         &self,
         func_idx: usize,

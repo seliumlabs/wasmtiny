@@ -83,7 +83,7 @@ The loader SHALL NOT size heap allocations directly from untrusted section count
 
 #### Scenario: Huge table minimum rejected
 - **WHEN** a table declaration's minimum exceeds the implementation cap
-- **THEN** validation SHALL fail with an explicit limits error rather than allocating minimum-sized storage
+- **THEN** loading or instantiation SHALL fail with an explicit limits error rather than allocating minimum-sized storage
 
 ### Requirement: Name encoding strictness
 The loader SHALL require names (module, function, import/export fields) to be valid UTF-8 and reject malformed encodings.

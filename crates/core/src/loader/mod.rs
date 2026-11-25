@@ -13,6 +13,9 @@ pub use parser::Parser;
 pub use reader::BinaryReader;
 pub use validator::Validator;
 
+/// Maximum table minimum accepted from an untrusted module.
+pub(crate) const MAX_TABLE_MIN: usize = 100_000;
+
 /// Binary WebAssembly parser support.
 pub mod parser;
 /// Binary reader APIs.

@@ -1,6 +1,6 @@
 use std::io::Cursor;
 
-use super::BinaryReader;
+use super::{BinaryReader, MAX_TABLE_MIN};
 
 use crate::runtime::{
     DataKind, DataSegment, ElemKind, ElemSegment, ExportKind, ExportType, Func, FunctionType,
@@ -337,7 +337,6 @@ impl Parser {
                     let min = limits.min() as usize;
 
                     // Cap table minimum to prevent untrusted-count allocations
-                    const MAX_TABLE_MIN: usize = 100_000;
                     if min > MAX_TABLE_MIN {
                         return Err(WasmError::Load(format!(
                             "table minimum {} exceeds supported maximum {}",

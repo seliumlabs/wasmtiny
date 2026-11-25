@@ -10,7 +10,10 @@ use super::{
 };
 use parking_lot::Mutex as ParkingMutex;
 
-use crate::{loader::BinaryReader, memory::RegionProt};
+use crate::{
+    loader::{BinaryReader, MAX_TABLE_MIN},
+    memory::RegionProt,
+};
 
 /// Type alias for a shared (thread-safe) global reference.
 pub type SharedGlobal = Arc<Mutex<Global>>;
@@ -343,7 +346,15 @@ impl Instance {
             self.memories.push(Arc::new(Mutex::new(memory)));
         }
 
-        for table_type in &self.module.tables {
+        for (index, table_type) in self.module.tables.iter().enumerate() {
+            if table_type.limits.min() as usize > MAX_TABLE_MIN {
+                return Err(WasmError::Instantiate(format!(
+                    "table {}: minimum {} exceeds supported maximum {}",
+                    index,
+                    table_type.limits.min(),
+                    MAX_TABLE_MIN
+                )));
+            }
             self.tables
                 .push(Arc::new(Mutex::new(Table::new(table_type.clone()))));
         }

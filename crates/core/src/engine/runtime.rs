@@ -9,6 +9,7 @@ use parking_lot::Mutex as ParkingMutex;
 
 use crate::{
     interpreter::Interpreter,
+    loader::MAX_TABLE_MIN,
     memory::RegionProt,
     runtime::{
         Extern, FunctionType, Global, HostCaller, HostFunc, ImportKind, Instance, Memory, Module,
@@ -771,14 +772,18 @@ impl LoadedModule {
             }
         }
         if self.tables.is_empty() {
-            self.tables.extend(
-                self.module
-                    .tables
-                    .iter()
-                    .cloned()
-                    .map(Table::new)
-                    .map(|table| Arc::new(Mutex::new(table))),
-            );
+            for (index, table_type) in self.module.tables.iter().cloned().enumerate() {
+                if table_type.limits.min() as usize > MAX_TABLE_MIN {
+                    return Err(WasmError::Instantiate(format!(
+                        "table {}: minimum {} exceeds supported maximum {}",
+                        index,
+                        table_type.limits.min(),
+                        MAX_TABLE_MIN
+                    )));
+                }
+                self.tables
+                    .push(Arc::new(Mutex::new(Table::new(table_type))));
+            }
         }
         Ok(())
     }

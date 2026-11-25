@@ -66,6 +66,31 @@ fn huge_type_count_rejected() {
     assert!(result.is_err(), "huge type count should be rejected");
 }
 
+/// A legacy table declaration with a huge minimum is rejected when the module
+/// is loaded, rather than allocating the declared minimum.
+///
+/// Regression for the `module_probing` fuzz finding: the final table declares
+/// `0x6FFFFFFF` elements, which `Table::new` would size at ~28 GiB.
+#[test]
+fn huge_legacy_table_minimum_rejected() {
+    let wasm: [u8; 43] = [
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic + version
+        0x04, 0x21, // table section, 33-byte payload
+        0x04, // four tables
+        0x63, 0xff, 0xff, 0x9e, 0xff, 0x06, 0x01, 0x00, 0x08, // min 0, max 8
+        0x63, 0xff, 0xff, 0x9e, 0xff, 0x06, 0x01, 0x05, 0x08, // min 5, max 8
+        0x63, 0xff, 0x06, 0x01, 0x00, 0x08, // min 0, max 8
+        0x63, 0x01, 0x00, 0xff, 0xff, 0xff, 0xff, 0x06, // min 0x6FFFFFFF
+    ];
+
+    let mut app = WasmApplication::new();
+    let result = app.load_module_from_memory(&wasm);
+    assert!(
+        matches!(&result, Err(WasmError::Instantiate(message)) if message.contains("table")),
+        "expected a table-minimum instantiate error, got {result:?}"
+    );
+}
+
 /// A module with an `if` without `else` where params != results should be rejected.
 #[test]
 fn if_without_else_mismatched_arity_rejected() {

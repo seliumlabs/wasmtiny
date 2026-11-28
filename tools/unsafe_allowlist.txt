@@ -21,6 +21,6 @@ crates/core/src/aot/store.rs 2 unsafe Send/Sync for AotTable, whose published ba
 crates/core/src/aot/traps.rs 41 signal-based trap recovery: sigaction/sigaltstack/mmap installation, sigsetjmp/siglongjmp boundary, lock-free raw-pointer trap registry, ucontext PC/SP extraction, and per-thread stack-base comparison to disambiguate native stack exhaustion from guest guard-page faults; every site carries a SAFETY comment
 crates/core/src/memory.rs 24 mmap-backed linear memory: raw pointer arithmetic, mprotect/munmap on mappings, and slice views over mmap regions; every site carries a SAFETY comment
 crates/core/src/runtime/shared_memory.rs 12 shm_open/mmap/ftruncate for shared regions and raw mapping teardown; every site carries a SAFETY comment
-crates/core/src/runtime/os_wake.rs 5 platform wake-word primitives (futex/_umtx_op/WaitOnAddress) on raw pointers behind cfg(os)
+crates/core/src/runtime/os_wake.rs 29 platform wake-word primitives (futex/_umtx_op/WaitOnAddress) on raw pointers behind cfg(os)
 crates/core/src/security_test.rs 3 testing build only: signal handler install, alarm write(2)/_exit(2), and setrlimit — libc calls with no safe wrapper; feature-gated, absent from shipped builds
 crates/core/src/runtime/metering.rs 2 tests only: raw `*const MeterCells` views over a live InstanceMeter's atomics, asserting the offset contract (executed at 0, budget at 8) the AOT compiler charges against; each site carries a SAFETY comment and lives in #[cfg(test)]

@@ -1,4 +1,4 @@
-## ADDED Requirements
+## Requirements
 
 ### Requirement: Map Region into Guest Memory
 The runtime SHALL map shared memory regions into a guest's linear memory address space so that the guest accesses them via native WASM load, store, and atomic instructions. Shared mappings SHALL be placed at offsets that owned-page growth can never reach (e.g. descending from the top of the reserved virtual address range), so that `memory.grow` can never alias a shared mapping.

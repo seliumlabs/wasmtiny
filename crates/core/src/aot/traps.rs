@@ -270,8 +270,12 @@ pub fn thread_stack_limit(margin: usize) -> usize {
     }
     #[cfg(target_os = "linux")]
     {
-        // SAFETY: `pthread_getattr_np` requires an initialised `pthread_attr_t`
-        // (zeroed qualifies on glibc/musl); all calls only query the thread.
+        // SAFETY: `pthread_getattr_np` requires an initialised
+        // `pthread_attr_t` (zeroed qualifies on glibc/musl); all calls only
+        // query the thread. On success the attr owns glibc-allocated
+        // internals (the thread's affinity set is copied in since glibc
+        // 2.32), so `pthread_attr_destroy` must run on every path after a
+        // successful `pthread_getattr_np`, or the attr leaks.
         let bottom = unsafe {
             let mut attr: libc::pthread_attr_t = std::mem::zeroed();
             if libc::pthread_getattr_np(libc::pthread_self(), &mut attr) != 0 {
@@ -279,7 +283,11 @@ pub fn thread_stack_limit(margin: usize) -> usize {
             }
             let mut base: *mut core::ffi::c_void = std::ptr::null_mut();
             let mut size: libc::size_t = 0;
-            if libc::pthread_attr_getstack(&attr, &mut base, &mut size) != 0 {
+            let stack = libc::pthread_attr_getstack(&attr, &mut base, &mut size);
+            // Unconditional: `attr` is initialised from this point on, so it
+            // must be destroyed whether or not the getter succeeded.
+            libc::pthread_attr_destroy(&mut attr);
+            if stack != 0 {
                 return stack_limit_from_probe(margin);
             }
             base as usize

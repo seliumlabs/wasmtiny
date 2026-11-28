@@ -105,7 +105,16 @@ pub fn active() -> bool {
 ///
 /// `ptr` must point to a mapped, writable, 4-byte-aligned word (the shared
 /// region's host mapping) that remains valid for the duration of the call.
+// The platform fact is a constant, so this is an assertion on a constant
+// by design: on a supported platform it is trivially true, and on an
+// unsupported one (macOS) it turns an embedder that skipped the SUPPORTED
+// check into a debug-build panic instead of a silent mis-park.
+#[allow(clippy::assertions_on_constants)]
 pub unsafe fn wait(ptr: *mut u8, expected: u32, timeout: Duration) -> WaitOutcome {
+    debug_assert!(
+        SUPPORTED,
+        "os_wake::wait on a platform with no wait-word backend; check SUPPORTED first"
+    );
     // SAFETY: delegated to the caller; each backend follows the same contract.
     unsafe { wait_impl(ptr, expected, timeout) }
 }

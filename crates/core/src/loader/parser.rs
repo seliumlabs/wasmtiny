@@ -921,6 +921,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_contains_atomic_notify_tolerance_is_one_directional() {
+        // A false positive (the sequence inside an unrelated immediate) is
+        // accepted by design: the fact is only consumed alongside a
+        // shared-memory declaration, which the validator already requires
+        // for atomics. A genuine notify never escapes detection.
+        assert!(contains_atomic_notify(&[0x41, 0xFE, 0x00]));
+        assert!(!contains_atomic_notify(&[0xFE, 0x01]));
+        assert!(!contains_atomic_notify(&[0xFE]));
+    }
+
+    #[test]
     fn test_parse_empty_module() {
         let data = vec![0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00];
         let parser = Parser::new();

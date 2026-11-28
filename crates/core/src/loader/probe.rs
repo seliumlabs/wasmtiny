@@ -113,4 +113,18 @@ mod tests {
         assert!(probe(b"not a module").is_err());
         assert!(probe(&[0x00, 0x61, 0x73]).is_err());
     }
+
+    // The loader rejects a custom section whose name is not valid UTF-8.
+    // `tests/malformed/custom_section_bad_name.wasm` covers the corpus walk;
+    // this pins the clause directly.
+    #[test]
+    fn probe_rejects_custom_section_with_invalid_utf8_name() {
+        let bytes = [
+            0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, // magic + version
+            0x00, 0x04, // custom section, 4-byte payload
+            0x02, 0xFF, 0xFE, // name length 2, invalid UTF-8
+            0x01, // one payload byte
+        ];
+        assert!(probe(&bytes).is_err());
+    }
 }

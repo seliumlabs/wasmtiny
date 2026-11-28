@@ -62,7 +62,9 @@ impl Default for WorkerPoolConfig {
 /// A worker that did not exit cleanly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerFault {
-    /// The worker id passed to the entry argument closure.
+    /// The worker id passed to the entry argument closure, or `u32::MAX`
+    /// when the worker thread panicked before it could report a fault (no
+    /// worker id is known in that case).
     pub worker_id: u32,
     /// The engine error rendered as text, without embedder formatting.
     pub message: String,

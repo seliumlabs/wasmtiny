@@ -1,5 +1,8 @@
+# Distinct from the in-repo deterministic `wasmtiny-fuzz` binary (crates/core),
+# which stays the libFuzzer-free `cargo test` lane; this standalone workspace
+# is the coverage-guided cargo-fuzz lane.
 [package]
-name = "wasmtiny-fuzz"
+name = "wasmtiny-libfuzz"
 version = "0.0.0"
 edition = "2024"
 publish = false

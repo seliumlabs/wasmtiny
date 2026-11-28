@@ -7,6 +7,10 @@
 pub use code::ExecutableCode;
 pub use exec::{AotInstance, InstanceOptions};
 pub use loader::{AotFunction, AotLoader, AotModule};
+pub use pool::{
+    DEFAULT_STOP_BUDGET, PoolReport, StopOutcome, StopSignal, WorkerFault, WorkerPool,
+    WorkerPoolConfig,
+};
 pub use store::{AotExtern, AotStore, AotTable};
 
 pub mod code;
@@ -14,6 +18,7 @@ mod context;
 pub mod exec;
 mod format;
 pub mod loader;
+pub mod pool;
 mod reader;
 pub mod store;
 mod traps;

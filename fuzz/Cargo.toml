@@ -1,0 +1,59 @@
+[package]
+name = "wasmtiny-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+wasmtiny = { path = "../crates/core", features = ["interpreter"] }
+wasmtiny-aotc = { path = "../crates/aotc" }
+
+[[bin]]
+name = "module_load"
+path = "fuzz_targets/module_load.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "load_and_instantiate"
+path = "fuzz_targets/load_and_instantiate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "interpreter_dispatch"
+path = "fuzz_targets/interpreter_dispatch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "aot_artifact_load"
+path = "fuzz_targets/aot_artifact_load.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "aot_dispatch"
+path = "fuzz_targets/aot_dispatch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "shared_region"
+path = "fuzz_targets/shared_region.rs"
+test = false
+doc = false
+bench = false
+
+# Standalone workspace: the default workspace build never compiles this crate,
+# and `cargo` inside fuzz/ does not consider it part of the parent workspace.
+[workspace]

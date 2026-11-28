@@ -78,6 +78,19 @@ pub struct ElemSegment {
     pub generated_by_table_init: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// A custom (name-keyed) section retained from the module binary.
+///
+/// Custom sections carry no engine semantics, but embedders use them to
+/// negotiate their own ABI and metadata. The payload is the section contents
+/// after the name, exactly as encoded.
+pub struct CustomSection {
+    /// The UTF-8 section name.
+    pub name: String,
+    /// Section payload bytes following the name.
+    pub payload: Vec<u8>,
+}
+
 #[derive(Debug, Clone)]
 /// Parsed WebAssembly module.
 pub struct Module {
@@ -103,6 +116,13 @@ pub struct Module {
     pub exports: Vec<ExportType>,
     /// Imports required by the module.
     pub imports: Vec<Import>,
+    /// Custom sections retained from the module binary, in order.
+    pub custom_sections: Vec<CustomSection>,
+    /// True when the code section contains the `memory.atomic.notify` opcode
+    /// sequence (`0xFE 0x00`). Heuristic in one direction only: an unrelated
+    /// immediate can produce a false positive, but a genuine notify always
+    /// produces the sequence. See the module probe docs.
+    pub uses_atomic_notify: bool,
     /// The optional start function index.
     pub start: Option<u32>,
     /// Data segments declared by the module.
@@ -126,6 +146,8 @@ impl Module {
             global_inits: Vec::new(),
             exports: Vec::new(),
             imports: Vec::new(),
+            custom_sections: Vec::new(),
+            uses_atomic_notify: false,
             start: None,
             data: Vec::new(),
             elems: Vec::new(),

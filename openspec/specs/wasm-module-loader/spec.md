@@ -1,4 +1,4 @@
-## ADDED Requirements
+## Requirements
 
 ### Requirement: Binary format parsing
 The loader SHALL parse WebAssembly binary format (.wasm) into an intermediate representation.

@@ -19,7 +19,9 @@
 //! ```
 
 pub use application::WasmApplication;
+pub use loader::probe::{ModuleProbe, probe};
 pub use memory::RegionProt;
+pub use runtime::CustomSection;
 pub use runtime::ExportType;
 pub use runtime::FunctionType;
 pub use runtime::Global;

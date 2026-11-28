@@ -29,7 +29,9 @@ pub use instance::{
     SharedTable, Store,
 };
 pub use metering::{InstanceMeter, InstanceStats, MeterCells};
-pub use module::{DataKind, DataSegment, ElemKind, ElemSegment, Func, Local, Module};
+pub use module::{
+    CustomSection, DataKind, DataSegment, ElemKind, ElemSegment, Func, Local, Module,
+};
 pub use shared_memory::{
     HostWaitSupport, RegionWaiter, SharedMemoryRegistry, SharedRegion, SharedRegionId, WakeOutcome,
 };

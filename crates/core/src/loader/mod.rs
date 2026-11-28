@@ -10,6 +10,7 @@
 //! - [`Validator`] - WebAssembly module validator
 
 pub use parser::Parser;
+pub use probe::{ModuleProbe, probe};
 pub use reader::BinaryReader;
 pub use validator::Validator;
 
@@ -18,6 +19,8 @@ pub(crate) const MAX_TABLE_MIN: usize = 100_000;
 
 /// Binary WebAssembly parser support.
 pub mod parser;
+/// Fact-only module probing for embedders.
+pub mod probe;
 /// Binary reader APIs.
 pub mod reader;
 /// Validation APIs.

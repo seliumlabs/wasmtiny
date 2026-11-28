@@ -11,6 +11,7 @@ use crate::runtime::{
 const CURRENT_VERSION: u32 = 1;
 const FUNC_TYPE_FORM: u8 = 0x60;
 const MAGIC: u32 = 0x6D736100;
+const CODE_SECTION_ID: u8 = 10;
 
 /// WebAssembly module parser.
 ///
@@ -67,6 +68,12 @@ impl Parser {
             let section_bytes = reader.read_bytes(section_size)?;
             let mut section_reader = BinaryReader::from_slice(&section_bytes);
 
+            // Fact captured while the section is still raw: embedders classify
+            // guests by whether their write path can emit a host wake.
+            if section_id == CODE_SECTION_ID {
+                module.uses_atomic_notify |= contains_atomic_notify(&section_bytes);
+            }
+
             if section_id != 0 {
                 if section_id as usize >= seen_sections.len() {
                     return Err(WasmError::Load(format!(
@@ -94,7 +101,7 @@ impl Parser {
             }
 
             match section_id {
-                0 => self.parse_custom(&mut section_reader)?,
+                0 => self.parse_custom(&mut section_reader, &mut module)?,
                 1 => self.parse_type(&mut section_reader, &mut module)?,
                 2 => self.parse_import(&mut section_reader, &mut module)?,
                 3 => self.parse_function(&mut section_reader, &mut module)?,
@@ -128,14 +135,23 @@ impl Parser {
         Ok(module)
     }
 
-    fn parse_custom(&self, reader: &mut BinaryReader<Cursor<&[u8]>>) -> Result<()> {
+    fn parse_custom(
+        &self,
+        reader: &mut BinaryReader<Cursor<&[u8]>>,
+        module: &mut Module,
+    ) -> Result<()> {
         if reader.remaining() == 0 {
             return Ok(());
         }
 
         let name_len = reader.read_uleb128()? as usize;
-        let _name = reader.read_bytes(name_len)?;
-        let _payload = reader.read_bytes(reader.remaining())?;
+        let name = reader.read_bytes(name_len)?;
+        let name = String::from_utf8(name)
+            .map_err(|_| WasmError::Load("invalid UTF-8 in custom section name".to_string()))?;
+        let payload = reader.read_bytes(reader.remaining())?;
+        module
+            .custom_sections
+            .push(crate::runtime::CustomSection { name, payload });
         Ok(())
     }
 
@@ -887,6 +903,17 @@ impl Default for Parser {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// True when `bytes` contains the `memory.atomic.notify` opcode sequence
+/// (`0xFE 0x00`).
+///
+/// The scan is heuristic in one direction only: an unrelated immediate can
+/// contain the sequence (false positive), but a genuine `memory.atomic.notify`
+/// always produces it (no false negative). Embedders combine it with the
+/// shared-memory declaration, which the validator already requires for atomics.
+fn contains_atomic_notify(bytes: &[u8]) -> bool {
+    bytes.windows(2).any(|pair| pair == [0xFE, 0x00])
 }
 
 #[cfg(test)]
